@@ -309,6 +309,7 @@ void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
     auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
         "missing native rollout retained through typed cache seed");
+    check(!page->records[0].source_counter_semantics, "usage2 native conversion remains unchanged");
     check(page->records[0].input.value == 12 && page->records[0].input.coverage->covered_records == 1 &&
         page->records[0].cache_creation.coverage->support == addon::Usage_support::UNSUPPORTED,
         "native cached category evidence preserved exactly");
@@ -747,6 +748,13 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     request.context.launch_environment = addon::Launch_environment{
         addon::host_platform_id(), addon::Json_value::object(), std::nullopt};
     request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(candidate)};
+    const auto imported_source = profile / "sessions" / "rollout-imported.jsonl";
+    auto imported = native_wrapper(imported_source, "imported", 19);
+    const auto seed_path = addon::path_from_utf8(*allocated) / "native-file-cache.jsonl";
+    const auto seed_bytes = addon::serialize_json(imported) + '\n';
+    write(seed_path, seed_bytes);
+    request.native_file_cache = addon::Usage_native_file_cache{
+        addon::path_to_utf8(seed_path), addon::to_hex(addon::Sha256::digest(seed_bytes)), account_key, true};
     addon::Simulator_invocation_options invocation;
     invocation.profile_storage = request.context.profile_storage;
     const auto acknowledge_id = host.invoke({"profile-storage", 1}, "acknowledge",
@@ -772,8 +780,23 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     request.snapshot_id = first.snapshot_id;
     request.cursor = first.next_cursor;
     const auto last = scan();
-    check(last.complete && last.records.size() == 14 && last.cache_candidate == first.cache_candidate,
+    check(last.complete && last.records.size() == 15 && last.cache_candidate == first.cache_candidate,
         "actual adapter preserves cache descriptor across pages");
+    const auto check_import = [](const auto& first_page, const auto& last_page) {
+        bool found = false;
+        for (const auto* page : {&first_page, &last_page}) {
+            for (const auto& record : page->records) {
+                if (record.record_id != "codex:imported:turn") continue;
+                found = true;
+                check(record.source_counter_semantics == "cumulative_turn_delta" &&
+                    record.aggregate_evidence == "partial" && record.total_tokens == 19 &&
+                    record.input.value == 14 && record.output.value == 5,
+                    "actual adapter preserves imported turn-delta attribution and partial evidence");
+            }
+        }
+        check(found, "native source-absent record survives packaged scan");
+    };
+    check_import(first, last);
     check(addon::validate_usage_cache_candidate(*last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "actual adapter cache verifies after paging");
     check(fs::remove(source), "remove native history to exercise selected cache replay");
@@ -789,10 +812,79 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     request.snapshot_id = replay.snapshot_id;
     request.cursor = replay.next_cursor;
     const auto replay_last = scan();
-    check(replay_last.complete && replay_last.records.size() == 14 && replay_last.cache_candidate == replay.cache_candidate,
+    check(replay_last.complete && replay_last.records.size() == 15 && replay_last.cache_candidate == replay.cache_candidate,
         "selected cache replay preserves all records across pages");
+    check_import(replay, replay_last);
     check(addon::validate_usage_cache_candidate(*replay_last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "replayed cache seals and reopens");
+    imported.find("records")->as_array().front().set("counter_semantics", addon::Json_value("future_counter"));
+    const auto unknown_bytes = addon::serialize_json(imported) + '\n';
+    write(seed_path, unknown_bytes);
+    request.native_file_cache->sha256_hex = addon::to_hex(addon::Sha256::digest(unknown_bytes));
+    const auto unknown_candidate = allocation_parent / "unknown-provenance";
+    check(fs::create_directory(addon::usage_cache_io_path(unknown_candidate)), "allocate unknown-provenance candidate");
+    request.snapshot_id.reset();
+    request.cursor.reset();
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(unknown_candidate)};
+    const auto unknown_id = host.invoke({"usage-scan", 3}, "scan",
+        addon::encode_usage_scan_request(request, 3), 15000, invocation);
+    const auto unknown = host.wait_outcome(unknown_id, 16000);
+    check(unknown && unknown->status != addon::Host_status::SUCCESS && unknown->reason_code == "native_usage_cache_invalid",
+        "unknown native provenance fails without producing a silently rewritten candidate");
+    // Reconstruct the preceding provider-owned format, whose records used the
+    // usage2 grammar. Missing provenance there cannot be recovered by guessing.
+    const auto old_root = addon::usage_cache_io_path(allocation_parent / "preceding-format");
+    check(fs::create_directory(old_root), "allocate preceding-format fixture");
+    const auto inventory = addon::validate_usage_cache_candidate(*first.cache_candidate, *allocated,
+        request.context.account_context, [] { return false; }, &failure);
+    check(inventory.has_value(), "read original candidate for preceding-format fixture");
+    for (const auto& file : inventory->files) {
+        const auto from = addon::usage_cache_io_path(candidate) / file.path;
+        if (file.path == "records" || file.path.ends_with(".records")) {
+            std::ifstream input(from, std::ios::binary);
+            std::string line;
+            std::string previous_bytes;
+            while (std::getline(input, line)) {
+                auto envelope = addon::parse_json(line, {}, nullptr);
+                check(envelope.has_value(), "parse current cache envelope");
+                auto record = addon::decode_usage_record(*envelope->find("usage"), &failure, 3);
+                check(record.has_value(), "decode current cache record");
+                if (record->source_counter_semantics == "cumulative_turn_delta") {
+                    record->source_counter_semantics.reset();
+                }
+                envelope->set("usage", addon::encode_usage_record(*record, 2));
+                previous_bytes += addon::serialize_json(*envelope) + '\n';
+            }
+            check(input.eof(), "read complete cache fixture");
+            write(old_root / file.path, previous_bytes);
+        }
+        else {
+            check(fs::copy_file(from, old_root / file.path), "copy preceding-format metadata");
+        }
+    }
+    const auto old_reference = addon::seal_usage_cache_candidate(
+        addon::path_to_utf8(allocation_parent / "preceding-format"), *allocated, request.context.account_context,
+        first.snapshot_id, "codex-rollout-cache@1", [] { return false; }, &failure);
+    check(old_reference.has_value(), "seal preceding-format fixture");
+    const auto upgraded_root = allocation_parent / "upgraded-format";
+    check(fs::create_directory(addon::usage_cache_io_path(upgraded_root)), "allocate upgraded candidate");
+    request.native_file_cache.reset();
+    request.cache_selection = addon::Usage_cache_selection{old_reference, addon::path_to_utf8(upgraded_root)};
+    const auto upgraded = scan();
+    request.snapshot_id = upgraded.snapshot_id;
+    request.cursor = upgraded.next_cursor;
+    const auto upgraded_last = scan();
+    check(upgraded.records.size() == 256 && upgraded_last.records.size() == 15 && upgraded_last.complete,
+        "preceding selected format retains all source-absent history through upgrade");
+    for (const auto* page : {&upgraded, &upgraded_last}) {
+        for (const auto& record : page->records) {
+            check(!record.source_counter_semantics && record.aggregate_evidence == "partial",
+                "format upgrade does not invent absent provenance or completeness");
+        }
+    }
+    check(addon::validate_usage_cache_candidate(*old_reference, *allocated,
+        request.context.account_context, [] { return false; }, &failure).has_value(),
+        "format upgrade leaves the selected old candidate immutable");
     check(host.shutdown(1000, nullptr), "actual adapter exits without any model request");
 }
 

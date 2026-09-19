@@ -4,6 +4,15 @@ Standalone C++20 provider package for Logonomic. The package links only the publ
 Logonomic CLI add-on SDK; it does not load Qt or import desktop-private headers.
 Package identity is `logonomic.cli.codex`.
 
+Host-selected usage caches use `codex-rollout-cache@2`, whose records retain
+usage-scan@3 native counter provenance. A selected `codex-rollout-cache@1` cache
+is validated and converted into a fresh candidate without modifying the selected
+input or inventing provenance absent from its records. Native imports preserve
+`cumulative_turn_delta` together with the validated rollout/turn record identity;
+unknown present source semantics fail the import. Aggregate evidence remains
+partial. The usage-scan@1/2 mutable cache namespaces and record grammar are
+unchanged.
+
 The provider recognizes installed Codex launchers, preserves the selected
 `CODEX_HOME` account, injects session hooks through command-line configuration,
 and prepares delegated implementation sessions with required task-control MCP

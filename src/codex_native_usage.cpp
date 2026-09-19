@@ -77,7 +77,7 @@ std::optional<addon::Usage_amount> native_amount(const addon::Json_value& value)
 } // namespace
 
 std::optional<Native_cache_file> convert_native_cache_file(const addon::Json_value& wrapper,
-    const std::function<bool(const Rollout_usage_record&)>& emit, std::string* error)
+    const std::function<bool(const Rollout_usage_record&)>& emit, std::string* error, std::uint16_t version)
 {
     const auto fail = [&]() -> std::optional<Native_cache_file> { *error = "native_usage_cache_invalid"; return std::nullopt; };
     Native_cache_file file;
@@ -127,8 +127,16 @@ std::optional<Native_cache_file> convert_native_cache_file(const addon::Json_val
             if (!value.empty()) *entry.second = value;
         }
         const auto semantics = text(native, "counter_semantics");
+        if (version == 3 && native.find("counter_semantics")) {
+            if (!member(native, "counter_semantics").is_string()) return fail();
+            record.usage.source_counter_semantics = semantics;
+        }
+        else
         if (semantics == "cumulative_final" || semantics == "per_event_sum") {
             record.usage.source_counter_semantics = semantics;
+        }
+        if (version == 3) {
+            record.usage.aggregate_evidence = "partial";
         }
         record.usage.input = unknown_amount();
         record.usage.output = unknown_amount();
@@ -155,7 +163,7 @@ std::optional<Native_cache_file> convert_native_cache_file(const addon::Json_val
         // for retained files, rather than trusting yesterday's allocation.
         refresh_repository(&record);
         addon::Contract_failure failure;
-        if (!addon::decode_usage_record(addon::encode_usage_record(record.usage, 2), &failure, 2) || !emit(record)) return fail();
+        if (!addon::decode_usage_record(addon::encode_usage_record(record.usage, version), &failure, version) || !emit(record)) return fail();
     }
     return file;
 }

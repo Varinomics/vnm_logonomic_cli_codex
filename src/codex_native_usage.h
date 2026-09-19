@@ -2,6 +2,8 @@
 
 #include "codex_usage_records.h"
 
+#include <cstdint>
+
 namespace codex {
 
 struct Native_cache_file
@@ -15,6 +17,6 @@ struct Native_cache_file
 std::optional<Native_cache_file> convert_native_cache_file(
     const logonomic::cli_addon::Json_value& wrapper,
     const std::function<bool(const Rollout_usage_record&)>& emit,
-    std::string* error);
+    std::string* error, std::uint16_t version = 2);
 
 } // namespace codex
