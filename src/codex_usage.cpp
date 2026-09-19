@@ -903,6 +903,8 @@ addon::Usage_scan_page scan_selected_cache(
         require(state && string_member(*state, "request_sha256") == request_hash &&
             string_member(*state, "snapshot_id") == *request.snapshot_id, "usage_snapshot_mismatch");
         auto page = page_at(work, *request.snapshot_id, decimal(*request.cursor), request.context.account_context, cancelled);
+        page.account_context = request.context.account_context;
+        page.profile_storage = request.context.profile_storage;
         require(fs::file_size(work / "cache-manifest.json") <= addon::k_max_usage_cache_manifest_bytes,
             "usage_cache_unavailable");
         page.cache_candidate = addon::Usage_cache_reference{
@@ -985,6 +987,8 @@ addon::Usage_scan_page scan_selected_cache(
     state.set("native_seeds", std::move(seeds));
     write_json(work / "cache-state", state);
     auto page = page_at(work, identifier, 0, request.context.account_context, cancelled);
+    page.account_context = request.context.account_context;
+    page.profile_storage = request.context.profile_storage;
     // A parsed rollout need not contain all historical contributing events.
     // This scanner cannot certify lower aggregate corrections from parsing alone.
     for (auto& record : page.records) {

@@ -750,9 +750,14 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     const auto acknowledged = host.wait_outcome(acknowledge_id, 6000);
     check(acknowledged && acknowledged->status == addon::Host_status::SUCCESS, "adapter acknowledges real profile allocation");
     const auto scan = [&] {
-        const auto id = host.invoke({"usage-scan", 3}, "scan", addon::encode_usage_scan_request(request, 3), 15000);
+        const auto id = host.invoke({"usage-scan", 3}, "scan",
+            addon::encode_usage_scan_request(request, 3), 15000, invocation);
         const auto outcome = host.wait_outcome(id, 16000);
         check(outcome && outcome->status == addon::Host_status::SUCCESS, "actual packaged adapter scan succeeds");
+        check(!addon::account_context_acknowledgment_failure(*request.context.account_context, outcome->payload),
+            "actual adapter acknowledges exact account context on every page");
+        check(!addon::profile_storage_acknowledgment_failure(*request.context.profile_storage, outcome->payload),
+            "actual adapter acknowledges exact profile storage on every page");
         const auto page = addon::decode_usage_scan_result(outcome->payload, &failure, 3);
         check(page.has_value(), failure.detail.c_str());
         return *page;
