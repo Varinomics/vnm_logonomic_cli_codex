@@ -2,6 +2,7 @@
 #include "codex_accounts.h"
 #include <logonomic_cli_addon/sha256.h>
 
+#include <logonomic_cli_addon/package_source.h>
 #include <charconv>
 #include <cmath>
 #include <utility>
@@ -84,7 +85,7 @@ std::optional<Native_cache_file> convert_native_cache_file(const addon::Json_val
     const auto size = integer(member(wrapper, "size"));
     const auto modified = integer(member(wrapper, "modified_msecs"));
     const auto& records = member(wrapper, "records");
-    if (!std::filesystem::u8path(file.path).is_absolute() || !size || *size < 0 || !modified || !records.is_array()) return fail();
+    if (!addon::path_from_utf8(file.path).is_absolute() || !size || *size < 0 || !modified || !records.is_array()) return fail();
     file.size = static_cast<std::uint64_t>(*size);
     file.modified_msecs = *modified;
     const auto& capabilities = member(wrapper, "capabilities");

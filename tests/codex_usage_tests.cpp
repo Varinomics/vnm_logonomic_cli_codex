@@ -130,7 +130,7 @@ fs::path accepted_snapshot(const fs::path& storage)
     std::ifstream input(root / "accepted", std::ios::binary);
     check(static_cast<bool>(input), "accepted generation pointer exists");
     const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    const auto pointer = addon::parse_json(bytes);
+    const auto pointer = addon::parse_json(bytes, {}, nullptr);
     check(pointer && pointer->find("snapshot") && pointer->find("snapshot")->is_string(),
         "accepted generation has its snapshot identity");
     return root / "snapshots" / pointer->find("snapshot")->as_string();
@@ -326,6 +326,50 @@ void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
     set_seed(&request, artifact, bytes);
     check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "required_usage_cache_unavailable",
         "consumed stale seed cannot resurrect older history after cache loss");
+}
+
+void native_seed_fingerprint_uses_system_clock(const fs::path& fixture)
+{
+    const auto profile = fixture / "fingerprint-profile";
+    const auto storage = fixture / "fingerprint-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-fingerprint.jsonl";
+    const auto artifact = storage / "native-file-cache.jsonl";
+    write(source, metadata("fingerprint") + start("turn") + tokens(23) + complete("turn"));
+
+    const auto modified = std::chrono::sys_days{std::chrono::year{2026} / 1 / 2} +
+        std::chrono::hours{12} + std::chrono::milliseconds{123};
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+    const auto file_modified = std::chrono::clock_cast<fs::file_time_type::clock>(modified);
+#else
+    const auto file_modified = fs::file_time_type::clock::from_sys(modified);
+#endif
+    fs::last_write_time(source, file_modified);
+    check(fs::last_write_time(source) == file_modified, "fixture preserves exact millisecond file timestamp");
+
+    // Distinct counts reveal whether the trusted fingerprint reuses the native
+    // evidence or reparses the source. No wall-clock sampling defines identity.
+    auto wrapper = native_wrapper(source, "fingerprint", 17);
+    wrapper.set("size", addon::Json_value(static_cast<std::int64_t>(fs::file_size(source))));
+    wrapper.set("modified_msecs", addon::Json_value(static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(modified.time_since_epoch()).count())));
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "account"};
+    set_seed(&request, artifact, addon::serialize_json(wrapper) + '\n');
+    std::string error;
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
+        "matching system-clock milliseconds reuse native cache evidence");
+
+    request.native_file_cache.reset();
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
+        "native timestamp identity survives accepted-cache reload");
+    fs::last_write_time(source, file_modified + std::chrono::seconds{2});
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 23,
+        "changed timestamp with unchanged size refreshes native cache evidence");
 }
 
 void native_seed_cancellation_preserves_accepted_history(const fs::path& fixture)
@@ -593,6 +637,7 @@ int main()
         scanner_sorts_pages_and_preserves_cache_on_retry(fixture.path);
         scanner_accepts_new_profiles_and_retains_transient_empty_history(fixture.path);
         native_seed_replay_and_required_cache_loss(fixture.path);
+        native_seed_fingerprint_uses_system_clock(fixture.path);
         native_seed_cancellation_preserves_accepted_history(fixture.path);
         rejected_scan_cannot_publish_refreshed_history_after_source_deletion(fixture.path);
         transient_refresh_discards_partial_records_before_acceptance(fixture.path);

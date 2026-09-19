@@ -1,3 +1,4 @@
+#include <logonomic_cli_addon/package_source.h>
 #include "codex_accounts.h"
 #include "codex_probes.h"
 
@@ -167,7 +168,7 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         check(context.succeeded && result.has_value(), "probe preparation through actual dispatch and public codec");
         check(result->process.executable.kind == addon::Process_executable::Kind::PACKAGE_PATH &&
             result->process.executable.path.starts_with("helpers/codex_launch_bridge"), "probe uses package bridge instead of frozen shell argv0");
-        check(std::filesystem::equivalent(std::filesystem::u8path(result->process.argv.front()), executable),
+        check(std::filesystem::equivalent(logonomic::cli_addon::path_from_utf8(result->process.argv.front()), executable),
             "recognized Codex executable preserved");
         check(result->process.argv[1] == (quota ? "app-server" : "login"), "native probe operation preserved");
         const auto contains = [&](std::string_view name, std::string_view value) {

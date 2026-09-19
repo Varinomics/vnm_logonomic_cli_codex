@@ -1,6 +1,7 @@
 #include "codex_accounts.h"
 #include "codex_launcher.h"
 
+#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -15,6 +16,7 @@
 #include <vector>
 
 namespace codex {
+namespace addon = logonomic::cli_addon;
 namespace {
 
 namespace fs = std::filesystem;
@@ -49,7 +51,7 @@ std::optional<std::string> environment_value(const addon::Json_value& environmen
 
 std::string profile_account_key(std::string_view absolute_path)
 {
-    fs::path path = fs::u8path(absolute_path).lexically_normal();
+    fs::path path = addon::path_from_utf8(absolute_path).lexically_normal();
 #if defined(_WIN32)
     std::wstring wide = path.generic_wstring();
     const int size = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, wide.data(),
@@ -86,10 +88,10 @@ std::optional<Profile_selection> profile_selection(const addon::Launch_environme
     std::string profile = resolved_value("CODEX_HOME").value_or("");
     if (profile.empty()) {
         std::string home = resolved_value(windows ? "USERPROFILE" : "HOME").value_or(std::string(fallback));
-        profile = path_text(fs::u8path(home) / ".codex");
+        profile = path_text(addon::path_from_utf8(home) / ".codex");
     }
-    fs::path path = fs::u8path(profile);
-    if (!path.is_absolute()) path = fs::u8path(normalization_directory) / path;
+    fs::path path = addon::path_from_utf8(profile);
+    if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;
     path = path.lexically_normal();
     if (!path.is_absolute()) { *error = "profile_path_invalid"; return std::nullopt; }
     Profile_selection selected{profile_account_key(path_text(path)), path_text(path)};
@@ -136,7 +138,7 @@ void handle_accounts(addon::Invocation_context& context)
     if (!selected) { context.fail(addon::Result_status::FAILED, error); return; }
     if (context.request().operation == addon::k_accounts_discover_operation) {
         std::error_code failure;
-        const bool exists = fs::is_directory(fs::u8path(selected->profile_path), failure);
+        const bool exists = fs::is_directory(addon::path_from_utf8(selected->profile_path), failure);
         addon::Account_record account;
         account.adapter_account_key = selected->adapter_account_key;
         account.profile_path = selected->profile_path;

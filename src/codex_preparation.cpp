@@ -15,6 +15,7 @@
 #include <regex>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace codex {
 namespace {
@@ -72,18 +73,18 @@ std::string control_wrapper(const addon::Delegated_task_server& server)
     for (const auto& [name, value] : server.environment) {
         result += "$env:" + name + " = " + shell_quote(value) + '\n';
     }
-    result += "& " + shell_quote(server.program) + " mcp --stdio\nexit $LASTEXITCODE\n";
+    result += "& " + shell_quote(server.program) + "\nexit $LASTEXITCODE\n";
 #else
     result = "#!/bin/sh\n";
     for (const auto& [name, value] : server.environment) {
         result += "export " + name + "=" + shell_quote(value) + '\n';
     }
-    result += "exec " + shell_quote(server.program) + " mcp --stdio\n";
+    result += "exec " + shell_quote(server.program) + "\n";
 #endif
     return result;
 }
 
-std::string hook_configuration()
+std::vector<std::string> hook_arguments()
 {
 #ifdef _WIN32
     const std::string script = "$p=Join-Path $env:LOGONOMIC_PROVIDER_HELPERS_DIR 'codex_helper.exe';"
@@ -94,13 +95,13 @@ std::string hook_configuration()
 #else
     const std::string command = "sh -c 'if [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ] && [ -x \"$LOGONOMIC_PROVIDER_HELPERS_DIR/codex_helper\" ]; then \"$LOGONOMIC_PROVIDER_HELPERS_DIR/codex_helper\"; fi; exit 0'";
 #endif
-    std::string result = "hooks={";
+    std::vector<std::string> result;
     for (const std::string name : {"SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest", "SubagentStart", "SubagentStop"}) {
-        if (result.back() != '{') result += ',';
-        result += name + "=[{hooks=[{type=\"command\",command=" + toml_string(command) + ",timeout=" +
-            (name == "SessionEnd" || name == "Interrupt" ? "3" : "10") + "}]}]";
+        result.push_back("-c");
+        result.push_back("hooks." + name + "=[{hooks=[{type=\"command\",command=" + toml_string(command) +
+            ",timeout=" + (name == "SessionEnd" || name == "Interrupt" ? "3" : "10") + "}]}]");
     }
-    return result + '}';
+    return result;
 }
 
 bool add_hooks(Verified_launch& launch, addon::Invocation_context& context)
@@ -110,7 +111,8 @@ bool add_hooks(Verified_launch& launch, addon::Invocation_context& context)
             "Codex hooks configuration conflicts with Logonomic-owned hooks.");
         return false;
     }
-    launch.argv.insert(launch.argv.begin() + launch.prefix_size, {"-c", hook_configuration()});
+    const auto hooks = hook_arguments();
+    launch.argv.insert(launch.argv.begin() + launch.prefix_size, hooks.begin(), hooks.end());
     return true;
 }
 

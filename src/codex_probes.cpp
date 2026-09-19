@@ -39,7 +39,7 @@ std::optional<addon::Json_value> response_for_id(std::string_view output, int id
     while (!output.empty()) {
         const auto end = output.find('\n');
         const auto line = trimmed(output.substr(0, end));
-        const auto value = addon::parse_json(line);
+        const auto value = addon::parse_json(line, {}, nullptr);
         if (value && value->is_object()) {
             const auto& identifier = member(*value, "id");
             if ((identifier.is_number() && identifier.as_number() == id) ||
@@ -168,8 +168,12 @@ addon::Quota_inspect_result inspect_quota(const addon::Probe_inspect_request& re
         return result;
     }
     result.complete = request.inspection.final;
-    if (result.complete) result.observation = addon::Quota_observation{scope(request), addon::Quota_status::FAILED};
-    else result.protocol_state = request.inspection.protocol_state;
+    if (result.complete) {
+        addon::Quota_observation observation;
+        observation.scope = scope(request);
+        observation.state = addon::Quota_status::FAILED;
+        result.observation = std::move(observation);
+    } else result.protocol_state = request.inspection.protocol_state;
     return result;
 }
 

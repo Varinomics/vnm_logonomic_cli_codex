@@ -28,13 +28,14 @@ public:
     addon::Json_value output;
     bool succeeded = false;
     bool done = false;
+    std::string failure_detail;
     std::optional<std::chrono::steady_clock::time_point> cancel_at;
     const addon::Invoke_request& request() const override { return input; }
     bool cancel_requested() const override { return cancel_at && std::chrono::steady_clock::now() >= *cancel_at; }
     bool wait_for_cancel(int timeout) override { std::this_thread::sleep_for(std::chrono::milliseconds(timeout)); return false; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
     void succeed(addon::Json_value value) override { succeeded = true; done = true; output = std::move(value); }
-    void fail(addon::Result_status, std::string reason, std::string) override { done = true; output = addon::Json_value(std::move(reason)); }
+    void fail(addon::Result_status, std::string reason, std::string detail) override { done = true; failure_detail = std::move(detail); output = addon::Json_value(std::move(reason)); }
     bool finished() const override { return done; }
 };
 
@@ -105,6 +106,17 @@ int main(int argc, char** argv)
         addon::Contract_failure failure;
         const auto patch = addon::decode_launch_patch(interactive.output, &failure, 3);
         require(interactive.succeeded && patch && patch->argv && patch->argv->at(1) == "-c", "Verified hook launch missing");
+        if (!addon::validate_launch_patch(*patch, {}, {}, &failure)) {
+            throw std::runtime_error(failure.reason_code + ": " + failure.detail);
+        }
+        for (const std::string event : {"SessionStart", "SessionEnd", "UserPromptSubmit", "Stop",
+                "Interrupt", "PermissionRequest", "SubagentStart", "SubagentStop"})
+        {
+            const auto prefix = "hooks." + event + "=";
+            require(std::count_if(patch->argv->begin(), patch->argv->end(), [&](const auto& argument) {
+                return argument.starts_with(prefix);
+            }) == 1, "Each required lifecycle hook must be configured exactly once");
+        }
         addon::Delegated_prepare_request delegated;
         delegated.context.launcher           = prepare.launcher;
         delegated.context.launcher_argv      = prepare.launcher_argv;
@@ -131,6 +143,38 @@ int main(int argc, char** argv)
         const auto task_process = addon::decode_delegated_prepare_result(task.output, &failure, 2);
         require(task.succeeded && task_process && task_process->private_artifacts.size() == 1 &&
             task_process->acknowledgment.server_ids == std::vector<std::string>{"control"}, "Delegated control acknowledgment or private wrapper missing");
+        require(task_process->private_artifacts.front().content.find(" mcp --stdio") == std::string::npos,
+            "Exact task-server entrypoint must not acquire provider-invented arguments");
+        // Assert the actual emitted private wrapper, not a second producer.
+        const auto quote = [](std::string_view value) {
+            std::string result = "'";
+            for (const char character : value) {
+                if (character == '\'') {
+#ifdef _WIN32
+                    result += "''";
+#else
+                    result += "'\"'\"'";
+#endif
+                } else result += character;
+            }
+            return result + '\'';
+        };
+        const auto& wrapper = task_process->private_artifacts.front().content;
+#ifdef _WIN32
+        const auto exact_execution = "& " + quote(server.program) + "\nexit $LASTEXITCODE\n";
+#else
+        const auto exact_execution = "exec " + quote(server.program) + "\n";
+#endif
+        require(wrapper.ends_with(exact_execution), "Exact supplied control entrypoint gained arguments");
+        for (const auto& [name, value] : server.environment) {
+#ifdef _WIN32
+            const auto assignment = "$env:" + name + " = " + quote(value) + '\n';
+#else
+            const auto assignment = "export " + name + "=" + quote(value) + '\n';
+#endif
+            require(wrapper.find(assignment) != std::string::npos,
+                "Control wrapper changed an exact supplied environment assignment");
+        }
         require(addon::validate_structured_process_proposal(task_process->process, &failure),
             "Delegated producer must satisfy the host process policy");
         require(std::find(task_process->process.environment_names.begin(), task_process->process.environment_names.end(),
@@ -148,37 +192,75 @@ int main(int argc, char** argv)
         resume.context.launch_environment = environment;
         resume.context.account_context = prepare.account_context;
         resume.resume_record.set("provider_session_id", addon::Json_value("019933a1-6e43-7102-a520-b3c8294cc763"));
-        resume.startup_observer = addon::Startup_observer_offer{1, "http-json-post", "http://127.0.0.1:32871/v1/logs", "Bearer live-private-token", "prepared-identity"};
+        resume.startup_observer = addon::Startup_observer_offer{1, "http-json-post", "http://127.0.0.1:32871/events", ("Bearer " + std::string(64, 'd')), "prepared-identity"};
+        require(addon::decode_startup_observer_offer(
+            addon::encode_startup_observer_offer(*resume.startup_observer), &failure).has_value(),
+            "Positive startup offer must satisfy the actual public decoder");
+        for (const bool bad_endpoint : {false, true}) {
+            auto invalid = *resume.startup_observer;
+            if (bad_endpoint) invalid.endpoint = "http://127.0.0.1:32871/v1/logs";
+            else invalid.authorization = "Bearer live-private-token";
+            require(!addon::decode_startup_observer_offer(
+                addon::encode_startup_observer_offer(invalid), &failure) &&
+                failure.reason_code == "frame_violation",
+                "Malformed public startup offer must remain a frame violation");
+        }
+        auto wrong_endpoint = resume;
+        wrong_endpoint.startup_observer->endpoint = "http://127.0.0.1:32871/v1/logs";
+        Context invalid_endpoint;
+        invalid_endpoint.input = {"invalid-endpoint", {"interactive-resume", 2}, "prepare_resume",
+            addon::encode_resume_prepare_request(wrong_endpoint, 2), 15000};
+        codex::handle_preparation(invalid_endpoint);
+        require(!invalid_endpoint.succeeded && invalid_endpoint.output.is_string() &&
+            invalid_endpoint.output.as_string() == "frame_violation",
+            "Invalid public endpoint must fail before private startup proof");
+        auto malformed_resume = resume;
+        malformed_resume.startup_observer->authorization = "Bearer live-private-token";
+        Context malformed_observer;
+        malformed_observer.input = {"malformed-observer", {"interactive-resume", 2}, "prepare_resume",
+            addon::encode_resume_prepare_request(malformed_resume, 2), 15000};
+        codex::handle_preparation(malformed_observer);
+        require(!malformed_observer.succeeded && malformed_observer.output.is_string() &&
+            malformed_observer.output.as_string() == "frame_violation",
+            "Malformed startup observer offer must remain rejected");
         Context exact;
         exact.input = {"resume", {"interactive-resume", 2}, "prepare_resume", addon::encode_resume_prepare_request(resume, 2), 15000};
         codex::handle_preparation(exact);
         const auto proposal = addon::decode_resume_prepare_result(exact.output, &failure, 2);
-        require(exact.succeeded && proposal && proposal->startup_observer && proposal->startup_observer->authorization == "Bearer live-private-token", "Isolated startup proof or exact observer echo missing");
-        require(addon::validate_resume_process_proposal(proposal->process, &failure) &&
-            addon::validate_launch_patch(proposal->patch, {}, {}, &failure),
-            "Resume producer must satisfy both terminal launch policies");
+        if (!exact.succeeded) std::cerr << "Resume prepare refusal: " << addon::serialize_json(exact.output) << "; " << exact.failure_detail << '\n';
+        require(exact.succeeded && proposal && proposal->startup_observer && proposal->startup_observer->authorization == ("Bearer " + std::string(64, 'd')), "Isolated startup proof or exact observer echo missing");
+        if (!addon::validate_resume_process_proposal(proposal->process, &failure)) {
+            throw std::runtime_error(failure.reason_code + ": " + failure.detail);
+        }
+        if (!addon::validate_launch_patch(proposal->patch, {}, {}, &failure)) {
+            throw std::runtime_error(failure.reason_code + ": " + failure.detail);
+        }
         require(proposal->process.environment_names.empty() && proposal->process.environment.empty() &&
             proposal->process.assets.empty(), "Resume environment must reach the terminal through its patch");
         require(std::count(proposal->patch.set.begin(), proposal->patch.set.end(),
             std::pair<std::string, std::string>{"CODEX_HOME", utf8(root)}) == 1, "Resume patch lost selected profile");
         require(std::count(proposal->patch.set.begin(), proposal->patch.set.end(),
-            std::pair<std::string, std::string>{"OTEL_EXPORTER_OTLP_LOGS_HEADERS", "Authorization=Bearer%20live-private-token"}) == 1,
+            std::pair<std::string, std::string>{"OTEL_EXPORTER_OTLP_LOGS_HEADERS", ("Authorization=Bearer%20" + std::string(64, 'd'))}) == 1,
             "Resume patch lost private observer authorization");
         require(proposal->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763", "Exact resume identity changed");
-        for (const auto& argument : proposal->process.argv) require(argument.find("live-private-token") == std::string::npos, "Startup secret escaped into argv");
+        for (const auto& argument : proposal->process.argv) require(argument.find(std::string(64, 'd')) == std::string::npos, "Startup secret escaped into argv");
         resume.context.launcher.script_body = "codex -c fixture_exporter=true";
         resume.context.launcher_argv = {argv[1], "-c", "fixture_exporter=true"};
         Context conflict;
         conflict.input = {"conflict", {"interactive-resume", 2}, "prepare_resume", addon::encode_resume_prepare_request(resume, 2)};
         codex::handle_preparation(conflict);
         require(!conflict.succeeded, "Existing telemetry exporter overwritten");
-        for (const std::string defect : {"missing-type", "surplus"}) {
+        for (const std::string& defect : {std::string("missing-type"), std::string("surplus")}) {
+            resume.context.launch_environment->effective_environment.set(
+                "CODEX_FIXTURE_OBSERVER", addon::Json_value(defect));
             resume.context.launcher.script_body = "codex -c fixture_observer=" + defect;
             resume.context.launcher_argv = {argv[1], "-c", "fixture_observer=" + defect};
             Context rejected;
             rejected.input = {"invalid-http", {"interactive-resume", 2}, "prepare_resume", addon::encode_resume_prepare_request(resume, 2), 15000};
             codex::handle_preparation(rejected);
-            require(!rejected.succeeded, "Malformed telemetry HTTP established startup support");
+            require(!rejected.succeeded && rejected.output.is_string() &&
+                rejected.output.as_string() == "startup_observer_unavailable",
+                "Malformed telemetry must fail at the actual private startup-observer owner");
         }
         return 0;
     }

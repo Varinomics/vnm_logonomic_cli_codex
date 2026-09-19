@@ -3,6 +3,7 @@
 #include "codex_usage_records.h"
 #include "codex_native_usage.h"
 
+#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #if defined(_WIN32)
@@ -385,7 +386,7 @@ std::optional<addon::Json_value> read_json(const fs::path& path)
     require(static_cast<bool>(input), "usage_storage_read_failed");
     std::string line;
     require(read_line(input, &line), "usage_cache_invalid");
-    auto value = addon::parse_json(line);
+    auto value = addon::parse_json(line, {}, nullptr);
     require(value.has_value() && value->is_object(), "usage_cache_invalid");
     require(!read_line(input, &line), "usage_cache_invalid");
     return value;
@@ -417,7 +418,7 @@ std::string encode_record(const Rollout_usage_record& record)
 
 Rollout_usage_record decode_record(std::string_view line)
 {
-    const auto value = addon::parse_json(line);
+    const auto value = addon::parse_json(line, {}, nullptr);
     require(value && value->is_object(), "usage_cache_invalid");
     addon::Contract_failure failure;
     auto record = addon::decode_usage_record(member(*value, "usage"), &failure, 2);
@@ -446,8 +447,13 @@ bool fingerprint_matches(const addon::Json_value& metadata, const Fingerprint& v
 {
     if (member(metadata, "size") != addon::Json_value(std::to_string(value.size))) return false;
     if (member(metadata, "modified") == addon::Json_value(std::to_string(value.modified.time_since_epoch().count()))) return true;
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+    const auto modified = std::chrono::clock_cast<std::chrono::system_clock>(value.modified);
+#else
+    const auto modified = fs::file_time_type::clock::to_sys(value.modified);
+#endif
     const auto native_msecs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        fs::file_time_type::clock::to_sys(value.modified).time_since_epoch()).count();
+        modified.time_since_epoch()).count();
     return member(metadata, "modified_native_msecs") == addon::Json_value(std::to_string(native_msecs));
 }
 
@@ -474,7 +480,7 @@ void refresh_file(const fs::path& path, const fs::path& work,
     std::string error;
     std::uint64_t file_records = 0;
     std::uint64_t file_bytes = 0;
-    const bool parsed = read_rollout_usage(input, fs::u8path(source), [&](const Rollout_usage_record& record) {
+    const bool parsed = read_rollout_usage(input, addon::path_from_utf8(source), [&](const Rollout_usage_record& record) {
         const auto encoded = encode_record(record);
         require(file_records < active_budget->limits().candidate_records && encoded.size() + 1 <=
             active_budget->limits().candidate_bytes - std::min(file_bytes, active_budget->limits().candidate_bytes),
@@ -550,7 +556,7 @@ void copy_accepted_cache(const addon::Json_value& accepted, const fs::path& snap
     bool have_records  = false;
     while (read_line(inventory, &line)) {
         check_cancel(cancelled);
-        const auto entry = addon::parse_json(line);
+        const auto entry = addon::parse_json(line, {}, nullptr);
         require(entry && entry->is_object(), "required_usage_cache_unavailable");
         const auto name = string_member(*entry, "name");
         require(cache_file_name(name) || name == "snapshot" || name == "records",
@@ -619,7 +625,7 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
     require(request.context.account_context && descriptor.source_account_key == request.context.account_context->adapter_account_key,
         "native_usage_cache_account_mismatch");
     require(digest_name(descriptor.sha256_hex), "native_usage_cache_invalid");
-    const auto path = fs::u8path(descriptor.path);
+    const auto path = addon::path_from_utf8(descriptor.path);
     require(path.is_absolute() && profile_account_key(path_text(path.parent_path())) == profile_account_key(path_text(storage)) &&
         fs::is_regular_file(fs::symlink_status(path)), "native_usage_cache_path_invalid");
     for (const auto& seed : seeds->as_array()) {
@@ -660,7 +666,7 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
     while (read_line(input, &line)) {
         check_cancel(cancelled);
         checked_hash.update(line); checked_hash.update("\n");
-        const auto wrapper = addon::parse_json(line);
+        const auto wrapper = addon::parse_json(line, {}, nullptr);
         require(wrapper && wrapper->is_object(), "native_usage_cache_invalid");
         const auto source = string_member(*wrapper, "path");
         const auto key = cache_key(source);
@@ -959,7 +965,7 @@ void handle_usage(addon::Invocation_context& context)
     if (!profile) return;
     if (!request->context.profile_storage) { context.fail(addon::Result_status::UNAVAILABLE, "profile_storage_unavailable"); return; }
     std::string error;
-    const auto page = scan_usage(*request, fs::u8path(profile->profile_path), fs::u8path(request->context.profile_storage->root),
+    const auto page = scan_usage(*request, addon::path_from_utf8(profile->profile_path), addon::path_from_utf8(request->context.profile_storage->root),
         [&context] { return context.cancel_requested(); }, &error);
     if (!page) { context.fail(error == "cancelled" ? addon::Result_status::CANCELLED : addon::Result_status::FAILED, error); return; }
     context.succeed(addon::encode_usage_scan_result(*page, 2));

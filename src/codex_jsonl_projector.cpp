@@ -201,11 +201,6 @@ Container_path object_path_for_target(Projection_target target)
     }
 }
 
-bool is_parent_object_target(Projection_target target)
-{
-    return object_path_for_target(target) != Container_path::NONE;
-}
-
 std::string target_key(Projection_target target)
 {
     switch (target) {

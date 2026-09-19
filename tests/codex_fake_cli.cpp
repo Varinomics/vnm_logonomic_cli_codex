@@ -71,7 +71,10 @@ int main(int argc, char** argv)
 {
     std::string endpoint;
     bool configured_exporter = false;
-    std::string defect;
+    // Model an intrinsic producer defect across the isolated native probe.
+    // User -c arguments are intentionally omitted by that probe.
+    const char* fixture_defect = std::getenv("CODEX_FIXTURE_OBSERVER");
+    std::string defect = fixture_defect ? fixture_defect : "";
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
 #ifndef _WIN32
