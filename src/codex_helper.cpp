@@ -1,3 +1,5 @@
+#include "codex_hook_metadata.h"
+
 #include <logonomic_cli_addon/helper_client.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
@@ -64,10 +66,7 @@ int main()
     addon::Helper_client client(*environment, cancelled);
     const auto key   = addon::random_nonce_hex();
     const auto nonce = addon::random_nonce_hex();
-    auto metadata = addon::Json_value::object();
-    for (const auto field : {"hook_event_name", "session_id", "turn_id", "agent_id", "agent_type", "source"}) {
-        if (const auto* value = event->find(field)) metadata.set(field, *value);
-    }
+    const auto metadata = codex::hook_metadata(*event);
     auto outcome = client.deliver_provider_event(name->as_string(), metadata, key, nonce);
     if (!short_hook && !outcome.committed && !cancelled() &&
         (outcome.exit_code == addon::k_helper_exit_transport_failure || outcome.exit_code == addon::k_helper_exit_pending))

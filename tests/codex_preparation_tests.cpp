@@ -117,6 +117,12 @@ int main(int argc, char** argv)
                 return argument.starts_with(prefix);
             }) == 1, "Each required lifecycle hook must be configured exactly once");
         }
+        for (const std::string event : {"PreToolUse", "PostToolUse"}) {
+            const auto prefix = "hooks." + event + "=[{matcher=\"^request_user_input$\",hooks=[";
+            require(std::count_if(patch->argv->begin(), patch->argv->end(), [&](const auto& argument) {
+                return argument.starts_with(prefix);
+            }) == 1, "Native question hooks must be narrowly matched and configured exactly once");
+        }
         addon::Delegated_prepare_request delegated;
         delegated.context.launcher           = prepare.launcher;
         delegated.context.launcher_argv      = prepare.launcher_argv;
