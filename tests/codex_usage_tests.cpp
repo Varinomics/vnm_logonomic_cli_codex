@@ -7,6 +7,7 @@
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -454,33 +455,56 @@ void transient_refresh_discards_partial_records_before_acceptance(const fs::path
     const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
     check(baseline && baseline->records.size() == 1, "establish history before a concurrent source change");
 
+    constexpr unsigned k_refresh_records = 500;
     std::string bytes = metadata("transient");
-    for (unsigned index = 0; index < 500; ++index) {
+    for (unsigned index = 0; index < k_refresh_records; ++index) {
         const auto turn = "turn-" + std::to_string(index);
         bytes += start(turn) + tokens(index + 1) + complete(turn);
     }
     check(bytes.size() > 65536, "fixture spans multiple rollout reader chunks");
     write(source, bytes);
+    const auto original_modified = fs::last_write_time(source);
     const auto snapshots = storage / "codex-usage-v1" / "snapshots";
     bool changed_after_output = false;
+    std::size_t records_at_mutation = 0;
     const auto change_during_read = [&] {
         if (!changed_after_output) {
             for (const auto& generation : fs::directory_iterator(snapshots)) {
                 for (const auto& entry : fs::directory_iterator(generation.path())) {
-                    if (entry.path().extension() == ".pending-records" && entry.file_size() > 0) {
-                        fs::last_write_time(source, fs::last_write_time(source) + std::chrono::seconds(5));
-                        changed_after_output = true;
-                        return false;
-                    }
+                    if (entry.path().extension() != ".pending-records" || fs::file_size(entry.path()) == 0) continue;
+                    // Enumeration metadata can lag an open writer on Windows.
+                    // Read the actual output and require a partial parse: the
+                    // callback also runs after close/fingerprint validation,
+                    // when this fixture has all k_refresh_records lines.
+                    std::ifstream pending(entry.path(), std::ios::binary);
+                    check(static_cast<bool>(pending), "open pending records for the mutation phase check");
+                    const auto complete_records = std::count(std::istreambuf_iterator<char>(pending),
+                        std::istreambuf_iterator<char>{}, '\n');
+                    check(!pending.bad(), "read pending records for the mutation phase check");
+                    if (complete_records == 0 || complete_records >= k_refresh_records) continue;
+                    check(fs::last_write_time(source) == original_modified, "source fingerprint is unchanged before mutation");
+                    const auto modified = original_modified + std::chrono::seconds(5);
+                    fs::last_write_time(source, modified);
+                    check(fs::last_write_time(source) == modified, "source fingerprint changes during the partial parse");
+                    records_at_mutation = static_cast<std::size_t>(complete_records);
+                    changed_after_output = true;
+                    return false;
                 }
             }
         }
         return false;
     };
     const auto retained = codex::scan_usage(request, profile, storage, change_during_read, &error);
-    check(changed_after_output, "source changes only after streamed candidate records reach disk");
+    check(changed_after_output && records_at_mutation > 0 && records_at_mutation < k_refresh_records,
+        "source must change during partial parsing, not at the post-fingerprint callback");
+    const auto diagnostic = "transient source change preserves the accepted file evidence: partial_records=" +
+        std::to_string(records_at_mutation) + " error=" + error +
+        (retained ? " incomplete=" + std::to_string(retained->incomplete_historical_coverage) +
+            " records=" + std::to_string(retained->records.size()) +
+            (retained->records.empty() ? "" : " first_tokens=" + std::to_string(retained->records[0].total_tokens))
+            : " no_page");
     check(retained && retained->incomplete_historical_coverage && retained->records.size() == 1 &&
-        retained->records[0].total_tokens == 17, "transient source change preserves the accepted file evidence");
+        retained->records[0].total_tokens == 17, diagnostic.c_str());
     for (const auto& entry : fs::directory_iterator(accepted_snapshot(storage))) {
         check(entry.path().extension() != ".pending-records",
             "accepted generation retains no discarded partial refresh output");
