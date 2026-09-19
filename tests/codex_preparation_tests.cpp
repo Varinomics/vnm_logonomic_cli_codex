@@ -68,6 +68,17 @@ int main(int argc, char** argv)
         if (const char* system_root = std::getenv("SystemRoot")) environment.effective_environment.set("SystemRoot", addon::Json_value(system_root));
         std::vector<std::pair<std::string, std::string>> probe_environment;
         for (const auto& member : environment.effective_environment.as_object()) probe_environment.emplace_back(member.name, member.value.as_string());
+        // More admissions than the custody table holds must survive both
+        // failed spawns and successfully reaped children without leaking slots.
+        for (int attempt = 0; attempt < 64; ++attempt) {
+            Context probe;
+            require(!codex::run_probe({utf8(root / "absent-cli")}, probe_environment, utf8(root), 1000, probe),
+                "Missing probe executable unexpectedly spawned");
+            const auto result = codex::run_probe({argv[1], "--version"}, probe_environment, utf8(root), 1000, probe);
+            require(result && (result->output == "codex-cli 0.150.1\n" ||
+                result->output == "codex-cli 0.150.1\r\n"),
+                "Probe custody admission leaked after failed spawn or child reaping");
+        }
 #ifndef _WIN32
         Context inherited;
         const auto custody = codex::run_probe({argv[1], "--fixture-custody"}, probe_environment, utf8(root), 1000, inherited);
