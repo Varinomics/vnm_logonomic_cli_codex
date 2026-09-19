@@ -861,6 +861,146 @@ addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& iden
     return page;
 }
 
+std::string selection_digest(addon::Usage_scan_request request)
+{
+    request.snapshot_id.reset();
+    request.cursor.reset();
+    return digest(addon::serialize_json_canonical(addon::encode_usage_scan_request(request, 3)));
+}
+
+addon::Usage_scan_page scan_selected_cache(
+    const addon::Usage_scan_request& request,
+    const fs::path& vendor_profile,
+    const fs::path& storage,
+    const std::function<bool()>& cancelled,
+    const Usage_scan_limits& limits)
+{
+    addon::Contract_failure failure;
+    if (!addon::validate_usage_cache_selection(request, &failure)) {
+        throw Scan_failure{failure.reason_code};
+    }
+    const auto& selection = *request.cache_selection;
+    const auto work = addon::path_from_utf8(selection.candidate_root);
+    const auto profile_root = path_text(storage);
+    const auto mutable_root = profile_account_key(path_text(storage / "codex-usage-v1"));
+    const auto outside_mutable_cache = [&](const std::string& root) {
+        for (auto path = addon::path_from_utf8(root); path.has_relative_path(); path = path.parent_path()) {
+            if (profile_account_key(path_text(path)) == mutable_root) {
+                return false;
+            }
+        }
+        return true;
+    };
+    require(outside_mutable_cache(selection.candidate_root) &&
+        (!selection.accepted || outside_mutable_cache(selection.accepted->root)), "usage_cache_namespace_conflict");
+    if (!addon::validate_usage_cache_root(selection.candidate_root, profile_root, &failure)) {
+        throw Scan_failure{failure.reason_code};
+    }
+    const auto request_hash = selection_digest(request);
+    if (request.snapshot_id) {
+        require(request.cursor.has_value(), "usage_cursor_invalid");
+        const auto state = read_json(work / "cache-state");
+        require(state && string_member(*state, "request_sha256") == request_hash &&
+            string_member(*state, "snapshot_id") == *request.snapshot_id, "usage_snapshot_mismatch");
+        auto page = page_at(work, *request.snapshot_id, decimal(*request.cursor), request.context.account_context, cancelled);
+        require(fs::file_size(work / "cache-manifest.json") <= addon::k_max_usage_cache_manifest_bytes,
+            "usage_cache_unavailable");
+        page.cache_candidate = addon::Usage_cache_reference{
+            selection.candidate_root, page.snapshot_id, hash_file(work / "cache-manifest.json", cancelled)};
+        for (auto& record : page.records) {
+            record.aggregate_evidence = "partial";
+        }
+        return page;
+    }
+    require(!request.cursor, "usage_cursor_invalid");
+    if (!addon::validate_usage_cache_allocation(selection.candidate_root, profile_root, &failure)) {
+        throw Scan_failure{failure.reason_code};
+    }
+    Disk_budget budget(work, limits, cancelled);
+    Budget_scope budget_scope(budget);
+    auto seeds = addon::Json_value::array();
+    if (selection.accepted) {
+        const auto accepted = addon::validate_usage_cache_candidate(
+            *selection.accepted, profile_root, request.context.account_context, cancelled, &failure);
+        check_cancel(cancelled);
+        require(accepted && accepted->format == "codex-rollout-cache@1", "usage_cache_unavailable");
+        const auto source = addon::path_from_utf8(selection.accepted->root);
+        const auto state = read_json(source / "cache-state");
+        require(state.has_value(), "usage_cache_unavailable");
+        seeds = member(*state, "native_seeds");
+        require(seeds.is_array(), "usage_cache_unavailable");
+        for (const auto& file : accepted->files) {
+            if (!cache_file_name(file.path)) {
+                continue;
+            }
+            std::ifstream input(source / file.path, std::ios::binary);
+            Budget_output output(work / file.path, std::ios::binary);
+            require(input && output, "usage_cache_unavailable");
+            std::string line;
+            while (read_line(input, &line)) {
+                check_cancel(cancelled);
+                write_line(output, line);
+            }
+            output.close();
+            require(output.good(), "usage_storage_write_failed");
+        }
+    }
+    seed_native_cache(request, storage, work, selection.accepted.has_value(), &seeds, cancelled);
+    require(fs::is_directory(vendor_profile), "usage_sessions_unavailable");
+    const auto sessions = vendor_profile / "sessions";
+    const bool have_sessions = fs::exists(sessions);
+    require(!have_sessions || fs::is_directory(sessions), "usage_sessions_not_directory");
+    bool incomplete = false;
+    fs::recursive_directory_iterator entries;
+    if (have_sessions) {
+        entries = fs::recursive_directory_iterator(sessions);
+    }
+    for (; entries != fs::recursive_directory_iterator{}; ++entries) {
+        check_cancel(cancelled);
+        const auto& entry = *entries;
+        if (hidden_entry(entry)) {
+            entries.disable_recursion_pending();
+            continue;
+        }
+        const auto name = addon::ascii_lowercase(entry.path().filename().string());
+        if (entry.is_regular_file() && name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+            refresh_file(entry.path(), work, request.mode != "incremental", &incomplete, cancelled);
+        }
+    }
+    sorted_snapshot(work, cancelled);
+    const auto identifier = nonce();
+    addon::Observation_scope scope;
+    if (request.context.account_context) {
+        scope.source_account_key = request.context.account_context->adapter_account_key;
+    }
+    scope.observed_at_ms = (std::uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    auto metadata = addon::Json_value::object();
+    metadata.set("scope", addon::encode_observation_scope(scope));
+    metadata.set("incomplete", addon::Json_value(incomplete));
+    write_json(work / "snapshot", metadata);
+    auto state = addon::Json_value::object();
+    state.set("request_sha256", addon::Json_value(request_hash));
+    state.set("snapshot_id", addon::Json_value(identifier));
+    state.set("native_seeds", std::move(seeds));
+    write_json(work / "cache-state", state);
+    auto page = page_at(work, identifier, 0, request.context.account_context, cancelled);
+    // A parsed rollout need not contain all historical contributing events.
+    // This scanner cannot certify lower aggregate corrections from parsing alone.
+    for (auto& record : page.records) {
+        record.aggregate_evidence = "partial";
+    }
+    page.cache_candidate = addon::seal_usage_cache_candidate(
+        selection.candidate_root, profile_root, request.context.account_context,
+        identifier, "codex-rollout-cache@1", cancelled, &failure);
+    if (!page.cache_candidate) {
+        throw Scan_failure{failure.reason_code};
+    }
+    require(addon::decode_usage_scan_result(addon::encode_usage_scan_result(page, 3), &failure, 3).has_value(),
+        "usage_snapshot_invalid");
+    return page;
+}
+
 } // namespace
 
 std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request& request,
@@ -871,6 +1011,9 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         std::unique_lock lock(scan_mutex, std::defer_lock);
         while (!lock.try_lock_for(std::chrono::milliseconds(50))) check_cancel(cancelled);
         check_cancel(cancelled);
+        if (request.cache_selection) {
+            return scan_selected_cache(request, vendor_profile, storage, cancelled, limits);
+        }
         // Bootstrap creates only these three zero-byte entries before inventory.
         require(limits.filesystem_entries >= 3, "usage_disk_budget_exceeded");
         const auto root = directory(storage, "codex-usage-v1");
@@ -959,7 +1102,8 @@ void handle_usage(addon::Invocation_context& context)
 {
     if (context.request().operation != addon::k_usage_scan_operation) { context.reject_unknown_operation(); return; }
     addon::Contract_failure failure;
-    const auto request = addon::decode_usage_scan_request(context.request().payload, &failure, 2);
+    const auto version = context.request().capability.version;
+    const auto request = addon::decode_usage_scan_request(context.request().payload, &failure, version);
     if (!request) { context.fail(addon::Result_status::FAILED, failure.reason_code); return; }
     const auto profile = selected_profile(request->context, context);
     if (!profile) return;
@@ -968,7 +1112,7 @@ void handle_usage(addon::Invocation_context& context)
     const auto page = scan_usage(*request, addon::path_from_utf8(profile->profile_path), addon::path_from_utf8(request->context.profile_storage->root),
         [&context] { return context.cancel_requested(); }, &error);
     if (!page) { context.fail(error == "cancelled" ? addon::Result_status::CANCELLED : addon::Result_status::FAILED, error); return; }
-    context.succeed(addon::encode_usage_scan_result(*page, 2));
+    context.succeed(addon::encode_usage_scan_result(*page, version));
 }
 
 addon::Legacy_import_result import_usage(const addon::Import_record_request& request)

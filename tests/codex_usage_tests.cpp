@@ -2,6 +2,9 @@
 #include "codex_usage.h"
 #include "codex_usage_records.h"
 #include "codex_native_usage.h"
+#include "codex_accounts.h"
+#include <logonomic_cli_addon/host_simulator.h>
+#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #include <chrono>
@@ -626,9 +629,125 @@ void disk_limits_refuse_growth_without_publishing(const fs::path& fixture)
         "over-budget native evidence cannot publish an accepted generation");
 }
 
+void selected_cache_preserves_host_authority(const fs::path& fixture)
+{
+    const auto profile = fixture / "selected-profile";
+    const auto storage = fixture / "selected-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-selected.jsonl";
+    write(source, metadata() + start("turn-one") + tokens(19) + complete("turn-one"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, addon::path_to_utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "selected-account"};
+    const auto allocate = [&](const char* name) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate fresh candidate");
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(path)};
+    };
+    const auto cancelled = [] { return false; };
+    std::string error;
+    allocate("first");
+    const auto first = codex::scan_usage(request, profile, storage, cancelled, &error);
+    check(first && first->cache_candidate && first->records.front().total_tokens == 19, "first immutable candidate");
+    check(first->records.front().aggregate_evidence == "partial", "parsing alone does not certify a complete aggregate");
+    check(!fs::exists(storage / "codex-usage-v1"), "usage3 never creates or promotes the usage2 namespace");
+    write(source, metadata() + start("turn-one") + tokens(7) + complete("turn-one"));
+    allocate("rejected");
+    request.cache_selection->accepted = first->cache_candidate;
+    request.mode = "repair";
+    const auto rejected = codex::scan_usage(request, profile, storage, cancelled, &error);
+    check(rejected && rejected->records.front().total_tokens == 7 && rejected->cache_candidate,
+        "lower partial candidate remains explicitly unaccepted");
+    check(fs::remove(source), "remove source to expose selected cache identity");
+    allocate("retry");
+    request.cache_selection->accepted = first->cache_candidate;
+    const auto retry = codex::scan_usage(request, profile, storage, cancelled, &error);
+    check(retry && retry->records.front().total_tokens == 19, "host-selected cache wins over newer rejected candidate");
+    addon::Contract_failure failure;
+    check(addon::validate_usage_cache_candidate(*first->cache_candidate, addon::path_to_utf8(storage),
+        request.context.account_context, cancelled, &failure).has_value(), "original accepted cache remains intact");
+    allocate("reset");
+    request.mode = "reset";
+    const auto reset = codex::scan_usage(request, profile, storage, cancelled, &error);
+    check(reset && reset->complete && reset->records.empty(), "usage3 reset successfully drops source-absent retained history");
+    check(fs::exists(storage / "first" / "cache-manifest.json") && fs::exists(storage / "rejected" / "cache-manifest.json"),
+        "provider never prunes accepted or unaccepted candidates");
+    allocate("cancelled");
+    check(!codex::scan_usage(request, profile, storage, [] { return true; }, &error) && error == "cancelled",
+        "cancellation does not publish any acceptance");
+    write(storage / "first" / "records", "corrupt\n");
+    allocate("corrupt-input");
+    request.mode = "incremental";
+    request.cache_selection->accepted = first->cache_candidate;
+    check(!codex::scan_usage(request, profile, storage, cancelled, &error) && error == "usage_cache_unavailable",
+        "corrupt host-selected cache cannot fall back to the valid newer candidate");
+}
+
+void adapter_cache_selection_contract(const fs::path& package, const fs::path& fixture)
+{
+    const auto profile = fixture / "adapter-profile";
+    fs::create_directories(profile / "sessions");
+    const auto source = profile / "sessions" / "rollout-adapter.jsonl";
+    std::string bytes = metadata();
+    for (int i = 0; i < 270; ++i) {
+        const auto turn = "turn-" + std::to_string(i);
+        bytes += start(turn) + tokens(i + 1) + complete(turn);
+    }
+    write(source, bytes);
+    addon::Simulator_options options;
+    options.package_directory = package;
+    options.profile_storage_root = fixture / "adapter-cache";
+    addon::Host_simulator host(options, nullptr);
+    addon::Contract_failure failure;
+    check(host.start(&failure), failure.detail.c_str());
+    const auto native_profile = addon::path_to_utf8(profile);
+    const auto account_key = codex::profile_account_key(native_profile);
+    std::string error;
+    const auto allocated = addon::allocate_profile_storage_root(
+        host.profile_storage_root(), "logonomic.cli.codex", &error, account_key);
+    check(allocated.has_value(), error.c_str());
+    const auto candidate = addon::path_from_utf8(*allocated) / "scan-one";
+    check(fs::create_directory(candidate), "allocate real adapter candidate");
+    addon::Usage_scan_request request;
+    request.context.launcher = {"codex", addon::k_runner_direct, {}};
+    request.context.launcher_argv = {"codex"};
+    request.context.profile_storage = addon::Profile_storage_context{1, *allocated};
+    request.context.account_context = addon::Account_context{2, account_key, native_profile};
+    request.context.launch_environment = addon::Launch_environment{
+        addon::host_platform_id(), addon::Json_value::object(), std::nullopt};
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(candidate)};
+    addon::Simulator_invocation_options invocation;
+    invocation.profile_storage = request.context.profile_storage;
+    const auto acknowledge_id = host.invoke({"profile-storage", 1}, "acknowledge",
+        addon::Json_value::object(), 5000, invocation);
+    const auto acknowledged = host.wait_outcome(acknowledge_id, 6000);
+    check(acknowledged && acknowledged->status == addon::Host_status::SUCCESS, "adapter acknowledges real profile allocation");
+    const auto scan = [&] {
+        const auto id = host.invoke({"usage-scan", 3}, "scan", addon::encode_usage_scan_request(request, 3), 15000);
+        const auto outcome = host.wait_outcome(id, 16000);
+        check(outcome && outcome->status == addon::Host_status::SUCCESS, "actual packaged adapter scan succeeds");
+        const auto page = addon::decode_usage_scan_result(outcome->payload, &failure, 3);
+        check(page.has_value(), failure.detail.c_str());
+        return *page;
+    };
+    const auto first = scan();
+    check(!first.complete && first.records.size() == 256 && first.cache_candidate, "adapter supplies bounded sealed first page");
+    request.snapshot_id = first.snapshot_id;
+    request.cursor = first.next_cursor;
+    const auto last = scan();
+    check(last.complete && last.records.size() == 14 && last.cache_candidate == first.cache_candidate,
+        "actual adapter preserves cache descriptor across pages");
+    check(addon::validate_usage_cache_candidate(*last.cache_candidate, *allocated,
+        request.context.account_context, [] { return false; }, &failure).has_value(), "actual adapter cache verifies after paging");
+    check(host.shutdown(1000, nullptr), "actual adapter exits without any model request");
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     try {
         Temporary_directory fixture;
@@ -645,6 +764,9 @@ int main()
         empty_native_cache_is_accepted_evidence(fixture.path);
         native_turn_identity_remains_validated(fixture.path / "rollout-native.jsonl");
         disk_limits_refuse_growth_without_publishing(fixture.path);
+        selected_cache_preserves_host_authority(fixture.path);
+        check(argc == 2, "usage tests require the built package directory");
+        adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path);
         return 0;
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

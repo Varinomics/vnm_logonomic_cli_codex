@@ -163,7 +163,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 3}, {"structured-session", 2}, {"delegated-session", 2},
         {"interactive-resume", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
-        {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"legacy-state-import", 1},
+        {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);
