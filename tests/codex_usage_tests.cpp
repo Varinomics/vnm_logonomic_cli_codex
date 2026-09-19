@@ -710,7 +710,7 @@ void selected_cache_preserves_host_authority(const fs::path& fixture)
         "corrupt host-selected cache cannot fall back to the valid newer candidate");
 }
 
-void adapter_cache_selection_contract(const fs::path& package, const fs::path& fixture)
+void adapter_cache_selection_contract(const fs::path& package, const fs::path& fixture, bool long_allocation)
 {
     const auto profile = fixture / "adapter-profile";
     fs::create_directories(profile / "sessions");
@@ -733,8 +733,12 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     const auto allocated = addon::allocate_profile_storage_root(
         host.profile_storage_root(), "logonomic.cli.codex", &error, account_key);
     check(allocated.has_value(), error.c_str());
-    const auto candidate = addon::path_from_utf8(*allocated) / "scan-one";
-    check(fs::create_directory(candidate), "allocate real adapter candidate");
+    auto allocation_parent = addon::path_from_utf8(*allocated);
+    while (long_allocation && allocation_parent.native().size() < 291) {
+        allocation_parent /= "retained-account-cache-allocation-component";
+    }
+    const auto candidate = allocation_parent / "scan-one";
+    check(fs::create_directories(addon::usage_cache_io_path(candidate)), "allocate real adapter candidate");
     addon::Usage_scan_request request;
     request.context.launcher = {"codex", addon::k_runner_direct, {}};
     request.context.launcher_argv = {"codex"};
@@ -753,7 +757,8 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
         const auto id = host.invoke({"usage-scan", 3}, "scan",
             addon::encode_usage_scan_request(request, 3), 15000, invocation);
         const auto outcome = host.wait_outcome(id, 16000);
-        check(outcome && outcome->status == addon::Host_status::SUCCESS, "actual packaged adapter scan succeeds");
+        check(outcome && outcome->status == addon::Host_status::SUCCESS,
+            outcome ? outcome->reason_code.c_str() : "actual packaged adapter scan timed out");
         check(!addon::account_context_acknowledgment_failure(*request.context.account_context, outcome->payload),
             "actual adapter acknowledges exact account context on every page");
         check(!addon::profile_storage_acknowledgment_failure(*request.context.profile_storage, outcome->payload),
@@ -771,6 +776,23 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
         "actual adapter preserves cache descriptor across pages");
     check(addon::validate_usage_cache_candidate(*last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "actual adapter cache verifies after paging");
+    check(fs::remove(source), "remove native history to exercise selected cache replay");
+    const auto replay_candidate = allocation_parent / "scan-replay";
+    check(fs::create_directory(addon::usage_cache_io_path(replay_candidate)), "allocate replay candidate");
+    request.snapshot_id.reset();
+    request.cursor.reset();
+    request.cache_selection = addon::Usage_cache_selection{first.cache_candidate, addon::path_to_utf8(replay_candidate)};
+    const auto replay = scan();
+    check(replay.records.size() == 256 && replay.cache_candidate &&
+        replay.cache_candidate->root == addon::path_to_utf8(replay_candidate),
+        "selected cache replay writes a new candidate without changing its wire identity");
+    request.snapshot_id = replay.snapshot_id;
+    request.cursor = replay.next_cursor;
+    const auto replay_last = scan();
+    check(replay_last.complete && replay_last.records.size() == 14 && replay_last.cache_candidate == replay.cache_candidate,
+        "selected cache replay preserves all records across pages");
+    check(addon::validate_usage_cache_candidate(*replay_last.cache_candidate, *allocated,
+        request.context.account_context, [] { return false; }, &failure).has_value(), "replayed cache seals and reopens");
     check(host.shutdown(1000, nullptr), "actual adapter exits without any model request");
 }
 
@@ -795,7 +817,8 @@ int main(int argc, char** argv)
         disk_limits_refuse_growth_without_publishing(fixture.path);
         selected_cache_preserves_host_authority(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
-        adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path);
+        adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "short-allocation", false);
+        adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "long-allocation", true);
         return 0;
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

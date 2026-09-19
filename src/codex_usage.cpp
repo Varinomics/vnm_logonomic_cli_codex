@@ -880,7 +880,7 @@ addon::Usage_scan_page scan_selected_cache(
         throw Scan_failure{failure.reason_code};
     }
     const auto& selection = *request.cache_selection;
-    const auto work = addon::path_from_utf8(selection.candidate_root);
+    const auto work = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root));
     const auto profile_root = path_text(storage);
     const auto mutable_root = profile_account_key(path_text(storage / "codex-usage-v1"));
     const auto outside_mutable_cache = [&](const std::string& root) {
@@ -926,7 +926,7 @@ addon::Usage_scan_page scan_selected_cache(
             *selection.accepted, profile_root, request.context.account_context, cancelled, &failure);
         check_cancel(cancelled);
         require(accepted && accepted->format == "codex-rollout-cache@1", "usage_cache_unavailable");
-        const auto source = addon::path_from_utf8(selection.accepted->root);
+        const auto source = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root));
         const auto state = read_json(source / "cache-state");
         require(state.has_value(), "usage_cache_unavailable");
         seeds = member(*state, "native_seeds");
