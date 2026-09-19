@@ -1,0 +1,129 @@
+cmake_minimum_required(VERSION 3.25)
+cmake_policy(SET CMP0141 NEW)
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+set(CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV OFF CACHE BOOL "Do not capture the configure environment" FORCE)
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV)
+if(POLICY CMP0168)
+    cmake_policy(SET CMP0168 NEW)
+elseif(CMAKE_GENERATOR STREQUAL "FASTBuild")
+    message(FATAL_ERROR "FASTBuild package builds require direct FetchContent population (CMP0168).")
+endif()
+project(logonomic_cli_codex VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(LOGONOMIC_CLI_ADDON_SDK_SOURCE "" CACHE PATH "Local Logonomic CLI add-on SDK source override")
+set(LOGONOMIC_CLI_ADDON_SDK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+if(LOGONOMIC_CLI_ADDON_SDK_SOURCE)
+    add_subdirectory("${LOGONOMIC_CLI_ADDON_SDK_SOURCE}" "${CMAKE_BINARY_DIR}/sdk")
+else()
+    include(FetchContent)
+    FetchContent_Declare(logonomic_sdk_source
+        GIT_REPOSITORY https://github.com/Varinomics/logonomic.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE
+        SOURCE_SUBDIR sdk/logonomic_cli_addon_sdk)
+    FetchContent_MakeAvailable(logonomic_sdk_source)
+endif()
+
+function(codex_target target)
+    target_link_libraries(${target} PRIVATE logonomic_cli_addon_sdk::sdk)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+        target_compile_definitions(${target} PRIVATE
+            _WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+    endif()
+endfunction()
+
+add_library(codex_provider STATIC
+    src/codex_accounts.cpp
+    src/codex_jsonl.cpp
+    src/codex_jsonl_projector.cpp
+    src/codex_launcher.cpp
+    src/codex_lifecycle.cpp
+    src/codex_preparation.cpp
+    src/codex_probes.cpp
+    src/codex_startup_observation.cpp
+    src/codex_startup_probe.cpp
+    src/codex_usage.cpp
+    src/codex_native_usage.cpp
+    src/codex_usage_records.cpp)
+codex_target(codex_provider)
+target_include_directories(codex_provider PUBLIC src)
+target_link_libraries(codex_provider PUBLIC logonomic_cli_addon_sdk::sdk)
+if(WIN32)
+    target_link_libraries(codex_provider PRIVATE ws2_32)
+endif()
+
+add_executable(codex_adapter src/adapter.cpp)
+target_link_libraries(codex_adapter PRIVATE codex_provider)
+codex_target(codex_adapter)
+add_executable(codex_helper src/codex_helper.cpp)
+codex_target(codex_helper)
+add_executable(codex_launch_bridge src/codex_launch_bridge.cpp)
+codex_target(codex_launch_bridge)
+
+logonomic_cli_addon_package_platform(CODEX_PLATFORM)
+set(CODEX_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
+logonomic_cli_addon_package_directory(logonomic.cli.codex CODEX_PACKAGE_DIRECTORY)
+configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
+file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance/*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/notices/*")
+add_custom_command(
+    OUTPUT "${CODEX_PACKAGE_DIRECTORY}/package.files.json"
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CODEX_PACKAGE_DIRECTORY}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${CODEX_PACKAGE_DIRECTORY}/adapter" "${CODEX_PACKAGE_DIRECTORY}/helpers"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/package/assets" "${CODEX_PACKAGE_DIRECTORY}/assets"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities" "${CODEX_PACKAGE_DIRECTORY}/capabilities"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance" "${CODEX_PACKAGE_DIRECTORY}/provenance"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/package/notices" "${CODEX_PACKAGE_DIRECTORY}/notices"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CODEX_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
+    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_adapter>" "${CODEX_PACKAGE_DIRECTORY}/adapter/codex_adapter${CODEX_EXECUTABLE_SUFFIX}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_helper>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_helper${CODEX_EXECUTABLE_SUFFIX}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_launch_bridge>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_launch_bridge${CODEX_EXECUTABLE_SUFFIX}"
+    COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${CODEX_PACKAGE_DIRECTORY}"
+        --third-party "assets/openai.svg" "notices/lobe_icons_mit.txt"
+            "provenance/lobe_icons.json"
+        --third-party "assets/openai-white.svg" "notices/lobe_icons_mit.txt"
+            "provenance/lobe_icons.json"
+    DEPENDS codex_adapter codex_helper codex_launch_bridge logonomic_cli_addon_index
+        "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" ${package_files}
+    VERBATIM)
+add_custom_target(codex_package ALL DEPENDS "${CODEX_PACKAGE_DIRECTORY}/package.files.json")
+
+enable_testing()
+add_executable(codex_fake_cli tests/codex_fake_cli.cpp)
+codex_target(codex_fake_cli)
+set_target_properties(codex_fake_cli PROPERTIES OUTPUT_NAME codex)
+if(WIN32)
+    target_link_libraries(codex_fake_cli PRIVATE ws2_32)
+endif()
+add_executable(codex_preparation_tests tests/codex_preparation_tests.cpp)
+target_link_libraries(codex_preparation_tests PRIVATE codex_provider)
+codex_target(codex_preparation_tests)
+add_dependencies(codex_preparation_tests codex_fake_cli)
+add_test(NAME codex_preparation_tests COMMAND codex_preparation_tests "$<TARGET_FILE:codex_fake_cli>")
+set_tests_properties(codex_preparation_tests PROPERTIES TIMEOUT 45)
+foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup_observation_tests codex_probe_tests codex_usage_tests)
+    add_executable(${test_name} "tests/${test_name}.cpp")
+    target_link_libraries(${test_name} PRIVATE codex_provider)
+    codex_target(${test_name})
+    if(test_name STREQUAL "codex_probe_tests")
+        add_dependencies(${test_name} codex_fake_cli)
+        add_test(NAME ${test_name} COMMAND ${test_name} "$<TARGET_FILE:codex_fake_cli>")
+    else()
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endif()
+    set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+endforeach()
+add_test(NAME codex_package_validation COMMAND logonomic_cli_addon_validate "${CODEX_PACKAGE_DIRECTORY}" --platform "${CODEX_PLATFORM}")
+add_test(NAME codex_package_conformance COMMAND logonomic_cli_addon_conformance "${CODEX_PACKAGE_DIRECTORY}")
+logonomic_cli_addon_install_package("${CODEX_PACKAGE_DIRECTORY}" logonomic.cli.codex)

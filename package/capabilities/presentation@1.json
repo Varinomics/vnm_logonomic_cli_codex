@@ -1,0 +1,11 @@
+{
+  "payload": {
+    "icon": {
+      "light": "assets/openai.svg",
+      "dark": "assets/openai-white.svg"
+    },
+    "display_name": "Codex"
+  },
+  "capability_id": "presentation",
+  "version": 1
+}

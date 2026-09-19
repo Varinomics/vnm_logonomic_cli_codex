@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "payload": {
+    "startup_observer": {
+      "mechanism": "http-json-post",
+      "confirmation": "prepared-identity",
+      "version": 1
+    },
+    "environment_names": [
+      "CODEX_HOME",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP",
+      "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+      "NODE_OPTIONS",
+      "NODE_PATH",
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_HEADERS"
+    ]
+  },
+  "capability_id": "interactive-resume"
+}

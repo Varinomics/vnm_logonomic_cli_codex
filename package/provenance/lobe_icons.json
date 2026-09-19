@@ -1,0 +1,16 @@
+{
+  "upstream": "https://github.com/lobehub/lobe-icons",
+  "snapshot": "4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
+  "source_path": "packages/static-svg/icons/openai.svg",
+  "source_sha256": "a595df6b423920c67a7f8f73c063e4bfb72d415948097b6cac063a2366bb5186",
+  "notice": "notices/lobe_icons_mit.txt",
+  "resources": [
+    "assets/openai.svg",
+    "assets/openai-white.svg"
+  ],
+  "changes": [
+    "Inherited original currentColor and fixed-white variants from Logonomic.",
+    "Removed root browser-layout style flex:none;line-height:1 and replaced root width/height 1em with numeric 24. All viewBox, path and fill data are preserved."
+  ],
+  "provenance_basis": "Logonomic compliance/evidence/LOBE_ICONS_PROVENANCE.md records this snapshot as a reproducible source reference, not the historical import revision."
+}

@@ -1,0 +1,23 @@
+{
+  "payload": {
+    "purposes": [
+      "implementation"
+    ],
+    "environment_names": [
+      "CODEX_HOME",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP",
+      "NODE_OPTIONS",
+      "NODE_PATH",
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_HEADERS"
+    ]
+  },
+  "capability_id": "delegated-session",
+  "version": 2
+}

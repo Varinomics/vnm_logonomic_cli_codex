@@ -1,0 +1,12 @@
+{
+  "provider": "Codex",
+  "source": "https://github.com/openai/codex",
+  "native_integration_source": "Varinomics/logonomic/src/logonomic_codex_cli_provider.cpp",
+  "native_integration_snapshot": "fc1f5acd",
+  "native_integration_followups": ["aa8f9f051904749890f669f03a12b603f9602656"],
+  "lifecycle_minimum": "0.146.0",
+  "delegated_implementation_minimum": "0.150.1",
+  "forward_policy": "Newer versions are admitted after launcher verification; protocol records and startup observation are validated.",
+  "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
+  "icons_license": "notices/lobe_icons_mit.txt"
+}

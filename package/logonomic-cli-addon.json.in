@@ -1,0 +1,13 @@
+{
+  "bootstrap_version": 1,
+  "package_id": "logonomic.cli.codex",
+  "release_version": "@PROJECT_VERSION@",
+  "platforms": ["@CODEX_PLATFORM@"],
+  "adapter": {
+    "path": {"@CODEX_PLATFORM@": "adapter/codex_adapter@CODEX_EXECUTABLE_SUFFIX@"},
+    "argv": [],
+    "environment": {}
+  },
+  "core_protocol_generations": [1],
+  "integrity_index": "package.files.json"
+}

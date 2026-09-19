@@ -1,0 +1,13 @@
+{
+  "payload": {
+    "environment_names": [
+      "CODEX_HOME",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  },
+  "capability_id": "launcher-discovery",
+  "version": 1
+}

@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "capability_id": "accounts",
+  "payload": {
+    "environment_names": [
+      "CODEX_HOME",
+      "HOME",
+      "USERPROFILE",
+      "PATH",
+      "PATHEXT",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL"
+    ]
+  }
+}
