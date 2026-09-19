@@ -63,7 +63,7 @@ target_link_libraries(codex_adapter PRIVATE codex_provider)
 codex_target(codex_adapter)
 add_executable(codex_helper src/codex_helper.cpp)
 codex_target(codex_helper)
-add_executable(codex_launch_bridge src/codex_launch_bridge.cpp)
+logonomic_cli_addon_add_launch_bridge(codex_launch_bridge)
 codex_target(codex_launch_bridge)
 
 logonomic_cli_addon_package_platform(CODEX_PLATFORM)
