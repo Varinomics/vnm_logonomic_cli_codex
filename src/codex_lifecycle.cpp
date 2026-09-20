@@ -1,9 +1,12 @@
 #include "codex_lifecycle.h"
 
+#include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 
 #include <array>
 #include <algorithm>
+#include <charconv>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -101,6 +104,116 @@ bool question_response(const addon::Json_value& body, const std::vector<std::str
     return true;
 }
 
+std::string question_request_id(const std::string& session, const std::string& turn, const std::string& call)
+{
+    addon::Provider_event identity;
+    identity.name = "request_user_input";
+    identity.body.set("session_id", addon::Json_value(session));
+    identity.body.set("turn_id", addon::Json_value(turn));
+    identity.body.set("tool_use_id", addon::Json_value(call));
+    return "codex-question-" + addon::provider_event_evidence_digest_hex(identity);
+}
+
+bool exact_members(const addon::Json_value& value, std::initializer_list<std::string_view> names)
+{
+    return value.is_object() && value.as_object().size() == names.size() &&
+        std::all_of(names.begin(), names.end(), [&](auto name) { return value.find(name); });
+}
+
+bool positive_decimal(const addon::Json_value& value)
+{
+    if (!value.is_string()) {
+        return false;
+    }
+    const auto& text = value.as_string();
+    if (text.empty() || text.front() < '1' || text.front() > '9') {
+        return false;
+    }
+    std::uint64_t number = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), number);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+bool action_required_title(std::string_view title)
+{
+    // Codex TUI status_surfaces.rs: both blink phases mean Action Required;
+    // realtime listening adds a microphone dot and configured items use " | ".
+    constexpr std::string_view microphone = "\xe2\x97\x8f ";
+    if (title.starts_with(microphone)) {
+        title.remove_prefix(microphone.size());
+    }
+    for (const std::string_view prefix : {"[ ! ] Action Required", "[ . ] Action Required"}) {
+        if (title.starts_with(prefix) &&
+            (title.size() == prefix.size() || title.substr(prefix.size()).starts_with(" | ")))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<addon::Attention_classification_result> classify_native_signal(
+    const addon::Attention_classification_request& request)
+{
+    // This envelope is supplied only by the host terminal lane, never helper
+    // ingress. The host owns authentication, generation/epoch/sequence freshness,
+    // and matching the returned request ID to its retained root candidate.
+    const auto& body = request.base.event.body;
+    if (!exact_members(body, {"origin", "terminal_event", "candidate"}) ||
+        *body.find("origin") != addon::Json_value("host_terminal"))
+    {
+        return std::nullopt;
+    }
+    const auto& terminal = *body.find("terminal_event");
+    const auto& candidate = *body.find("candidate");
+    if (!exact_members(terminal, {"terminal_id", "generation", "source", "stream", "stream_index", "timestamp", "payload"}) ||
+        !exact_members(candidate, {"session_id", "turn_id", "tool_use_id"}) ||
+        !positive_decimal(*terminal.find("terminal_id")) || !positive_decimal(*terminal.find("generation")) ||
+        *terminal.find("source") != addon::Json_value("logonomic_terminal_worker") ||
+        *terminal.find("stream") != addon::Json_value("terminal") ||
+        *terminal.find("stream_index") != addon::Json_value(0) || !terminal.find("timestamp")->is_number())
+    {
+        return std::nullopt;
+    }
+    const auto& payload = *terminal.find("payload");
+    if (!exact_members(payload, {"kind", "title_sequence", "title"}) ||
+        *payload.find("kind") != addon::Json_value("terminal_title_changed") ||
+        !positive_decimal(*payload.find("title_sequence")))
+    {
+        return std::nullopt;
+    }
+    const auto session = metadata(candidate, "session_id");
+    const auto turn    = metadata(candidate, "turn_id");
+    const auto call    = metadata(candidate, "tool_use_id");
+    const auto& ledger = request.base.ledger;
+    if (!session || !turn || !call || !ledger.current_epoch || !ledger.current_transition ||
+        ledger.current_transition->provider_session_id != *session)
+    {
+        return std::nullopt;
+    }
+    const auto& title = *payload.find("title");
+    if (!title.is_null() && !title.is_string()) {
+        return std::nullopt;
+    }
+    addon::Attention_classification_result result;
+    // Empty, unavailable and nonmatching titles withdraw corroboration only.
+    // They are neither an answer nor a model-readiness observation.
+    if (title.is_null() || !action_required_title(title.as_string())) {
+        return result;
+    }
+    addon::Lifecycle_observation observation;
+    observation.provider_event_name   = request.base.event.name;
+    observation.provider_session_id   = *session;
+    observation.provider_turn_id      = *turn;
+    observation.attention_request_id  = question_request_id(*session, *turn, *call);
+    observation.attention_transition  = addon::Attention_transition::REQUESTED;
+    observation.attention_evidence    = addon::Evidence::INFERRED;
+    result.base.classification = addon::Classification::EVENT;
+    result.base.observations.push_back(std::move(observation));
+    result.attention_kind = addon::Attention_kind{0, "interactive_question"};
+    return result;
+}
+
 } // namespace
 
 std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_event_request& request)
@@ -177,13 +290,41 @@ std::optional<addon::Attention_classification_result> classify_attention(
     const addon::Attention_classification_request& request)
 {
     const auto& event = request.base.event;
+    if (event.name == "NativeSignal") {
+        return classify_native_signal(request);
+    }
     if (event.name != "PreToolUse" && event.name != "PostToolUse") {
         auto base = classify_hook(request.base);
         if (!base) {
             return std::nullopt;
         }
         addon::Attention_classification_result result{std::move(*base), std::nullopt};
-        if (!result.base.observations.empty() && event.name == "PermissionRequest") {
+        if (result.base.observations.empty()) {
+            return result;
+        }
+        auto& observation = result.base.observations.front();
+        if (event.name == "Stop") {
+            const auto* message = event.body.find("last_assistant_message");
+            if (message && message->is_string() && message->as_string().size() <= 2048 &&
+                addon::looks_like_reply_request(message->as_string()))
+            {
+                observation.attention_transition = addon::Attention_transition::REQUESTED;
+                observation.attention_evidence   = addon::Evidence::INFERRED;
+                observation.attention_request_id = "conversation-" + std::to_string(request.base.ledger.current_epoch) + "-" +
+                    (request.base.ledger.current_transition ? request.base.ledger.current_transition->nonce : std::string{}) + "-" +
+                    addon::provider_event_evidence_digest_hex(event);
+                result.attention_kind = addon::Attention_kind{0, "conversational_hint"};
+            }
+        }
+        else
+        if (event.name == "UserPromptSubmit" && request.pending_conversational_request_id) {
+            observation.attention_transition = addon::Attention_transition::RESOLVED;
+            observation.attention_evidence   = addon::Evidence::INFERRED;
+            observation.attention_request_id = *request.pending_conversational_request_id;
+            result.attention_kind = addon::Attention_kind{0, "conversational_hint"};
+        }
+        else
+        if (event.name == "PermissionRequest") {
             result.attention_kind = addon::Attention_kind{0, "permission"};
         }
         return result;
@@ -205,17 +346,11 @@ std::optional<addon::Attention_classification_result> classify_attention(
     {
         return std::nullopt;
     }
-    addon::Provider_event identity;
-    identity.name = "request_user_input";
-    identity.body.set("session_id", addon::Json_value(*session));
-    identity.body.set("turn_id", addon::Json_value(*turn));
-    identity.body.set("tool_use_id", addon::Json_value(*call));
-
     addon::Lifecycle_observation observation;
     observation.provider_event_name = event.name;
     observation.provider_session_id = *session;
     observation.provider_turn_id    = *turn;
-    observation.attention_request_id = "codex-question-" + addon::provider_event_evidence_digest_hex(identity);
+    observation.attention_request_id = question_request_id(*session, *turn, *call);
     // PreToolUse is an attempt, before validation and other hooks. The host must
     // corroborate this candidate with PTY presentation before showing an indicator.
     observation.attention_evidence = addon::Evidence::INFERRED;
@@ -223,7 +358,9 @@ std::optional<addon::Attention_classification_result> classify_attention(
         ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED;
     result.base.classification = addon::Classification::EVENT;
     result.base.observations.push_back(std::move(observation));
-    result.attention_kind = addon::Attention_kind{0, "interactive_question"};
+    if (event.name == "PreToolUse") {
+        result.attention_kind = addon::Attention_kind{0, "interactive_question_candidate"};
+    }
     return result;
 }
 

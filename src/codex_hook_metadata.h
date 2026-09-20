@@ -15,6 +15,14 @@ inline logonomic::cli_addon::Json_value hook_metadata(const logonomic::cli_addon
             result.set(field, *value);
         }
     }
+    const auto* name = event.find("hook_event_name");
+    if (name && name->is_string() && name->as_string() == "Stop" && !event.find("agent_id")) {
+        // The existing local inference feed retains only complete bounded root replies.
+        const auto* reply = event.find("last_assistant_message");
+        if (reply && reply->is_string() && reply->as_string().size() <= 2048) {
+            result.set("last_assistant_message", *reply);
+        }
+    }
     const auto* tool = event.find("tool_name");
     if (tool && tool->is_string() && tool->as_string() == "request_user_input") {
         // Preserve native question evidence verbatim; no host presentation fact is a CLI hook.

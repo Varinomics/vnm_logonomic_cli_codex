@@ -16,6 +16,225 @@ bool check(bool condition, const char* message)
     return condition;
 }
 
+bool title_corroboration(const std::string& request_id)
+{
+    // Oracle: root-approved host envelope and Codex TUI action-required title
+    // formatting. Real PTY visibility/answer and host freshness need their own gates.
+    addon::Attention_classification_request request;
+    request.base.event.name = "NativeSignal";
+    request.base.ledger.current_epoch = 1;
+    request.base.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-a", std::string(64, 'a')};
+    request.base.event.body = *addon::parse_json(R"({
+        "origin":"host_terminal",
+        "terminal_event":{
+            "terminal_id":"17","generation":"2","source":"logonomic_terminal_worker",
+            "stream":"terminal","stream_index":0,"timestamp":1234.5,
+            "payload":{"kind":"terminal_title_changed","title_sequence":"8","title":null}
+        },
+        "candidate":{"session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a"}
+    })", {}, nullptr);
+    const auto original = request.base.event.body;
+    bool ok = true;
+    for (const auto title : {"[ ! ] Action Required", "[ . ] Action Required",
+        "[ ! ] Action Required | project", "[ . ] Action Required | project | thread",
+        "\xe2\x97\x8f [ ! ] Action Required | project"})
+    {
+        request.base.event.body.find("terminal_event")->find("payload")->set("title", addon::Json_value(title));
+        const auto raw = addon::serialize_json(request.base.event.body);
+        const auto result = codex::classify_attention(request);
+        if (!check(result && result->base.observations.size() == 1 && result->attention_kind &&
+            result->attention_kind->kind == "interactive_question", "Matching title did not corroborate candidate"))
+        {
+            return false;
+        }
+        const auto& observation = result->base.observations.front();
+        ok &= check(observation.attention_request_id == request_id &&
+            observation.attention_transition == addon::Attention_transition::REQUESTED &&
+            observation.attention_evidence == addon::Evidence::INFERRED &&
+            observation.provider_event_name == "NativeSignal" &&
+            observation.provider_session_id == "session-a" && observation.provider_turn_id == "turn-a",
+            "Title promotion lost native identity, host origin or inferred evidence");
+        ok &= check(addon::serialize_json(request.base.event.body) == raw, "Classifier altered host provenance");
+        ok &= check(!codex::classify_hook(request.base), "Host signal accepted as a native hook");
+    }
+    for (const auto title : {addon::Json_value(), addon::Json_value(""), addon::Json_value("Working"),
+        addon::Json_value("Action Required"), addon::Json_value("[ ! ] Action Requiredness"),
+        addon::Json_value("project | [ ! ] Action Required")})
+    {
+        request.base.event.body.find("terminal_event")->find("payload")->set("title", title);
+        const auto result = codex::classify_attention(request);
+        ok &= check(result && result->base.classification == addon::Classification::IGNORED &&
+            result->base.observations.empty() && !result->attention_kind,
+            "Unavailable/nonmatching title became a question, resolution or readiness observation");
+    }
+    // Every envelope field is required, and a hook identity is never a host origin.
+    for (const auto section : {"", "terminal_event", "candidate"}) {
+        const auto& object = *section ? *original.find(section) : original;
+        for (const auto& member : object.as_object()) {
+            request.base.event.body = original;
+            auto& target = *section ? *request.base.event.body.find(section) : request.base.event.body;
+            target.erase(member.name);
+            ok &= check(!codex::classify_attention(request), "Incomplete host envelope accepted");
+        }
+    }
+    for (const auto field : {"terminal_id", "generation", "title_sequence"}) {
+        for (const auto value : {"0", "01", "-1", "1x", "18446744073709551616"}) {
+            request.base.event.body = original;
+            auto* target = request.base.event.body.find("terminal_event");
+            if (std::string(field) == "title_sequence") target = target->find("payload");
+            target->set(field, addon::Json_value(value));
+            ok &= check(!codex::classify_attention(request), "Invalid host runtime/sequence identity accepted");
+        }
+    }
+    for (const auto section : {"", "terminal_event", "candidate", "payload"}) {
+        request.base.event.body = original;
+        auto* target = &request.base.event.body;
+        if (std::string(section) == "payload") target = target->find("terminal_event")->find("payload");
+        else if (*section) target = target->find(section);
+        target->set("hook_event_name", addon::Json_value("PreToolUse"));
+        ok &= check(!codex::classify_attention(request), "Hook identity or unknown field accepted in host envelope");
+    }
+    for (const auto field : {"source", "stream", "stream_index", "timestamp"}) {
+        request.base.event.body = original;
+        request.base.event.body.find("terminal_event")->set(field, addon::Json_value("wrong"));
+        ok &= check(!codex::classify_attention(request), "Invalid host source/stream/timestamp accepted");
+    }
+    for (const auto field : {"kind", "title_sequence", "title"}) {
+        request.base.event.body = original;
+        request.base.event.body.find("terminal_event")->find("payload")->erase(field);
+        ok &= check(!codex::classify_attention(request), "Incomplete title payload accepted");
+        request.base.event.body = original;
+        request.base.event.body.find("terminal_event")->find("payload")->set(field, addon::Json_value(1));
+        ok &= check(!codex::classify_attention(request), "Mistyped title payload accepted");
+    }
+    for (const auto field : {"session_id", "turn_id", "tool_use_id"}) {
+        request.base.event.body = original;
+        request.base.event.body.find("candidate")->set(field, addon::Json_value(""));
+        ok &= check(!codex::classify_attention(request), "Incomplete native candidate accepted");
+    }
+    for (const auto field : {"turn_id", "tool_use_id"}) {
+        request.base.event.body = original;
+        request.base.event.body.find("candidate")->set(field, addon::Json_value("different"));
+        request.base.event.body.find("terminal_event")->find("payload")->set(
+            "title", addon::Json_value("[ ! ] Action Required"));
+        const auto result = codex::classify_attention(request);
+        ok &= check(result && result->base.observations.size() == 1 &&
+            result->base.observations.front().attention_request_id != request_id,
+            "Different native turn/call reused a title candidate identity");
+    }
+    request.base.event.body = original;
+    request.base.event.body.set("origin", addon::Json_value("cli_hook"));
+    ok &= check(!codex::classify_attention(request), "Untrusted origin accepted");
+    request.base.event.body = original;
+    request.base.ledger.current_transition->provider_session_id = "another-session";
+    ok &= check(!codex::classify_attention(request), "Title crossed provider session ledger");
+    request.base.ledger.current_transition.reset();
+    ok &= check(!codex::classify_attention(request), "Title accepted without a live provider session");
+    return ok;
+}
+
+bool conversational_stop()
+{
+    // Oracle: native StopCommandInput and the adopted bounded local hint contract.
+    // Exercise the same metadata producer used by codex_helper before classification.
+    auto native = *addon::parse_json(R"({
+        "session_id":"session-a","turn_id":"turn-a","transcript_path":null,
+        "cwd":"C:/project","hook_event_name":"Stop","model":"gpt-5",
+        "permission_mode":"default","stop_hook_active":false,
+        "last_assistant_message":"Done.\n\nWhich directory?  \n"
+    })", {}, nullptr);
+    addon::Attention_classification_request request;
+    request.base.event.name = "Stop";
+    request.base.event.body = codex::hook_metadata(native);
+    request.base.ledger.current_epoch = 1;
+    request.base.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-a", std::string(64, 'a')};
+    auto result = codex::classify_attention(request);
+    if (!check(result && result->attention_kind && result->attention_kind->kind == "conversational_hint" &&
+        result->base.observations.size() == 1, "Native Stop reply lost through helper to classifier"))
+    {
+        return false;
+    }
+    const auto hint = result->base.observations.front();
+    bool ok = check(hint.attention_transition == addon::Attention_transition::REQUESTED &&
+        hint.attention_evidence == addon::Evidence::INFERRED && !hint.attention_request_id.empty() &&
+        hint.phase_transition == addon::Phase_transition::AWAITING_INPUT,
+        "Conversational hint lost inferred attention or native phase");
+    const auto wire = addon::encode_attention_classification_result(*result);
+    const auto decoded = addon::decode_attention_classification_result(wire, nullptr, 2);
+    ok &= check(decoded && decoded->attention_kind && decoded->attention_kind->kind == "conversational_hint",
+        "Conversational hint failed SDK decoding");
+    ok &= check(addon::serialize_json(wire).find("Which directory?") == std::string::npos,
+        "Classification output exposed assistant text");
+    result = codex::classify_attention(request);
+    ok &= check(result && result->base.observations.front().attention_request_id == hint.attention_request_id,
+        "Replayed Stop changed conversational identity");
+    request.base.ledger.current_epoch = 2;
+    result = codex::classify_attention(request);
+    ok &= check(result && result->base.observations.front().attention_request_id != hint.attention_request_id,
+        "Conversational identity crossed epochs");
+    const auto base = codex::classify_hook(request.base);
+    ok &= check(base && base->observations.front().attention_transition == addon::Attention_transition::NONE,
+        "Unnegotiated lifecycle classification emitted a hint");
+
+    native.set("last_assistant_message", addon::Json_value(std::string(2032, ' ') + "Which directory?"));
+    request.base.event.body = codex::hook_metadata(native);
+    result = codex::classify_attention(request);
+    ok &= check(request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
+        result->attention_kind->kind == "conversational_hint", "Complete reply at the byte bound lost its hint");
+    for (const auto& reply : {std::string("The changes are complete."), std::string{}, std::string(2049, '?')}) {
+        native.set("last_assistant_message", addon::Json_value(reply));
+        request.base.event.body = codex::hook_metadata(native);
+        result = codex::classify_attention(request);
+        ok &= check(result && !result->attention_kind && result->base.observations.size() == 1,
+            "Missing, ordinary or oversized reply became a hint");
+        if (reply.size() > 2048) {
+            ok &= check(!request.base.event.body.find("last_assistant_message"), "Oversized reply was forwarded");
+            request.base.event.body = native;
+            result = codex::classify_attention(request);
+            ok &= check(result && !result->attention_kind, "Direct classifier input bypassed the reply bound");
+        }
+    }
+    native.set("last_assistant_message", addon::Json_value());
+    request.base.event.body = codex::hook_metadata(native);
+    result = codex::classify_attention(request);
+    ok &= check(result && !result->attention_kind, "Nullable native Stop reply became a hint");
+    native.set("last_assistant_message", addon::Json_value("Which directory?"));
+    native.set("agent_id", addon::Json_value("child-a"));
+    request.base.event.body = codex::hook_metadata(native);
+    result = codex::classify_attention(request);
+    ok &= check(!request.base.event.body.find("last_assistant_message") && result &&
+        result->base.observations.empty(), "Child reply became a root hint");
+    native.erase("agent_id");
+    native.set("hook_event_name", addon::Json_value("UserPromptSubmit"));
+    request.base.event.name = "UserPromptSubmit";
+    request.base.event.body = codex::hook_metadata(native);
+    request.pending_conversational_request_id = hint.attention_request_id;
+    result = codex::classify_attention(request);
+    ok &= check(!request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
+        result->attention_kind->kind == "conversational_hint" && result->base.observations.size() == 1 &&
+        result->base.observations.front().attention_request_id == hint.attention_request_id &&
+        result->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED &&
+        result->base.observations.front().attention_evidence == addon::Evidence::INFERRED &&
+        result->base.observations.front().phase_transition == addon::Phase_transition::WORKING,
+        "User submission did not resolve only the supplied conversational hint");
+    request.pending_conversational_request_id.reset();
+    result = codex::classify_attention(request);
+    ok &= check(result && !result->attention_kind &&
+        result->base.observations.front().attention_transition == addon::Attention_transition::NONE,
+        "User submission invented a conversational resolution");
+    request.pending_conversational_request_id = hint.attention_request_id;
+    request.base.event.name = "PermissionRequest";
+    request.base.event.body.set("hook_event_name", addon::Json_value("PermissionRequest"));
+    result = codex::classify_attention(request);
+    ok &= check(result && result->attention_kind && result->attention_kind->kind == "permission" &&
+        result->base.observations.front().attention_transition == addon::Attention_transition::REQUESTED &&
+        result->base.observations.front().attention_request_id.empty(),
+        "Permission borrowed the pending conversational identity");
+    return ok;
+}
+
 bool question_hooks()
 {
     // Oracle: Codex native Pre/PostToolUse fields and the adopted inferred-candidate contract.
@@ -34,12 +253,13 @@ bool question_hooks()
     const auto raw = addon::serialize_json(body);
     auto result = codex::classify_attention(request);
     if (!check(result && result->base.observations.size() == 1 && result->attention_kind &&
-        result->attention_kind->kind == "interactive_question", "Question candidate missing"))
+        result->attention_kind->kind == "interactive_question_candidate", "Hidden question candidate missing"))
     {
         return false;
     }
     const auto candidate = result->base.observations.front();
-    bool ok = check(candidate.attention_evidence == addon::Evidence::INFERRED &&
+    bool ok = title_corroboration(candidate.attention_request_id);
+    ok &= check(candidate.attention_evidence == addon::Evidence::INFERRED &&
         candidate.attention_transition == addon::Attention_transition::REQUESTED,
         "Pre-use must remain inferred") &&
         check(addon::serialize_json(body) == raw, "Classifier changed native evidence");
@@ -50,8 +270,10 @@ bool question_hooks()
     ok &= check(ordinary && ordinary->classification == addon::Classification::IGNORED,
         "Question classification requires the attention companion");
     const auto encoded = addon::encode_attention_classification_result(*result);
-    ok &= check(addon::decode_attention_classification_result(encoded, nullptr, 2).has_value(),
-        "Companion result violates helper-ingress@2");
+    const auto decoded = addon::decode_attention_classification_result(encoded, nullptr, 2);
+    ok &= check(decoded && decoded->attention_kind &&
+        decoded->attention_kind->kind == "interactive_question_candidate",
+        "SDK attention-kind vocabulary does not retain the hidden candidate");
     ok &= check(!addon::decode_classify_event_result(encoded, nullptr, 2),
         "Ordinary helper envelope accepted companion metadata");
 
@@ -89,7 +311,7 @@ bool question_hooks()
     {
         body.set("tool_response", addon::Json_value(response));
         result = codex::classify_attention(request);
-        ok &= check(result && result->base.observations.size() == 1 &&
+        ok &= check(result && !result->attention_kind && result->base.observations.size() == 1 &&
             result->base.observations.front().attention_request_id == candidate.attention_request_id &&
             result->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED &&
             result->base.observations.front().attention_evidence == addon::Evidence::INFERRED,
@@ -191,5 +413,5 @@ int main()
     {
         return 1;
     }
-    return question_hooks() ? 0 : 1;
+    return question_hooks() && conversational_stop() ? 0 : 1;
 }
