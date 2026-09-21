@@ -165,6 +165,7 @@ int main()
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 3}, {"structured-session", 2}, {"delegated-session", 2},
+        {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {"interactive-resume", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3},

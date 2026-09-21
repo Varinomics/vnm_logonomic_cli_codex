@@ -284,6 +284,15 @@ bool package_flag(std::string_view value)
         value == "--silent" || value == "--no-install" || value == "--bun";
 }
 
+// Whether Codex's argument parser (clap) takes the argument after an option as
+// that option's value. None of the session options allows hyphen values, so
+// "--" ends the options and anything else starting with '-' is parsed as an
+// option, leaving the first option without its value; a lone "-" is a value.
+bool separate_option_value(std::string_view argument)
+{
+    return !argument.empty() && (argument == "-" || argument.front() != '-');
+}
+
 bool environment_name(std::string_view name)
 {
     if (name.empty() || (name.front() != '_' &&
@@ -982,19 +991,37 @@ bool supported_session_arguments(const std::vector<std::string>& argv, bool resu
         values.insert(values.end(), {"-i", "--image", "--add-dir"});
     }
     const std::vector<std::string> switches{"--oss", "--yolo", "--search", "--no-alt-screen"};
-    bool yolo = false;
+    // Codex's parser (clap) rejects a second occurrence of a flag or of a
+    // single-value option; configuration, feature and attachment options
+    // accumulate.
+    const std::vector<std::string> repeatable{"-c", "--config", "--enable", "--disable", "-i", "--image", "--add-dir"};
+    std::vector<std::string> seen;
+    const auto repeated = [&](const std::string& option) {
+        const auto name = option == "-m" ? "--model" : option == "-p" ? "--profile" : option;
+        if (std::find(repeatable.begin(), repeatable.end(), name) != repeatable.end()) {
+            return false;
+        }
+        if (std::find(seen.begin(), seen.end(), name) != seen.end()) {
+            return true;
+        }
+        seen.push_back(name);
+        return false;
+    };
     for (std::size_t index = 1; index < argv.size(); ++index) {
         const auto& argument = argv[index];
         const auto equal = argument.find('=');
         const auto key = argument.substr(0, equal);
         if (std::find(values.begin(), values.end(), key) != values.end()) {
+            if (repeated(key)) {
+                return false;
+            }
             if (equal != std::string::npos) {
                 if (equal + 1 == argument.size()) {
                     return false;
                 }
             }
             else
-            if (++index == argv.size() || argv[index].empty()) {
+            if (++index == argv.size() || !separate_option_value(argv[index])) {
                 return false;
             }
             continue;
@@ -1002,12 +1029,9 @@ bool supported_session_arguments(const std::vector<std::string>& argv, bool resu
         if (resume && argument.starts_with("-c") && !argument.starts_with("--") && argument.size() > 2) {
             continue;
         }
-        if (std::find(switches.begin(), switches.end(), argument) == switches.end() ||
-            (!resume && argument == "--yolo" && yolo))
-        {
+        if (std::find(switches.begin(), switches.end(), argument) == switches.end() || repeated(argument)) {
             return false;
         }
-        yolo |= argument == "--yolo";
     }
     return true;
 }

@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <shellapi.h>
 #else
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -15,6 +16,8 @@
 #include <iostream>
 #include <initializer_list>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -65,10 +68,45 @@ void send_observation(const std::string& endpoint, const std::string& defect)
 #endif
 }
 
+// The arguments as a native Codex binary receives them: on Windows the wide
+// command line split by the platform's rules and converted to UTF-8, never
+// the code-page argv.
+std::vector<std::string> received_arguments([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
+{
+#ifdef _WIN32
+    int count = 0;
+    wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    std::vector<std::string> result;
+    for (int index = 0; arguments && index < count; ++index) {
+        const std::wstring_view wide(arguments[index]);
+        const int length = static_cast<int>(wide.size());
+        const int bytes = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), length, nullptr, 0, nullptr, nullptr);
+        std::string value(static_cast<std::size_t>(bytes), '\0');
+        WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), length, value.data(), bytes, nullptr, nullptr);
+        result.push_back(std::move(value));
+    }
+    LocalFree(arguments);
+    return result;
+#else
+    return {argv, argv + argc};
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
+    // Report the invocation instead of acting on it.
+    if (std::getenv("CODEX_FIXTURE_ARGV")) {
+        Json arguments = Json::array();
+        for (auto& argument : received_arguments(argc, argv)) {
+            arguments.push_back(Json(std::move(argument)));
+        }
+        std::cout << addon::serialize_json(arguments) << std::flush;
+        return 0;
+    }
     std::string endpoint;
     bool configured_exporter = false;
     // Model an intrinsic producer defect across the isolated native probe.
@@ -83,6 +121,12 @@ int main(int argc, char** argv)
         if (argument == "--fixture-ignore-stdin") { std::this_thread::sleep_for(std::chrono::seconds(30)); return 0; }
         if (argument == "--fixture-overflow") { std::cout << std::string(65537, 'x') << std::flush; return 0; }
         if (argument == "--version") { std::cout << "codex-cli 0.150.1\n"; return 0; }
+        if (argument == "--help") {
+            // A build without the interactive positional PROMPT omits it from its usage.
+            std::cout << (std::getenv("CODEX_FIXTURE_NO_PROMPT") ? "Usage: codex [OPTIONS] <COMMAND> [ARGS]\n"
+                : "Usage: codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]\n");
+            return 0;
+        }
         if (argument == "fixture_exporter=true") configured_exporter = true;
         if (argument.starts_with("fixture_observer=")) defect = argument.substr(17);
         const auto begin = argument.find("endpoint=\"");

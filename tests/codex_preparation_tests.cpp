@@ -2,6 +2,11 @@
 #include "codex_launcher.h"
 #include "codex_preparation.h"
 
+#include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/launch_preparation.h>
+#include <logonomic_cli_addon/launcher_discovery.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -11,7 +16,10 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -42,6 +50,165 @@ public:
 void require(bool value, const char* detail) { if (!value) throw std::runtime_error(detail); }
 std::string utf8(const fs::path& path) { const auto value = path.u8string(); return {value.begin(), value.end()}; }
 
+// One launch-preparation@3 prepare through the production dispatch.
+void prepare_launch(Context& context, const addon::Prepare_request& request)
+{
+    context.input = {"interactive", {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3)};
+    codex::handle_preparation(context);
+}
+
+// The literal PowerShell launcher of the same program, found on PATH.
+addon::Prepare_request through_powershell(addon::Prepare_request request)
+{
+    const auto program = addon::path_from_utf8(request.launcher_argv.front());
+    request.launcher.runner_key  = addon::k_runner_powershell;
+    request.launcher.script_body = "codex --yolo";
+    request.launcher_argv        = {"powershell", "-NoLogo", "-Command", "codex --yolo"};
+    request.launch_environment->effective_environment.set("PATH", addon::Json_value(utf8(program.parent_path())));
+    return request;
+}
+
+// The same launcher record with other arguments after the program.
+addon::Prepare_request with_arguments(addon::Prepare_request request, const std::vector<std::string>& arguments)
+{
+    request.launcher.script_body = "codex";
+    request.launcher_argv.resize(1);
+    for (const auto& argument : arguments) {
+        request.launcher.script_body += ' ' + argument;
+        request.launcher_argv.push_back(argument);
+    }
+    return request;
+}
+
+void require_refusal(addon::Prepare_request request, std::string text, std::string brief, const char* detail)
+{
+    request.initial_prompt = addon::Initial_prompt_request{std::move(text), std::move(brief)};
+    Context context;
+    prepare_launch(context, request);
+    require(!context.succeeded && context.output.is_string() &&
+        context.output.as_string() == addon::reason::k_initial_prompt_unavailable, detail);
+}
+
+// Starts a prepared invocation the way the terminal does, one command-line
+// argument per argv entry under the platform's quoting rules, and returns
+// the arguments the fake CLI received.
+std::vector<std::string> delivered_arguments(
+    const std::vector<std::string>&                  argv,
+    std::vector<std::pair<std::string, std::string>> environment,
+    const fs::path&                                  root)
+{
+    environment.emplace_back("CODEX_FIXTURE_ARGV", "1");
+    Context run;
+    const auto output = codex::run_probe(argv, environment, utf8(root), 10000, run);
+    const auto recorded = output ? addon::parse_json(output->output, {}, nullptr) : std::nullopt;
+    require(recorded && recorded->is_array(), "The prepared invocation did not reach the fake CLI");
+    std::vector<std::string> arguments;
+    for (const auto& argument : recorded->as_array()) {
+        arguments.push_back(argument.as_string());
+    }
+    return arguments;
+}
+
+void initial_prompt_launches(
+    const addon::Prepare_request&                           direct,
+    const std::vector<std::pair<std::string, std::string>>& probe_environment,
+    const fs::path&                                         root)
+{
+    // A brief path with spaces and non-ASCII characters, and a text made of
+    // what a shell or the command-line quoting rules could reinterpret.
+    const auto brief = utf8(root / u8"continuation briefs" / u8"Zoë Ångström 概要 🧭" / "brief.md");
+    const std::vector<std::string> texts{
+        "Logonomic continuation: read the brief at " + brief +
+            " before anything else and follow it; do not modify the project until the user confirms.",
+        "-- \"quoted \\\"inner\\\"\" 'single' $HOME %PATH% ^& | < > ` \\\" trailing backslashes \\\\",
+    };
+    const auto powershell = through_powershell(direct);
+    const auto modelled   = with_arguments(direct, {"--model", "gpt-5"});
+    addon::Contract_failure failure;
+    for (const auto* launcher : {&direct, &powershell, &modelled}) {
+        Context unprompted;
+        prepare_launch(unprompted, *launcher);
+        require(unprompted.succeeded && !unprompted.output.find(addon::k_initial_prompt_member),
+            "A launch without an initial prompt must not acknowledge one");
+        for (const auto& text : texts) {
+            auto request = *launcher;
+            request.initial_prompt = addon::Initial_prompt_request{text, brief};
+            Context prompted;
+            prepare_launch(prompted, request);
+            const auto patch = addon::decode_launch_patch(prompted.output, &failure, 3);
+            require(prompted.succeeded && patch &&
+                addon::validate_initial_prompt_acknowledgment(request.initial_prompt, *patch, &failure) &&
+                addon::validate_launch_patch(*patch, {}, {}, &failure),
+                "The host must accept the initial-prompt launch and its digest echo");
+            const auto& prepared = *patch->argv;
+            require(prepared[prepared.size() - 2] == "--" && prepared.back() == text &&
+                std::count(prepared.begin(), prepared.end(), text) == 1,
+                "The text must be the one positional prompt, after --");
+            auto remainder = *patch;
+            remainder.argv->resize(prepared.size() - 2);
+            remainder.initial_prompt.reset();
+            const auto encoded = addon::serialize_json(addon::encode_launch_patch(remainder, 3));
+            require(encoded == addon::serialize_json(unprompted.output),
+                "The initial prompt must add only --, the text and the echo");
+            const auto delivered = delivered_arguments(prepared, probe_environment, root);
+            require(delivered.size() == prepared.size() &&
+                std::equal(prepared.begin() + 1, prepared.end(), delivered.begin() + 1),
+                "Every argument, the text included, must reach Codex byte for byte");
+        }
+    }
+
+    const auto& text = texts.front();
+    require_refusal(direct, "!" + text, brief, "Codex would run a text starting with ! as a shell command");
+    require_refusal(with_arguments(direct, {"resume", "--last"}), text, brief,
+        "A launcher subcommand would take the initial prompt");
+    require_refusal(with_arguments(direct, {"--yolo", "summarize"}), text, brief,
+        "A launcher prompt would precede the initial prompt");
+    require_refusal(with_arguments(direct, {"--model", "--"}), text, brief,
+        "Codex takes -- as the end of options, leaving --model without its value");
+    require_refusal(with_arguments(direct, {"--image", "screen.png"}), text, brief,
+        "Launcher images would join the first message");
+    require_refusal(with_arguments(direct, {"--search", "--search"}), text, brief,
+        "Codex rejects a repeated flag, so the session would never start");
+    require_refusal(with_arguments(direct, {"-m", "gpt-5", "--model", "gpt-5"}), text, brief,
+        "Codex rejects a repeated single-value option under either of its names");
+    auto without_prompt = direct;
+    without_prompt.launch_environment->effective_environment.set("CODEX_FIXTURE_NO_PROMPT", addon::Json_value("1"));
+    require_refusal(without_prompt, text, brief, "A Codex whose help shows no PROMPT cannot carry the initial prompt");
+    auto runner = direct;
+    runner.launcher.script_body = "npx @openai/codex";
+    runner.launcher_argv        = {"npx", "@openai/codex"};
+    require_refusal(runner, text, brief, "A package runner launcher is not prepared");
+    auto absent = direct;
+    absent.launcher_argv = {utf8(root / "absent" / "codex")};
+    require_refusal(absent, text, brief, "An unverified Codex program cannot carry the initial prompt");
+    Context unverified;
+    prepare_launch(unverified, absent);
+    require(!unverified.succeeded && unverified.output.is_string() &&
+        unverified.output.as_string() == addon::reason::k_launcher_program_unavailable,
+        "An unverified launch without an initial prompt keeps its refusal");
+
+    // Launcher options that fill the argument bounds: the launch fits without
+    // the prompt and exceeds them with it. The launcher record's own bound
+    // keeps its options near 4 KiB, so the entry count is the bound a fixture
+    // reaches.
+    Context bare;
+    prepare_launch(bare, with_arguments(direct, {}));
+    const auto bare_patch = addon::decode_launch_patch(bare.output, &failure, 3);
+    require(bare.succeeded && bare_patch && bare_patch->argv, "Launch without launcher arguments failed");
+    std::vector<std::string> options;
+    while (bare_patch->argv->size() + options.size() + 2 <= addon::limits::k_max_argv_entries) {
+        options.push_back("-c");
+        options.push_back("p" + std::to_string(options.size() / 2) + "=1");
+    }
+    const auto crowded = with_arguments(direct, options);
+    Context fitting;
+    prepare_launch(fitting, crowded);
+    const auto fitting_patch = addon::decode_launch_patch(fitting.output, &failure, 3);
+    require(fitting.succeeded && fitting_patch && addon::validate_launch_patch(*fitting_patch, {}, {}, &failure),
+        "The crowded launch must fit the argument bounds without a prompt");
+    require_refusal(crowded, text, brief, "A launch the prompt pushes past the argument bounds was accepted");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -54,6 +221,9 @@ int main(int argc, char** argv)
         require(!codex::hooks_configuration_conflicts({"codex", "-c", "model=\"hooks\""}, 1), "Unrelated config rejected");
         require(codex::supported_session_arguments({"codex", "--model", "gpt-5", "--yolo"}, false), "Supported delegated flags rejected");
         require(!codex::supported_session_arguments({"codex", "resume", "session"}, false), "Existing delegated subcommand accepted");
+        require(!codex::supported_session_arguments({"codex", "--yolo", "--yolo"}, true) &&
+            codex::supported_session_arguments({"codex", "-c", "a=1", "--config", "b=2", "--enable", "x", "--enable", "y"}, false),
+            "Only configuration, feature and attachment options may repeat");
         const auto root = fs::temp_directory_path() / ("codex-preparation-" + addon::random_nonce_hex());
         fs::create_directories(root);
         struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{root};
@@ -134,6 +304,7 @@ int main(int argc, char** argv)
                 return argument.starts_with(prefix);
             }) == 1, "Native question hooks must be narrowly matched and configured exactly once");
         }
+        initial_prompt_launches(prepare, probe_environment, root);
         addon::Delegated_prepare_request delegated;
         delegated.context.launcher           = prepare.launcher;
         delegated.context.launcher_argv      = prepare.launcher_argv;
