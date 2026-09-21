@@ -90,15 +90,6 @@ bool package_flag(std::string_view value)
         value == "--silent" || value == "--no-install" || value == "--bun";
 }
 
-// Whether Codex's argument parser (clap) takes the argument after an option as
-// that option's value. None of the session options allows hyphen values, so
-// "--" ends the options and anything else starting with '-' is parsed as an
-// option, leaving the first option without its value; a lone "-" is a value.
-bool separate_option_value(std::string_view argument)
-{
-    return !argument.empty() && (argument == "-" || argument.front() != '-');
-}
-
 bool environment_name(std::string_view name)
 {
     if (name.empty() || (name.front() != '_' &&
@@ -758,7 +749,7 @@ bool supported_session_arguments(const std::vector<std::string>& argv, bool resu
                 }
             }
             else
-            if (++index == argv.size() || !separate_option_value(argv[index])) {
+            if (++index == argv.size() || argv[index].empty()) {
                 return false;
             }
             continue;

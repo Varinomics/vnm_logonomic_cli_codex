@@ -4,8 +4,6 @@
 #include "codex_launcher.h"
 #include "codex_startup_probe.h"
 
-#include <logonomic_cli_addon/ids.h>
-#include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -123,27 +121,6 @@ bool add_hooks(Verified_launch& launch, addon::Invocation_context& context)
     return true;
 }
 
-// Codex submits its positional PROMPT as the first user message of a new
-// interactive session. The text can take that place only behind launcher
-// arguments that are all options of the session grammar: a subcommand or an
-// earlier positional would claim it, and --image attaches files to that first
-// message.
-bool leaves_prompt_position(const addon::Prepare_request& request)
-{
-    const auto literal = request.launcher.runner_key == addon::k_runner_direct
-        ? request.launcher_argv : literal_launcher_argv(request.launcher.script_body);
-    return supported_session_arguments(literal, false) &&
-        std::none_of(literal.begin() + 1, literal.end(), [](const std::string& argument) {
-            const auto option = argument.substr(0, argument.find('='));
-            return option == "-i" || option == "--image";
-        });
-}
-
-void refuse_initial_prompt(addon::Invocation_context& context, std::string detail)
-{
-    context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_initial_prompt_unavailable, std::move(detail));
-}
-
 void prepare_interactive(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -158,24 +135,9 @@ void prepare_interactive(addon::Invocation_context& context)
     account.launch_environment = request->launch_environment;
     const auto profile = selected_profile(account, context);
     if (!profile) return;
-    const auto& prompt = request->initial_prompt;
-    // The TUI runs a first message that starts with '!' as a local shell
-    // command instead of sending it to the model.
-    if (prompt && prompt->text.starts_with('!')) {
-        refuse_initial_prompt(context, "Codex runs an initial prompt that starts with '!' as a shell command.");
-        return;
-    }
-    if (prompt && !leaves_prompt_position(*request)) {
-        refuse_initial_prompt(context, "The launcher's arguments leave Codex no place for the initial prompt.");
-        return;
-    }
     auto launch = verified_launch(request->launcher, request->launcher_argv,
         request->launch_environment->effective_environment, request->working_directory, false, context);
     if (!launch) {
-        if (prompt && !context.cancel_requested()) {
-            refuse_initial_prompt(context, "Codex cannot be prepared from this launcher.");
-            return;
-        }
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
         return;
@@ -188,19 +150,6 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
     patch.disposition     = addon::Launch_disposition{true, version_is_at_least(launch->version, 0, 146, 0), true};
-    if (prompt) {
-        // "--" ends option parsing, so the text is the positional PROMPT
-        // whatever its first character. The replacement invocation runs the
-        // verified program directly, with no shell layer to quote for.
-        patch.argv->insert(patch.argv->end(), {"--", prompt->text});
-        patch.initial_prompt = addon::Initial_prompt_acknowledgment{
-            addon::initial_prompt_text_digest_hex(prompt->text)};
-        if (!addon::validate_launch_patch(patch, {}, {}, &failure)) {
-            refuse_initial_prompt(context,
-                "The launch with the initial prompt is not a valid replacement: " + failure.detail);
-            return;
-        }
-    }
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
