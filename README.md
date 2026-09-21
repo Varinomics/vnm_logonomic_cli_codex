@@ -35,6 +35,17 @@ The probe does not request a model turn. Authentication headers remain in the
 launched process environment, while vendor OTLP interpretation belongs to this
 package.
 
+An interactive-initial-prompt@1 launch starts Codex's interactive TUI with the
+host's text as its positional `PROMPT`, placed after `--`, and echoes the text's
+SHA-256. The replacement invocation runs the verified program directly, so no
+shell layer quotes the text. The package refuses with `initial_prompt_unavailable`
+when it cannot guarantee that the text becomes the first user message: a launcher
+whose program it cannot verify, launcher arguments other than known session
+options or with `--image` attachments, a text starting with `!` (which Codex runs
+as a local shell command), or an invocation beyond the launch-preparation@3
+argument bounds. It grants no access to the referenced file; Codex reads it under
+the permissions of the selected configuration.
+
 On Linux, probes inherit the generation custodian's process group and session.
 Probe cleanup confirms its direct child within a bounded settlement interval;
 descendants remain under generation custody until retirement. A successful probe
