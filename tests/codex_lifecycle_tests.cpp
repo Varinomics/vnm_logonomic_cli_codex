@@ -58,7 +58,7 @@ bool title_corroboration(const std::string& request_id)
         ok &= check(addon::serialize_json(request.base.event.body) == raw, "Classifier altered host provenance");
         ok &= check(!codex::classify_hook(request.base), "Host signal accepted as a native hook");
     }
-    for (const auto title : {addon::Json_value(), addon::Json_value(""), addon::Json_value("Working"),
+    for (const auto& title : {addon::Json_value(), addon::Json_value(""), addon::Json_value("Working"),
         addon::Json_value("Action Required"), addon::Json_value("[ ! ] Action Requiredness"),
         addon::Json_value("project | [ ! ] Action Required")})
     {
