@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.25)
 cmake_policy(SET CMP0141 NEW)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
-set(CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV OFF CACHE BOOL "Do not capture the configure environment" FORCE)
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV)
+# A build that adds this package as a subproject sets the normal variable
+# LOGONOMIC_CLI_ADDON_EMBEDDED. That build owns the cache, try_compile()
+# settings, the SDK and testing (the SDK's docs/package_contract.md,
+# "Embedded build"), so only a standalone build sets them up here.
+if(NOT LOGONOMIC_CLI_ADDON_EMBEDDED)
+    set(CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV OFF CACHE BOOL "Do not capture the configure environment" FORCE)
+    list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV)
+endif()
 if(POLICY CMP0168)
     cmake_policy(SET CMP0168 NEW)
 elseif(CMAKE_GENERATOR STREQUAL "FASTBuild")
@@ -13,26 +19,37 @@ project(logonomic_cli_codex VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(LOGONOMIC_CLI_ADDON_SDK_SOURCE "" CACHE PATH "Local Logonomic CLI add-on SDK source override")
-set(LOGONOMIC_CLI_ADDON_SDK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-if(LOGONOMIC_CLI_ADDON_SDK_SOURCE)
-    add_subdirectory("${LOGONOMIC_CLI_ADDON_SDK_SOURCE}" "${CMAKE_BINARY_DIR}/sdk")
+if(LOGONOMIC_CLI_ADDON_EMBEDDED)
+    if(NOT TARGET logonomic_cli_addon_sdk::sdk)
+        message(FATAL_ERROR
+            "The embedding build must add the Logonomic CLI add-on SDK before this package.")
+    endif()
 else()
-    include(FetchContent)
-    FetchContent_Declare(logonomic_sdk_source
-        GIT_REPOSITORY https://github.com/Varinomics/logonomic.git
-        GIT_TAG master
-        GIT_SHALLOW TRUE
-        SOURCE_SUBDIR sdk/logonomic_cli_addon_sdk)
-    FetchContent_MakeAvailable(logonomic_sdk_source)
+    set(LOGONOMIC_CLI_ADDON_SDK_SOURCE "" CACHE PATH "Local Logonomic CLI add-on SDK source override")
+    set(LOGONOMIC_CLI_ADDON_SDK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    if(LOGONOMIC_CLI_ADDON_SDK_SOURCE)
+        add_subdirectory("${LOGONOMIC_CLI_ADDON_SDK_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/sdk")
+    else()
+        include(FetchContent)
+        FetchContent_Declare(logonomic_sdk_source
+            GIT_REPOSITORY https://github.com/Varinomics/logonomic.git
+            GIT_TAG master
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR sdk/logonomic_cli_addon_sdk)
+        FetchContent_MakeAvailable(logonomic_sdk_source)
+    endif()
 endif()
 
 function(codex_target target)
     target_link_libraries(${target} PRIVATE logonomic_cli_addon_sdk::sdk)
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+    # The Windows API selection belongs to the platform, so a MinGW build gets
+    # the same one as MSVC.
+    if(WIN32)
         target_compile_definitions(${target} PRIVATE
             _WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    endif()
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
     endif()
@@ -90,7 +107,7 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance" "${CODEX_PACKAGE_DIRECTORY}/provenance"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/package/notices" "${CODEX_PACKAGE_DIRECTORY}/notices"
-    COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CODEX_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CODEX_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_adapter>" "${CODEX_PACKAGE_DIRECTORY}/adapter/codex_adapter${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_helper>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_helper${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_launch_bridge>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_launch_bridge${CODEX_EXECUTABLE_SUFFIX}"
@@ -100,9 +117,16 @@ add_custom_command(
         --third-party "assets/openai-white.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
     DEPENDS codex_adapter codex_helper codex_launch_bridge logonomic_cli_addon_index
-        "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
     VERBATIM)
 add_custom_target(codex_package ALL DEPENDS "${CODEX_PACKAGE_DIRECTORY}/package.files.json")
+logonomic_cli_addon_install_package("${CODEX_PACKAGE_DIRECTORY}" logonomic.cli.codex TARGET codex_package)
+
+# Everything below is the package's own test suite, which only its standalone
+# build configures; an embedding build stages the package and stops here.
+if(LOGONOMIC_CLI_ADDON_EMBEDDED)
+    return()
+endif()
 
 enable_testing()
 add_executable(codex_fake_cli tests/codex_fake_cli.cpp)
@@ -134,7 +158,6 @@ foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup
 endforeach()
 add_test(NAME codex_package_validation COMMAND logonomic_cli_addon_validate "${CODEX_PACKAGE_DIRECTORY}" --platform "${CODEX_PLATFORM}")
 add_test(NAME codex_package_conformance COMMAND logonomic_cli_addon_conformance "${CODEX_PACKAGE_DIRECTORY}")
-logonomic_cli_addon_install_package("${CODEX_PACKAGE_DIRECTORY}" logonomic.cli.codex)
 
 # Exercise this repository's actual producer, never a substitute packaging
 # implementation. The isolated nested configure uses this same SDK source;
