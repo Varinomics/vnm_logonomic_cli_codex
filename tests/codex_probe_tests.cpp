@@ -2,7 +2,10 @@
 #include "codex_accounts.h"
 #include "codex_probes.h"
 
+#include <logonomic_cli_addon/accounts.h>
+
 #include <filesystem>
+#include <string>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -136,6 +139,48 @@ void account_resolution_uses_frozen_origin()
     check(profile->adapter_account_key == codex::profile_account_key(profile->profile_path), "stable opaque account identity");
 }
 
+void accounts_are_named_after_their_profile_folders()
+{
+    // Oracle: accounts@1 names an account with a filesystem profile after that
+    // profile's folder, which tells it apart from the provider's other accounts.
+#if defined(_WIN32)
+    const std::string platform = "windows-x86_64";
+    const std::string home     = "C:/Users/Jane Doe";
+    const std::string home_env = "USERPROFILE";
+#else
+    const std::string platform = "linux-x86_64";
+    const std::string home     = "/home/jane";
+    const std::string home_env = "HOME";
+#endif
+    const auto discovered_name = [&](const char* codex_home) {
+        addon::Accounts_launcher_request request;
+        request.launcher.script_body = "codex";
+        request.launcher.runner_key  = addon::k_runner_direct;
+        request.launch_environment.platform_id = platform;
+        request.launch_environment.effective_environment = addon::Json_value::object();
+        request.launch_environment.effective_environment.set(home_env, addon::Json_value(home));
+        if (codex_home) request.launch_environment.effective_environment.set("CODEX_HOME", addon::Json_value(codex_home));
+        request.default_home_fallback   = home;
+        request.normalization_directory = home;
+        Context context;
+        context.input.operation = addon::k_accounts_discover_operation;
+        context.input.payload   = addon::encode_accounts_launcher_request(request);
+        codex::handle_accounts(context);
+        addon::Contract_failure failure;
+        const auto accounts = addon::decode_accounts_result(context.output, &failure);
+        check(context.succeeded && accounts && accounts->size() == 1, "discovery returns the selected account");
+        return accounts->front().display_name;
+    };
+    check(discovered_name(nullptr) == ".codex", "the default profile is named .codex");
+    check(discovered_name((home + "/.codex-work").c_str()) == ".codex-work", "a CODEX_HOME profile is named after its folder");
+    check(discovered_name((home + "/.codex-work/").c_str()) == ".codex-work", "a trailing separator does not hide the folder name");
+    check(discovered_name((home + "/.codex-review").c_str()) != discovered_name((home + "/.codex-work").c_str()),
+        "two profiles of one provider are named apart");
+    const std::string long_home = home + "/.codex-account-for-the-varinomics-nightly-release-builds";
+    check(discovered_name(long_home.c_str()) == addon::account_display_name(long_home),
+        "an over-long folder name is fitted by the SDK's account display-name rule");
+}
+
 void probe_preparation_preserves_program_environment_and_custody(const std::filesystem::path& executable)
 {
     const auto utf8 = [](const auto& path) { const auto bytes = path.u8string(); return std::string(bytes.begin(), bytes.end()); };
@@ -192,6 +237,7 @@ int main(int argc, char** argv)
         quota_protocol_and_optional_windows();
         quota_errors_remain_redacted();
         account_resolution_uses_frozen_origin();
+        accounts_are_named_after_their_profile_folders();
         probe_preparation_preserves_program_environment_and_custody(std::filesystem::absolute(argv[1]));
         return 0;
     }
