@@ -156,6 +156,12 @@ foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup
     endif()
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
 endforeach()
+add_executable(codex_usage_host_tests tests/codex_usage_host_tests.cpp)
+target_link_libraries(codex_usage_host_tests PRIVATE codex_provider)
+codex_target(codex_usage_host_tests)
+add_dependencies(codex_usage_host_tests codex_package)
+add_test(NAME codex_usage_host_tests COMMAND codex_usage_host_tests "${CODEX_PACKAGE_DIRECTORY}")
+set_tests_properties(codex_usage_host_tests PROPERTIES TIMEOUT 120)
 add_test(NAME codex_package_validation COMMAND logonomic_cli_addon_validate "${CODEX_PACKAGE_DIRECTORY}" --platform "${CODEX_PLATFORM}")
 add_test(NAME codex_package_conformance COMMAND logonomic_cli_addon_conformance "${CODEX_PACKAGE_DIRECTORY}")
 
