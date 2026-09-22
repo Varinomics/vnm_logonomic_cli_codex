@@ -9,7 +9,13 @@ usage-scan@3 native counter provenance. A candidate keeps one metadata line per
 rollout in `rollouts` beside the sorted `records`, so it holds the same four
 files however many rollouts a home has. An incremental scan parses only the
 rollouts whose size or modification time changed and streams the selected
-cache's records for the others; repair and reset parse every rollout. A selected
+cache's records for the others; repair and reset parse every rollout. Equal
+size and modification time are taken to mean unchanged content, the check the
+pre-cutover scanner used, because rollouts are append-only and repair rereads
+every rollout. Turns reconcile by their stable record IDs: a rollout parsed
+again keeps its accepted turns that it no longer holds, a moved rollout keeps
+one observation of each turn under its accepted identity, and differing
+observations of one turn within a scan fail it. A selected
 `codex-rollout-cache@1` or `@2` cache, which kept two files per rollout, is
 validated and converted into a fresh candidate without modifying the selected
 input or inventing provenance absent from its records. Native imports preserve

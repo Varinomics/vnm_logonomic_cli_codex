@@ -783,6 +783,79 @@ void selected_cache_stays_compact_across_incremental_scans(const fs::path& fixtu
     check(files(next) <= 4, "an incremental candidate stays compact");
 }
 
+void selected_cache_reconciles_turns_by_identity(const fs::path& fixture)
+{
+    // Turns reconcile by their stable record IDs: a rollout parsed again keeps
+    // the accepted turns it no longer holds, and a moved rollout remains one
+    // observation of each turn.
+    const auto profile = fixture / "identity-profile";
+    const auto storage = fixture / "identity-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto truncated = profile / "sessions" / "rollout-truncated.jsonl";
+    const auto moved     = profile / "sessions" / "rollout-moved.jsonl";
+    const auto renamed   = profile / "sessions" / "rollout-renamed.jsonl";
+    const auto both_turns = metadata("truncated") + start("a") + tokens(10) + complete("a") +
+        start("b") + tokens(25) + complete("b");
+    write(truncated, both_turns);
+    write(moved, metadata("moved") + start("c") + tokens(7) + complete("c"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "identity-account"};
+    const auto cancelled = [] { return false; };
+    std::string error;
+    unsigned allocations = 0;
+    const auto scan = [&](const char* mode, std::optional<addon::Usage_cache_reference> accepted) {
+        const auto path = storage / ("candidate-" + std::to_string(allocations++));
+        check(fs::create_directory(path), "allocate identity candidate");
+        request.mode = mode;
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
+        return codex::scan_usage(request, profile, storage, cancelled, &error);
+    };
+    const auto totals = [](const addon::Usage_scan_page& page) {
+        std::map<std::string, std::uint64_t> result;
+        for (const auto& record : page.records) {
+            result[record.record_id] = record.total_tokens;
+        }
+        return result;
+    };
+    const std::map<std::string, std::uint64_t> expected{
+        {"codex:moved:c", 7}, {"codex:truncated:a", 10}, {"codex:truncated:b", 15}};
+    auto accepted = scan("incremental", std::nullopt);
+    check(accepted && totals(*accepted) == expected, "first scan records every turn");
+
+    write(truncated, metadata("truncated") + start("a") + tokens(10) + complete("a"));
+    for (const auto* mode : {"incremental", "repair"}) {
+        const auto page = scan(mode, accepted->cache_candidate);
+        check(page && totals(*page) == expected,
+            error.empty() ? "a truncated rollout keeps its accepted turns" : error.c_str());
+        accepted = page;
+    }
+
+    fs::rename(moved, renamed);
+    const auto after_move = scan("incremental", accepted->cache_candidate);
+    check(after_move && totals(*after_move) == expected,
+        error.empty() ? "a moved rollout reconciles to one observation of each turn" : error.c_str());
+    for (const auto& record : after_move->records) {
+        if (record.record_id == "codex:moved:c") {
+            check(record.source_path == utf8(fs::absolute(moved).lexically_normal()),
+                "the reconciled turn keeps its accepted identity");
+        }
+    }
+    write(renamed, metadata("moved") + start("c") + tokens(7) + complete("c") + start("d") + tokens(12) + complete("d"));
+    auto grown = expected;
+    grown["codex:moved:d"] = 5;
+    const auto after_growth = scan("incremental", after_move->cache_candidate);
+    check(after_growth && totals(*after_growth) == grown, "a moved rollout's new turn adds exactly its delta");
+
+    // Two live copies disagreeing about one turn cannot both be accepted.
+    write(profile / "sessions" / "rollout-conflict.jsonl", metadata("moved") + start("c") + tokens(9) + complete("c"));
+    check(!scan("repair", after_growth->cache_candidate) && error == "duplicate_usage_record",
+        "conflicting observations of one turn fail the scan");
+}
+
 // Rebuilds a sealed current candidate in the per-rollout layout of @1 or @2:
 // a `.meta` and a `.records` file per rollout beside the sorted `records`.
 // @1 records use the usage2 grammar, which carries no counter provenance.
@@ -972,6 +1045,15 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
         const auto upgraded_last = scan();
         check(upgraded.records.size() == 256 && upgraded_last.records.size() == 15 && upgraded_last.complete,
             "preceding selected format retains all source-absent history through upgrade");
+        const auto sum = [](const auto& page) {
+            std::uint64_t total = 0;
+            for (const auto& record : page.records) {
+                total += record.total_tokens;
+            }
+            return total;
+        };
+        check(sum(upgraded) + sum(upgraded_last) == sum(first) + sum(last),
+            "a preceding-format upgrade keeps the exact total");
         if (format == 1) {
             for (const auto* page : {&upgraded, &upgraded_last}) {
                 for (const auto& record : page->records) {
@@ -1011,6 +1093,7 @@ int main(int argc, char** argv)
         disk_limits_refuse_growth_without_publishing(fixture.path);
         selected_cache_preserves_host_authority(fixture.path);
         selected_cache_stays_compact_across_incremental_scans(fixture.path);
+        selected_cache_reconciles_turns_by_identity(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "short-allocation", false);
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "long-allocation", true);
