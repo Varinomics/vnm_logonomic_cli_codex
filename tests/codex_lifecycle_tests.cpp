@@ -1,7 +1,15 @@
 #include "codex_lifecycle.h"
 #include "codex_hook_metadata.h"
 
+#include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/lifecycle_events.h>
+#include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/sidecar.h>
+
+#include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 
 namespace {
@@ -183,6 +191,13 @@ bool conversational_stop()
     result = codex::classify_attention(request);
     ok &= check(request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
         result->attention_kind->kind == "conversational_hint", "Complete reply at the byte bound lost its hint");
+    // Codex renders replies as Markdown, so the closing question may be emphasised.
+    native.set("last_assistant_message",
+        addon::Json_value("The build is configured.\n\n**Which target should I build?**"));
+    request.base.event.body = codex::hook_metadata(native);
+    result = codex::classify_attention(request);
+    ok &= check(result && result->attention_kind && result->attention_kind->kind == "conversational_hint",
+        "A reply ending in an emphasised question lost its hint");
     for (const auto& reply : {std::string("The changes are complete."), std::string{}, std::string(2049, '?')}) {
         native.set("last_assistant_message", addon::Json_value(reply));
         request.base.event.body = codex::hook_metadata(native);
@@ -351,13 +366,13 @@ bool question_hooks()
         }
         if (std::string(name) == "Interrupt") {
             ok &= check(boundary.outcome_transition == addon::Outcome_transition::INTERRUPTED &&
-                boundary.outcome_evidence == addon::Evidence::INFERRED,
+                boundary.outcome_evidence == addon::Evidence::CONFIRMED,
                 "Interruption no longer invalidates pending candidates");
         }
         if (std::string(name) == "Stop" || std::string(name) == "UserPromptSubmit") {
             const auto expected = std::string(name) == "Stop"
                 ? addon::Phase_transition::AWAITING_INPUT : addon::Phase_transition::WORKING;
-            ok &= check(boundary.phase_transition == expected && boundary.phase_evidence == addon::Evidence::INFERRED,
+            ok &= check(boundary.phase_transition == expected && boundary.phase_evidence == addon::Evidence::CONFIRMED,
                 "Turn boundary no longer invalidates pending candidates");
         }
         if (std::string(name) == "PermissionRequest") {
@@ -375,11 +390,104 @@ bool question_hooks()
     return ok;
 }
 
+std::optional<addon::Lifecycle_declaration> package_lifecycle_declaration(const std::filesystem::path& package)
+{
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(
+        addon::sidecar_relative_path(addon::k_lifecycle_events_capability_id, addon::k_lifecycle_events_version),
+        addon::limits::k_max_sidecar_bytes,
+        nullptr);
+    const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
+    return sidecar ? addon::decode_lifecycle_declaration(sidecar->payload, nullptr) : std::nullopt;
+}
+
+bool declared_profile_admits_every_shape(const std::filesystem::path& package)
+{
+    // Oracle: the host's feature gate. It rejects an observation carrying a
+    // fact the package's own declaration leaves unsupported, phase and all.
+    const auto declaration = package_lifecycle_declaration(package);
+    if (!check(declaration.has_value(), "Package lifecycle declaration is unreadable")) {
+        return false;
+    }
+    addon::Attention_classification_request request;
+    request.base.ledger.current_epoch = 1;
+    request.base.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-a", std::string(64, 'a')};
+    bool ok = true;
+    const auto classify = [
+            &request,
+            &declaration,
+            &ok
+        ](
+            const std::string& name,
+            const std::string& body,
+            const char*        shape)
+        {
+            request.base.event.name = name;
+            request.base.event.body = *addon::parse_json(body, {}, nullptr);
+            const auto result = codex::classify_attention(request);
+            ok &= check(result && !result->base.observations.empty(), shape);
+            if (result) {
+                for (const auto& observation : result->base.observations) {
+                    ok &= check(addon::lifecycle_profile_admits(declaration->features, observation), shape);
+                }
+            }
+            return result;
+        };
+    const auto hook = [](const std::string& name, const std::string& members) {
+        return R"({"hook_event_name":")" + name + R"(","session_id":"session-a")" + members + "}";
+    };
+    classify("SessionStart", hook("SessionStart", R"(,"source":"startup")"),
+        "The declaration refuses a session start");
+    classify("SessionStart", hook("SessionStart", R"(,"source":"resume")"),
+        "The declaration refuses a session resume");
+    classify("UserPromptSubmit", hook("UserPromptSubmit", R"(,"turn_id":"turn-a")"),
+        "The declaration refuses a turn start");
+    classify("PermissionRequest", hook("PermissionRequest", R"(,"turn_id":"turn-a")"),
+        "The declaration refuses an approval request");
+    classify("Stop", hook("Stop", R"(,"turn_id":"turn-a")"), "The declaration refuses a turn completion");
+    const auto hint = classify(
+        "Stop",
+        hook("Stop", R"(,"turn_id":"turn-a","last_assistant_message":"Which directory?")"),
+        "The declaration refuses a completion that ends in a question");
+    if (hint && hint->attention_kind) {
+        request.pending_conversational_request_id = hint->base.observations.front().attention_request_id;
+    }
+    classify("UserPromptSubmit", hook("UserPromptSubmit", R"(,"turn_id":"turn-b")"),
+        "The declaration refuses the reply that resolves a conversational hint");
+    request.pending_conversational_request_id.reset();
+    classify("Interrupt", hook("Interrupt", R"(,"turn_id":"turn-b")"), "The declaration refuses an interruption");
+    for (const std::string name : {"SubagentStart", "SubagentStop"}) {
+        classify(name, hook(name, R"(,"turn_id":"turn-b","agent_id":"child-a","agent_type":"worker")"),
+            "The declaration refuses a subagent transition");
+    }
+    for (const std::string name : {"PreToolUse", "PostToolUse"}) {
+        classify(name, hook(name, R"(,"turn_id":"turn-b","tool_use_id":"call-a","tool_name":"request_user_input",
+            "tool_input":{"questions":[{"id":"scope","header":"Scope","question":"Which directory?"}]},
+            "tool_response":"{\"answers\":{\"scope\":{\"answers\":[\"src\"]}}}")"),
+            "The declaration refuses a structured question or its answer");
+    }
+    classify("NativeSignal", R"({"origin":"host_terminal",
+        "terminal_event":{
+            "terminal_id":"17","generation":"2","source":"logonomic_terminal_worker",
+            "stream":"terminal","stream_index":0,"timestamp":1234.5,
+            "payload":{"kind":"terminal_title_changed","title_sequence":"8","title":"[ ! ] Action Required"}
+        },
+        "candidate":{"session_id":"session-a","turn_id":"turn-b","tool_use_id":"call-a"}})",
+        "The declaration refuses a corroborated structured question");
+    classify("SessionEnd", hook("SessionEnd", ""), "The declaration refuses a session end");
+    return ok;
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     namespace addon = logonomic::cli_addon;
+    if (argc != 2) {
+        std::cerr << "usage: codex_lifecycle_tests <package directory>\n";
+        return 2;
+    }
     addon::Classify_event_request request;
     request.event.name = "SessionStart";
     request.event.body.set("hook_event_name", addon::Json_value("SessionStart"));
@@ -398,7 +506,7 @@ int main()
     }
     request.event.body.set("turn_id", addon::Json_value("turn-a"));
     result = codex::classify_hook(request);
-    if (!result || result->observations.front().phase_evidence != addon::Evidence::INFERRED ||
+    if (!result || result->observations.front().phase_evidence != addon::Evidence::CONFIRMED ||
         result->observations.front().phase_transition != addon::Phase_transition::WORKING)
     {
         return 1;
@@ -413,5 +521,6 @@ int main()
     {
         return 1;
     }
-    return question_hooks() && conversational_stop() ? 0 : 1;
+    const bool gated = declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
+    return question_hooks() && conversational_stop() && gated ? 0 : 1;
 }

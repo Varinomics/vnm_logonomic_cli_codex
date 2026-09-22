@@ -257,12 +257,13 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
         }
         observation.provider_turn_id = *turn;
         if (*name == "UserPromptSubmit" || *name == "Stop" || *name == "Interrupt") {
+            // A native turn hook is Codex's own report of the turn boundary.
             observation.phase_transition = *name == "UserPromptSubmit"
                 ? addon::Phase_transition::WORKING : addon::Phase_transition::AWAITING_INPUT;
-            observation.phase_evidence = addon::Evidence::INFERRED;
+            observation.phase_evidence = addon::Evidence::CONFIRMED;
             if (*name == "Interrupt") {
                 observation.outcome_transition = addon::Outcome_transition::INTERRUPTED;
-                observation.outcome_evidence   = addon::Evidence::INFERRED;
+                observation.outcome_evidence   = addon::Evidence::CONFIRMED;
             }
         }
         else

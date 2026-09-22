@@ -6,12 +6,12 @@
     "features": {
       "root_turn_start": "supported",
       "subagents": "supported",
-      "confirmed_phase_status": "unsupported",
+      "confirmed_phase_status": "supported",
       "attention": "supported",
       "cooperative_description": "unsupported",
       "root_turn_completion": "supported",
       "blockable_completion": "unsupported",
-      "paired_attention": "unsupported"
+      "paired_attention": "supported"
     }
   },
   "capability_id": "lifecycle-events",
