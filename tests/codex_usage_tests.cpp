@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 
@@ -711,6 +712,127 @@ void selected_cache_preserves_host_authority(const fs::path& fixture)
         "corrupt host-selected cache cannot fall back to the valid newer candidate");
 }
 
+void selected_cache_stays_compact_across_incremental_scans(const fs::path& fixture)
+{
+    // A candidate holds the same few files however many rollouts a home has,
+    // and an incremental scan carries the accepted records of every rollout
+    // it does not parse again, including rollouts whose files are gone.
+    const auto profile = fixture / "compact-profile";
+    const auto storage = fixture / "compact-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    constexpr int rollouts = 40;
+    const auto source = [&](int index) {
+        return profile / "sessions" / ("rollout-compact-" + std::to_string(index) + ".jsonl");
+    };
+    for (int index = 0; index < rollouts; ++index) {
+        write(source(index), metadata("compact-" + std::to_string(index)) + start("turn") + tokens(10 + index) +
+            complete("turn"));
+    }
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "compact-account"};
+    const auto cancelled = [] { return false; };
+    std::string error;
+    // Runs of about one record make the scan sort through many merged runs.
+    codex::Usage_scan_limits limits;
+    limits.sort_run_bytes = 1024;
+    const auto scan = [&](const char* name, std::optional<addon::Usage_cache_reference> accepted) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate compact candidate");
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
+        const auto page = codex::scan_usage(request, profile, storage, cancelled, &error, limits);
+        check(page && page->complete && page->cache_candidate, error.empty() ? "compact scan succeeds" : error.c_str());
+        return *page;
+    };
+    const auto total = [](const addon::Usage_scan_page& page) {
+        std::uint64_t sum = 0;
+        for (const auto& record : page.records) {
+            sum += record.total_tokens;
+        }
+        return sum;
+    };
+    const auto files = [&](const addon::Usage_scan_page& page) {
+        addon::Contract_failure failure;
+        const auto manifest = addon::validate_usage_cache_candidate(
+            *page.cache_candidate, utf8(storage), request.context.account_context, cancelled, &failure);
+        check(manifest.has_value(), "compact candidate validates");
+        return manifest->files.size();
+    };
+    const auto first = scan("first", std::nullopt);
+    check(first.records.size() == rollouts && total(first) == 1180, "first scan records every rollout");
+    check(files(first) <= 4, "a candidate's file count does not grow with its rollouts");
+
+    // Rollout 0 gains a turn, rollout 1 disappears, and rollout 2 becomes
+    // unparseable behind an unchanged size and modification time.
+    write(source(0), metadata("compact-0") + start("turn") + tokens(10) + complete("turn") +
+        start("second") + tokens(15) + complete("second"));
+    check(fs::remove(source(1)), "remove a rollout");
+    const auto unchanged_size     = fs::file_size(source(2));
+    const auto unchanged_modified = fs::last_write_time(source(2));
+    write(source(2), std::string(unchanged_size - 1, 'x') + "\n");
+    fs::last_write_time(source(2), unchanged_modified);
+    const auto next = scan("next", first.cache_candidate);
+    check(next.records.size() == rollouts + 1 && total(next) == 1180 + 5,
+        "an incremental scan adds the new turn once and retains every other accepted record");
+    for (std::size_t index = 1; index < next.records.size(); ++index) {
+        check(next.records[index - 1].record_id < next.records[index].record_id, "merged records stay sorted");
+    }
+    check(files(next) <= 4, "an incremental candidate stays compact");
+}
+
+// Rebuilds a sealed current candidate in the per-rollout layout of @1 or @2:
+// a `.meta` and a `.records` file per rollout beside the sorted `records`.
+// @1 records use the usage2 grammar, which carries no counter provenance.
+std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usage_cache_reference& current,
+    const fs::path& fixture_root, const std::string& profile_root,
+    const std::optional<addon::Account_context>& account, int format)
+{
+    const auto from = addon::usage_cache_io_path(addon::path_from_utf8(current.root));
+    const auto to = addon::usage_cache_io_path(fixture_root);
+    check(fs::create_directory(to), "allocate per-rollout fixture");
+    const auto key_of = [](const std::string& source) {
+        return addon::to_hex(addon::Sha256::digest(codex::profile_account_key(source)));
+    };
+    addon::Contract_failure failure;
+    std::map<std::string, std::string> rollout_records;
+    std::string sorted_records;
+    std::ifstream records(from / "records", std::ios::binary);
+    std::string line;
+    while (std::getline(records, line)) {
+        auto envelope = addon::parse_json(line, {}, nullptr);
+        check(envelope.has_value(), "parse current cache envelope");
+        auto record = addon::decode_usage_record(*envelope->find("usage"), &failure, 3);
+        check(record.has_value() && record->source_path.has_value(), "decode current cache record");
+        if (format == 1) {
+            if (record->source_counter_semantics == "cumulative_turn_delta") {
+                record->source_counter_semantics.reset();
+            }
+            envelope->set("usage", addon::encode_usage_record(*record, 2));
+        }
+        const auto encoded = addon::serialize_json(*envelope) + '\n';
+        sorted_records += encoded;
+        rollout_records[key_of(*record->source_path)] += encoded;
+    }
+    check(records.eof(), "read complete cache fixture");
+    write(to / "records", sorted_records);
+    std::ifstream rollouts(from / "rollouts", std::ios::binary);
+    while (std::getline(rollouts, line)) {
+        const auto rollout = addon::parse_json(line, {}, nullptr);
+        check(rollout && rollout->find("source"), "parse current rollout metadata");
+        const auto key = key_of(rollout->find("source")->as_string());
+        write(to / (key + ".meta"), line + '\n');
+        write(to / (key + ".records"), rollout_records[key]);
+    }
+    for (const auto* name : {"snapshot", "cache-state"}) {
+        check(fs::copy_file(from / name, to / name), "copy preceding-format metadata");
+    }
+    return addon::seal_usage_cache_candidate(addon::path_to_utf8(fixture_root), profile_root, account,
+        current.snapshot_id, "codex-rollout-cache@" + std::to_string(format), [] { return false; }, &failure);
+}
+
 void adapter_cache_selection_contract(const fs::path& package, const fs::path& fixture, bool long_allocation)
 {
     const auto profile = fixture / "adapter-profile";
@@ -831,60 +953,40 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     const auto unknown = host.wait_outcome(unknown_id, 16000);
     check(unknown && unknown->status != addon::Host_status::SUCCESS && unknown->reason_code == "native_usage_cache_invalid",
         "unknown native provenance fails without producing a silently rewritten candidate");
-    // Reconstruct the preceding provider-owned format, whose records used the
-    // usage2 grammar. Missing provenance there cannot be recovered by guessing.
-    const auto old_root = addon::usage_cache_io_path(allocation_parent / "preceding-format");
-    check(fs::create_directory(old_root), "allocate preceding-format fixture");
-    const auto inventory = addon::validate_usage_cache_candidate(*first.cache_candidate, *allocated,
-        request.context.account_context, [] { return false; }, &failure);
-    check(inventory.has_value(), "read original candidate for preceding-format fixture");
-    for (const auto& file : inventory->files) {
-        const auto from = addon::usage_cache_io_path(candidate) / file.path;
-        if (file.path == "records" || file.path.ends_with(".records")) {
-            std::ifstream input(from, std::ios::binary);
-            std::string line;
-            std::string previous_bytes;
-            while (std::getline(input, line)) {
-                auto envelope = addon::parse_json(line, {}, nullptr);
-                check(envelope.has_value(), "parse current cache envelope");
-                auto record = addon::decode_usage_record(*envelope->find("usage"), &failure, 3);
-                check(record.has_value(), "decode current cache record");
-                if (record->source_counter_semantics == "cumulative_turn_delta") {
-                    record->source_counter_semantics.reset();
+    // The preceding provider-owned formats kept files per rollout; @1 records
+    // also used the usage2 grammar, whose missing provenance cannot be guessed.
+    request.native_file_cache.reset();
+    for (const int format : {1, 2}) {
+        const auto name = "preceding-format-" + std::to_string(format);
+        const auto old_reference = per_rollout_fixture(*first.cache_candidate, allocation_parent / name, *allocated,
+            request.context.account_context, format);
+        check(old_reference.has_value(), "seal preceding-format fixture");
+        const auto upgraded_root = allocation_parent / ("upgraded-format-" + std::to_string(format));
+        check(fs::create_directory(addon::usage_cache_io_path(upgraded_root)), "allocate upgraded candidate");
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        request.cache_selection = addon::Usage_cache_selection{old_reference, addon::path_to_utf8(upgraded_root)};
+        const auto upgraded = scan();
+        request.snapshot_id = upgraded.snapshot_id;
+        request.cursor = upgraded.next_cursor;
+        const auto upgraded_last = scan();
+        check(upgraded.records.size() == 256 && upgraded_last.records.size() == 15 && upgraded_last.complete,
+            "preceding selected format retains all source-absent history through upgrade");
+        if (format == 1) {
+            for (const auto* page : {&upgraded, &upgraded_last}) {
+                for (const auto& record : page->records) {
+                    check(!record.source_counter_semantics && record.aggregate_evidence == "partial",
+                        "format upgrade does not invent absent provenance or completeness");
                 }
-                envelope->set("usage", addon::encode_usage_record(*record, 2));
-                previous_bytes += addon::serialize_json(*envelope) + '\n';
             }
-            check(input.eof(), "read complete cache fixture");
-            write(old_root / file.path, previous_bytes);
         }
         else {
-            check(fs::copy_file(from, old_root / file.path), "copy preceding-format metadata");
+            check_import(upgraded, upgraded_last);
         }
+        check(addon::validate_usage_cache_candidate(*old_reference, *allocated,
+            request.context.account_context, [] { return false; }, &failure).has_value(),
+            "format upgrade leaves the selected old candidate immutable");
     }
-    const auto old_reference = addon::seal_usage_cache_candidate(
-        addon::path_to_utf8(allocation_parent / "preceding-format"), *allocated, request.context.account_context,
-        first.snapshot_id, "codex-rollout-cache@1", [] { return false; }, &failure);
-    check(old_reference.has_value(), "seal preceding-format fixture");
-    const auto upgraded_root = allocation_parent / "upgraded-format";
-    check(fs::create_directory(addon::usage_cache_io_path(upgraded_root)), "allocate upgraded candidate");
-    request.native_file_cache.reset();
-    request.cache_selection = addon::Usage_cache_selection{old_reference, addon::path_to_utf8(upgraded_root)};
-    const auto upgraded = scan();
-    request.snapshot_id = upgraded.snapshot_id;
-    request.cursor = upgraded.next_cursor;
-    const auto upgraded_last = scan();
-    check(upgraded.records.size() == 256 && upgraded_last.records.size() == 15 && upgraded_last.complete,
-        "preceding selected format retains all source-absent history through upgrade");
-    for (const auto* page : {&upgraded, &upgraded_last}) {
-        for (const auto& record : page->records) {
-            check(!record.source_counter_semantics && record.aggregate_evidence == "partial",
-                "format upgrade does not invent absent provenance or completeness");
-        }
-    }
-    check(addon::validate_usage_cache_candidate(*old_reference, *allocated,
-        request.context.account_context, [] { return false; }, &failure).has_value(),
-        "format upgrade leaves the selected old candidate immutable");
     check(host.shutdown(1000, nullptr), "actual adapter exits without any model request");
 }
 
@@ -908,6 +1010,7 @@ int main(int argc, char** argv)
         native_turn_identity_remains_validated(fixture.path / "rollout-native.jsonl");
         disk_limits_refuse_growth_without_publishing(fixture.path);
         selected_cache_preserves_host_authority(fixture.path);
+        selected_cache_stays_compact_across_incremental_scans(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "short-allocation", false);
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "long-allocation", true);

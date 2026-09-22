@@ -218,12 +218,16 @@ std::optional<std::string> repository_for_cwd(std::string_view cwd)
 
 void refresh_repository(Rollout_usage_record* record)
 {
-    const auto path = repository_for_cwd(record->recorded_cwd);
+    refresh_repository(record, repository_for_cwd(record->recorded_cwd));
+}
+
+void refresh_repository(Rollout_usage_record* record, const std::optional<std::string>& repository)
+{
     record->usage.repository_path.reset();
-    addon::Usage_repository repository;
-    if (path) repository.allocations.push_back({*path, record->usage.total_tokens});
-    else repository.unattributed_tokens = record->usage.total_tokens;
-    record->usage.repository_usage = std::move(repository);
+    addon::Usage_repository allocation;
+    if (repository) allocation.allocations.push_back({*repository, record->usage.total_tokens});
+    else allocation.unattributed_tokens = record->usage.total_tokens;
+    record->usage.repository_usage = std::move(allocation);
 }
 
 bool read_rollout_usage(std::istream& input, const fs::path& path,
