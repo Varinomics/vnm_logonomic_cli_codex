@@ -1,8 +1,10 @@
 #include "codex_launcher.h"
 
-#include <logonomic_cli_addon/launcher_utilities.h>
-#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/presentation_record.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #include <algorithm>
@@ -51,6 +53,196 @@ using addon::path_to_utf8;
 using addon::Environment;
 using addon::Launcher_whitespace;
 namespace fs = std::filesystem;
+
+std::string path_text(const fs::path& path)
+{
+    const auto bytes = path.generic_u8string();
+    return std::string(bytes.begin(), bytes.end());
+}
+
+std::string profile_display_name(const fs::path& profile)
+{
+    std::string name = path_text(profile.filename());
+    std::string folded = addon::lower(name);
+    if (folded.starts_with(".codex")) {
+        name.erase(0, std::string(".codex").size());
+    }
+    const auto first = name.find_first_not_of("-_. ");
+    if (first == std::string::npos) {
+        return "Codex";
+    }
+    name.erase(0, first);
+    for (char& character : name) {
+        if (character == '-' || character == '_' || character == '.') {
+            character = ' ';
+        }
+    }
+    std::string display_name = "Codex " + name;
+    if (!addon::is_valid_utf8(display_name)) {
+        return "Codex profile";
+    }
+    return addon::fitted_display_name(display_name).value_or("Codex profile");
+}
+
+struct Configured_codex_home
+{
+    fs::path scan_path;
+    fs::path identity_path;
+};
+
+std::optional<Configured_codex_home> configured_codex_home(
+    const addon::Discover_request& request,
+    const Environment& environment)
+{
+    std::string configured = addon::environment_value(environment, "CODEX_HOME");
+    if (configured.empty()) {
+        const bool windows = request.platform_id.starts_with("windows-");
+        std::string home = addon::environment_value(
+            environment, windows ? "USERPROFILE" : "HOME");
+        if (home.empty()) {
+            home = request.default_home_fallback;
+        }
+        if (home.empty()) {
+            return std::nullopt;
+        }
+        configured = path_text(addon::path_from_utf8(home) / ".codex");
+    }
+
+    fs::path path = addon::path_from_utf8(configured);
+    if (!path.is_absolute()) {
+        return std::nullopt;
+    }
+    Configured_codex_home home;
+    home.scan_path = path.lexically_normal();
+    std::error_code error;
+    home.identity_path = fs::weakly_canonical(path, error);
+    if (error) {
+        home.identity_path = home.scan_path;
+    }
+    return home;
+}
+
+bool has_codex_auth_file(const fs::path& profile)
+{
+    std::error_code error;
+    return fs::is_regular_file(profile / "auth.json", error) && !error;
+}
+
+bool safe_for_environment_line(const fs::path& profile)
+{
+    const std::string value = path_text(profile);
+    return value.find_first_of("\r\n") == std::string::npos;
+}
+
+std::optional<std::string> codex_profile_environment_text_impl(
+    std::string_view profile_path)
+{
+    std::string assignment = "CODEX_HOME=";
+    assignment.append(profile_path);
+    if (assignment.size() > addon::limits::k_max_environment_text_bytes ||
+        assignment.find('\0') != std::string::npos || !addon::is_valid_utf8(assignment))
+    {
+        return std::nullopt;
+    }
+    return assignment;
+}
+
+std::vector<fs::path> authenticated_codex_profiles(
+    const Configured_codex_home& selected_home,
+    codex::Codex_profile_discovery_stats* out_profile_stats)
+{
+    std::vector<fs::path> profiles;
+    const auto append_if_authenticated = [&profiles](const fs::path& candidate) {
+        if (profiles.size() == addon::limits::k_max_discovery_candidates) {
+            return;
+        }
+        if (!has_codex_auth_file(candidate)) {
+            return;
+        }
+        std::error_code error;
+        fs::path normalized = fs::weakly_canonical(candidate, error);
+        if (error) {
+            normalized = candidate.lexically_normal();
+        }
+        if (!safe_for_environment_line(normalized)) {
+            return;
+        }
+        if (!codex_profile_environment_text_impl(path_text(normalized))) {
+            return;
+        }
+        const bool already_present = std::ranges::any_of(
+            profiles,
+            [&normalized](const fs::path& existing) {
+                std::error_code equivalent_error;
+                if (fs::equivalent(existing, normalized, equivalent_error) &&
+                    !equivalent_error)
+                {
+                    return true;
+                }
+                return existing == normalized;
+            });
+        if (!already_present) {
+            profiles.push_back(std::move(normalized));
+        }
+    };
+
+    append_if_authenticated(selected_home.scan_path);
+    std::error_code error;
+    fs::directory_iterator entry(
+        selected_home.scan_path.parent_path(),
+        fs::directory_options::skip_permission_denied,
+        error);
+    const fs::directory_iterator end;
+    std::size_t entries_examined = 0;
+    for (; !error && entry != end &&
+           entries_examined < codex::k_max_codex_profile_scan_entries &&
+           profiles.size() < addon::limits::k_max_discovery_candidates;
+         entry.increment(error))
+    {
+        ++entries_examined;
+        const std::string name = path_text(entry->path().filename());
+        if (!addon::lower(name).starts_with(".codex") ||
+            !entry->is_directory(error) || error)
+        {
+            error.clear();
+            continue;
+        }
+        append_if_authenticated(entry->path());
+    }
+    if (out_profile_stats) {
+        out_profile_stats->entries_examined = entries_examined;
+    }
+
+    std::ranges::sort(
+        profiles,
+        [&selected_home](const fs::path& left, const fs::path& right) {
+            std::error_code left_error;
+            std::error_code right_error;
+            const bool left_selected = fs::equivalent(
+                left, selected_home.identity_path, left_error) && !left_error;
+            const bool right_selected = fs::equivalent(
+                right, selected_home.identity_path, right_error) && !right_error;
+            if (left_selected != right_selected) {
+                return left_selected;
+            }
+            return path_text(left.filename()) < path_text(right.filename());
+        });
+    if (out_profile_stats) {
+        out_profile_stats->profiles_retained = profiles.size();
+    }
+    return profiles;
+}
+
+addon::Launcher_candidate generic_codex_candidate(const addon::Discover_request& request)
+{
+    return {
+        "interactive", "Codex", "codex",
+        request.platform_id == "windows-x86_64"
+            ? addon::k_runner_powershell
+            : addon::k_runner_direct,
+        "", true, addon::Json_value::object(),
+    };
+}
 
 std::string trim(std::string_view value)
 {
@@ -619,18 +811,69 @@ std::optional<Launcher_command> recognize_launcher(std::string_view script)
     return recognize(script, 8);
 }
 
-std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover_request& request)
+std::optional<std::string> codex_profile_environment_text(std::string_view profile_path)
 {
+    return codex_profile_environment_text_impl(profile_path);
+}
+
+std::vector<addon::Launcher_candidate> discover_launchers(
+    const addon::Discover_request& request)
+{
+    return discover_launchers(request, nullptr);
+}
+
+std::vector<addon::Launcher_candidate> discover_launchers(
+    const addon::Discover_request& request,
+    codex::Codex_profile_discovery_stats* out_profile_stats)
+{
+    if (out_profile_stats) {
+        *out_profile_stats = {};
+    }
     Environment environment;
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    if (!resolve_program("codex", environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
-    return addon::Launcher_candidate{
-        "interactive", "Codex", "codex",
-        request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct,
-        "", true, addon::Json_value::object(),
-    };
+    if (!resolve_program("codex", environment, {}, Launcher_whitespace::ASCII)) {
+        return {};
+    }
+
+    const auto selected_home = configured_codex_home(request, environment);
+    const std::vector<fs::path> profiles = selected_home
+        ? authenticated_codex_profiles(*selected_home, out_profile_stats)
+        : std::vector<fs::path>{};
+    if (profiles.empty()) {
+        return {generic_codex_candidate(request)};
+    }
+
+    std::vector<addon::Launcher_candidate> candidates;
+    candidates.reserve(profiles.size());
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+        if (candidates.size() == addon::limits::k_max_discovery_candidates) {
+            break;
+        }
+        const std::string profile = path_text(profiles[index]);
+        const std::optional<std::string> environment_text =
+            codex_profile_environment_text(profile);
+        if (!environment_text) {
+            continue;
+        }
+        std::error_code selected_error;
+        const bool is_selected = selected_home && fs::equivalent(
+            profiles[index], selected_home->identity_path, selected_error) &&
+            !selected_error;
+        candidates.push_back({
+            "codex_profile_" + std::to_string(index + 1),
+            profile_display_name(profiles[index]),
+            "codex",
+            request.platform_id == "windows-x86_64"
+                ? addon::k_runner_powershell
+                : addon::k_runner_direct,
+            *environment_text,
+            is_selected,
+            addon::Json_value::object(),
+        });
+    }
+    return candidates;
 }
 
 std::vector<std::string> literal_launcher_argv(std::string_view script)

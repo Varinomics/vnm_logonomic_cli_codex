@@ -3,6 +3,7 @@
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
 
+#include <cstddef>
 #include <optional>
 #include <functional>
 #include <string>
@@ -11,6 +12,14 @@
 #include <vector>
 
 namespace codex {
+
+inline constexpr std::size_t k_max_codex_profile_scan_entries = 256;
+
+struct Codex_profile_discovery_stats
+{
+    std::size_t entries_examined = 0;
+    std::size_t profiles_retained = 0;
+};
 
 struct Launcher_command
 {
@@ -57,7 +66,12 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
     std::string_view working_directory);
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
-std::optional<logonomic::cli_addon::Launcher_candidate> discover_launcher(const logonomic::cli_addon::Discover_request& request);
+std::optional<std::string> codex_profile_environment_text(std::string_view profile_path);
+std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
+    const logonomic::cli_addon::Discover_request& request);
+std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
+    const logonomic::cli_addon::Discover_request& request,
+    Codex_profile_discovery_stats* out_profile_stats);
 
 // Literal argv follows the host's direct-launch grammar; it never evaluates a
 // shell expression. Recognition is deliberately separate from executable proof.

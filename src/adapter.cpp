@@ -64,8 +64,7 @@ void discovery(addon::Invocation_context& context)
             context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
             return;
         }
-        const auto candidate = codex::discover_launcher(*request);
-        context.succeed(addon::encode_candidates(candidate ? std::vector<addon::Launcher_candidate>{*candidate} : std::vector<addon::Launcher_candidate>{}));
+        context.succeed(addon::encode_candidates(codex::discover_launchers(*request)));
     }
     else
     if (context.request().operation == addon::k_recognize_operation) {
