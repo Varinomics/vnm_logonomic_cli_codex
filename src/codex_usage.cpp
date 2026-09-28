@@ -3,6 +3,7 @@
 #include "codex_usage_records.h"
 #include "codex_native_usage.h"
 
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -42,6 +43,9 @@ constexpr int k_parser_revision = 1;
 // rollouts a home has. @1 and @2 kept a metadata and a records file per
 // rollout, which every scan had to copy, flush and hash again.
 constexpr std::string_view k_cache_format = "codex-rollout-cache@3";
+constexpr std::chrono::milliseconds k_first_progress_interval{1000};
+// The interval between progress frames doubles each time this many are sent.
+constexpr std::uint64_t k_progress_frames_per_doubling = addon::limits::k_max_progress_frames_per_request / 16;
 std::timed_mutex scan_mutex;
 
 struct Scan_failure { std::string reason; };
@@ -1180,6 +1184,7 @@ addon::Usage_scan_page scan_selected_cache(
     const fs::path& vendor_profile,
     const fs::path& storage,
     const std::function<bool()>& cancelled,
+    Usage_scan_progress& progress,
     const Usage_scan_limits& limits)
 {
     addon::Contract_failure failure;
@@ -1225,7 +1230,11 @@ addon::Usage_scan_page scan_selected_cache(
     if (!addon::validate_usage_cache_allocation(selection.candidate_root, profile_root, &failure)) {
         throw Scan_failure{failure.reason_code};
     }
-    Disk_budget budget(work, limits, cancelled);
+    // Every long step polls cancellation, the SDK's cache validation and
+    // sealing included, so the poll is where the working scan reports.
+    const std::function<bool()> working = [&] { progress.poll(); return cancelled(); };
+    progress.begin("Preparing the usage cache");
+    Disk_budget budget(work, limits, working);
     Budget_scope budget_scope(budget);
     auto seeds = addon::Json_value::array();
     // Rollout metadata by cache key; the accepted records stay on disk and are
@@ -1235,8 +1244,8 @@ addon::Usage_scan_page scan_selected_cache(
     std::uint16_t accepted_version = 3;
     if (selection.accepted) {
         const auto accepted = addon::validate_usage_cache_candidate(
-            *selection.accepted, profile_root, request.context.account_context, cancelled, &failure);
-        check_cancel(cancelled);
+            *selection.accepted, profile_root, request.context.account_context, working, &failure);
+        check_cancel(working);
         require(accepted && (accepted->format == "codex-rollout-cache@1" ||
             accepted->format == "codex-rollout-cache@2" || accepted->format == k_cache_format), "usage_cache_unavailable");
         const auto source = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root));
@@ -1244,36 +1253,39 @@ addon::Usage_scan_page scan_selected_cache(
         require(state.has_value(), "usage_cache_unavailable");
         seeds = member(*state, "native_seeds");
         require(seeds.is_array(), "usage_cache_unavailable");
-        load_accepted_rollouts(*accepted, source, &rollouts, cancelled);
+        load_accepted_rollouts(*accepted, source, &rollouts, working);
         accepted_records = source / "records";
         accepted_version = accepted->format == "codex-rollout-cache@1" ? 2 : 3;
     }
     // Turns converted from a native seed and turns parsed in this scan, each
     // sorted by ID for reconciliation with the accepted records.
-    Record_sorter seeded(work, "seeded-run", cancelled, 3, false);
-    Record_sorter parsed(work, "parsed-run", cancelled, 3, false);
+    Record_sorter seeded(work, "seeded-run", working, 3, false);
+    Record_sorter parsed(work, "parsed-run", working, 3, false);
+    if (request.native_file_cache) progress.begin("Importing earlier usage history");
     seed_native_cache(request, storage, selection.accepted.has_value(), &seeds,
         [&rollouts](const std::string& key) {
             const auto found = rollouts.find(key);
             return found == rollouts.end() ? std::nullopt : std::optional(found->second);
         },
-        [&rollouts, &seeded](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
+        [&rollouts, &seeded, &progress](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
             rollouts[key] = std::move(metadata);
             for (auto& record : records) {
                 seeded.add(std::move(record));
             }
-        }, cancelled, 3);
+            progress.advance();
+        }, working, 3);
     require(fs::is_directory(vendor_profile), "usage_sessions_unavailable");
     const auto sessions = vendor_profile / "sessions";
     const bool have_sessions = fs::exists(sessions);
     require(!have_sessions || fs::is_directory(sessions), "usage_sessions_not_directory");
     bool incomplete = false;
+    progress.begin("Reading Codex sessions");
     fs::recursive_directory_iterator entries;
     if (have_sessions) {
         entries = fs::recursive_directory_iterator(sessions);
     }
     for (; entries != fs::recursive_directory_iterator{}; ++entries) {
-        check_cancel(cancelled);
+        check_cancel(working);
         const auto& entry = *entries;
         if (hidden_entry(entry)) {
             entries.disable_recursion_pending();
@@ -1287,8 +1299,9 @@ addon::Usage_scan_page scan_selected_cache(
         std::vector<Sort_record> records;
         auto refreshed = refresh_rollout(entry.path(), source,
             cached == rollouts.end() ? std::nullopt : std::optional(cached->second),
-            request.mode != "incremental", cancelled, 3,
+            request.mode != "incremental", working, 3,
             [&records](Sort_record record) { records.push_back(std::move(record)); });
+        progress.advance();
         if (refreshed.incomplete) incomplete = true;
         if (!refreshed.metadata) continue;
         rollouts[key] = std::move(*refreshed.metadata);
@@ -1298,12 +1311,15 @@ addon::Usage_scan_page scan_selected_cache(
     }
     const auto seeded_path = work / "seeded-records";
     const auto parsed_path = work / "parsed-records";
+    progress.begin("Sorting usage records");
     seeded.finish(seeded_path);
     parsed.finish(parsed_path);
-    merge_snapshot_records(work, accepted_records, accepted_version, rollouts, seeded_path, parsed_path, cancelled);
+    progress.begin("Merging usage history");
+    merge_snapshot_records(work, accepted_records, accepted_version, rollouts, seeded_path, parsed_path, working);
     remove_owned_path(seeded_path);
     remove_owned_path(parsed_path);
-    write_rollouts(work, rollouts, cancelled);
+    progress.begin("Saving the usage cache");
+    write_rollouts(work, rollouts, working);
     const auto identifier = nonce();
     addon::Observation_scope scope;
     if (request.context.account_context) {
@@ -1320,7 +1336,7 @@ addon::Usage_scan_page scan_selected_cache(
     state.set("snapshot_id", addon::Json_value(identifier));
     state.set("native_seeds", std::move(seeds));
     write_json(work / "cache-state", state);
-    auto page = page_at(work, identifier, 0, request.context.account_context, cancelled, 3);
+    auto page = page_at(work, identifier, 0, request.context.account_context, working, 3);
     page.account_context = request.context.account_context;
     page.profile_storage = request.context.profile_storage;
     // A parsed rollout need not contain all historical contributing events.
@@ -1330,7 +1346,7 @@ addon::Usage_scan_page scan_selected_cache(
     }
     page.cache_candidate = addon::seal_usage_cache_candidate(
         selection.candidate_root, profile_root, request.context.account_context,
-        identifier, std::string(k_cache_format), cancelled, &failure);
+        identifier, std::string(k_cache_format), working, &failure);
     if (!page.cache_candidate) {
         throw Scan_failure{failure.reason_code};
     }
@@ -1341,16 +1357,52 @@ addon::Usage_scan_page scan_selected_cache(
 
 } // namespace
 
+Usage_scan_progress::Usage_scan_progress(
+    Sink                      sink,
+    std::chrono::milliseconds tolerated_silence,
+    Clock                     clock)
+:
+    m_sink(std::move(sink)),
+    m_clock(std::move(clock)),
+    m_longest_interval(tolerated_silence / 4)
+{}
+
+void Usage_scan_progress::begin(std::string note)
+{
+    m_note      = std::move(note);
+    m_completed = 0;
+    emit();
+}
+
+void Usage_scan_progress::poll()
+{
+    const auto doublings = static_cast<int>(m_frames / k_progress_frames_per_doubling);
+    const auto interval  = std::min(k_first_progress_interval * (std::int64_t{1} << doublings), m_longest_interval);
+    if (m_clock() - m_last_frame >= interval) {
+        emit();
+    }
+}
+
+void Usage_scan_progress::emit()
+{
+    if (m_frames == addon::limits::k_max_progress_frames_per_request) {
+        return;
+    }
+    ++m_frames;
+    m_last_frame = m_clock();
+    m_sink(m_completed, m_note);
+}
+
 std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request& request,
     const fs::path& vendor_profile, const fs::path& storage, const std::function<bool()>& cancelled,
-    std::string* error, const Usage_scan_limits& limits)
+    Usage_scan_progress& progress, std::string* error, const Usage_scan_limits& limits)
 {
     try {
         std::unique_lock lock(scan_mutex, std::defer_lock);
         while (!lock.try_lock_for(std::chrono::milliseconds(50))) check_cancel(cancelled);
         check_cancel(cancelled);
         if (request.cache_selection) {
-            return scan_selected_cache(request, vendor_profile, storage, cancelled, limits);
+            return scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits);
         }
         // Bootstrap creates only these three zero-byte entries before inventory.
         require(limits.filesystem_entries >= 3, "usage_disk_budget_exceeded");
@@ -1362,7 +1414,10 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
             return page_at(snapshots / *request.snapshot_id, *request.snapshot_id, decimal(*request.cursor), request.context.account_context, cancelled);
         }
         require(!request.cursor, "usage_cursor_invalid");
-        Disk_budget budget(root, limits, cancelled);
+        // As in scan_selected_cache, the working scan reports where it polls.
+        const std::function<bool()> working = [&] { progress.poll(); return cancelled(); };
+        progress.begin("Preparing the usage cache");
+        Disk_budget budget(root, limits, working);
         Budget_scope budget_scope(budget);
         require(fs::is_directory(vendor_profile), "usage_sessions_unavailable");
         const auto sessions = vendor_profile / "sessions";
@@ -1390,28 +1445,34 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         const auto work = directory(snapshots, identifier);
         Pending_snapshot pending(work);
         if (accepted) {
-            copy_accepted_cache(*accepted, snapshots, work, cancelled);
+            copy_accepted_cache(*accepted, snapshots, work, working);
         }
+        if (request.native_file_cache) progress.begin("Importing earlier usage history");
         seed_native_cache(request, storage, accepted.has_value(), &seeds,
             [&work](const std::string& key) { return read_json(work / (key + ".meta")); },
-            [&work](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
+            [&work, &progress](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
                 write_rollout_records(work / (key + ".records"), records);
                 write_json(work / (key + ".meta"), metadata);
-            }, cancelled);
+                progress.advance();
+            }, working);
         bool incomplete = false;
+        progress.begin("Reading Codex sessions");
         fs::recursive_directory_iterator entries;
         if (have_sessions) entries = fs::recursive_directory_iterator(sessions);
         for (; entries != fs::recursive_directory_iterator{}; ++entries) {
-            check_cancel(cancelled);
+            check_cancel(working);
             const auto& entry = *entries;
             if (hidden_entry(entry)) { entries.disable_recursion_pending(); continue; }
             const auto name = addon::ascii_lowercase(entry.path().filename().string());
             if (entry.is_regular_file() && name.starts_with("rollout-") && name.ends_with(".jsonl")) {
-                refresh_file(entry.path(), work, request.mode != "incremental", &incomplete, cancelled);
+                refresh_file(entry.path(), work, request.mode != "incremental", &incomplete, working);
+                progress.advance();
             }
         }
-        sorted_snapshot(work, cancelled);
-        check_cancel(cancelled);
+        progress.begin("Sorting usage records");
+        sorted_snapshot(work, working);
+        check_cancel(working);
+        progress.begin("Saving the usage cache");
         addon::Observation_scope scope;
         if (request.context.account_context) scope.source_account_key = request.context.account_context->adapter_account_key;
         scope.observed_at_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1420,8 +1481,8 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         metadata.set("scope", addon::encode_observation_scope(scope));
         metadata.set("incomplete", addon::Json_value(incomplete));
         write_json(work / "snapshot", metadata);
-        auto page = page_at(work, identifier, 0, request.context.account_context, cancelled);
-        auto next = accepted_generation(work, seeds, request.context.account_context, cancelled);
+        auto page = page_at(work, identifier, 0, request.context.account_context, working);
+        auto next = accepted_generation(work, seeds, request.context.account_context, working);
         // Include response construction in the candidate: encoding can still fail
         // before the one pointer exposes this generation and its seed receipts.
         const auto encoded = addon::encode_usage_scan_result(page, 2);
@@ -1429,7 +1490,7 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         require(addon::decode_usage_scan_result(encoded, &failure, 2).has_value(), "usage_snapshot_invalid");
         sync_path(root, true);
         sync_path(storage, true);
-        check_cancel(cancelled);
+        check_cancel(working);
         // A failed rename/directory flush can leave the new pointer visible.
         // Preserve both generations until the next scan resolves that pointer.
         write_json(root / "accepted", next, &pending);
@@ -1452,8 +1513,13 @@ void handle_usage(addon::Invocation_context& context)
     if (!profile) return;
     if (!request->context.profile_storage) { context.fail(addon::Result_status::UNAVAILABLE, "profile_storage_unavailable"); return; }
     std::string error;
+    Usage_scan_progress progress(
+        [&context](std::uint64_t completed, const std::string& note) {
+            context.report_progress(completed, std::nullopt, note);
+        },
+        std::chrono::milliseconds(context.request().deadline_ms));
     const auto page = scan_usage(*request, addon::path_from_utf8(profile->profile_path), addon::path_from_utf8(request->context.profile_storage->root),
-        [&context] { return context.cancel_requested(); }, &error);
+        [&context] { return context.cancel_requested(); }, progress, &error);
     if (!page) { context.fail(error == "cancelled" ? addon::Result_status::CANCELLED : addon::Result_status::FAILED, error); return; }
     context.succeed(addon::encode_usage_scan_result(*page, version));
 }

@@ -4,18 +4,22 @@
 #include "codex_native_usage.h"
 #include "codex_accounts.h"
 #include <logonomic_cli_addon/host_simulator.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 
@@ -25,6 +29,19 @@ namespace fs = std::filesystem;
 void check(bool condition, const char* message)
 {
     if (!condition) throw std::runtime_error(message);
+}
+
+// Scans whose progress a test does not examine report into this.
+codex::Usage_scan_progress quiet_progress([](std::uint64_t, const std::string&) {}, std::chrono::minutes(15));
+
+// The notes of consecutive frames, each stage named once.
+std::vector<std::string> stage_notes(const std::vector<std::string>& notes)
+{
+    std::vector<std::string> stages;
+    for (const auto& note : notes) {
+        if (stages.empty() || stages.back() != note) stages.push_back(note);
+    }
+    return stages;
 }
 
 struct Temporary_directory
@@ -211,26 +228,26 @@ void scanner_sorts_pages_and_preserves_cache_on_retry(const fs::path& fixture)
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
     std::string error;
-    auto first = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    auto first = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(first && !first->complete && first->records.size() == 256, error.empty() ? "bounded first page" : error.c_str());
     for (std::size_t index = 1; index < first->records.size(); ++index) {
         check(first->records[index - 1].record_id < first->records[index].record_id, "external sort order");
     }
     request.snapshot_id = first->snapshot_id;
     request.cursor = first->next_cursor;
-    const auto final = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto final = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(final && final->complete && final->records.size() == 44, "terminal page");
     check(first->records.back().record_id < final->records.front().record_id, "ordering across pages");
-    const auto retry = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto retry = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(retry && addon::encode_usage_scan_result(*retry, 2) == addon::encode_usage_scan_result(*final, 2), "continuation retry is stable");
     request.snapshot_id.reset(); request.cursor.reset();
     write(path, bytes + "{broken json}\n");
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error), "malformed changed history fails snapshot");
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error), "malformed changed history fails snapshot");
     fs::remove(path);
-    const auto retained = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto retained = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(retained && retained->records.size() == 256, "disappeared source retains last valid history");
     unsigned polls = 0;
-    check(!codex::scan_usage(request, profile, storage, [&] { return ++polls > 8; }, &error) && error == "cancelled",
+    check(!codex::scan_usage(request, profile, storage, [&] { return ++polls > 8; }, quiet_progress, &error) && error == "cancelled",
         "cancellation discards pending snapshot");
     unsigned snapshots = 0;
     for (const auto& entry : fs::directory_iterator(storage / "codex-usage-v1" / "snapshots")) {
@@ -247,35 +264,35 @@ void scanner_accepts_new_profiles_and_retains_transient_empty_history(const fs::
     fs::create_directory(storage);
     addon::Usage_scan_request request;
     std::string error;
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->complete && page->records.empty(), "existing new account without sessions is an empty successful scan");
     const auto sessions = profile / "sessions";
     write(sessions, "not a directory");
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "usage_sessions_not_directory",
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "usage_sessions_not_directory",
         "an existing non-directory session path remains invalid");
     fs::remove(sessions);
     fs::create_directory(sessions);
     const auto rollout = sessions / "rollout-new.jsonl";
     write(rollout, "");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.empty() && page->incomplete_historical_coverage, "first empty rollout is transient, not invalid history");
     for (const auto& entry : fs::directory_iterator(accepted_snapshot(storage))) {
         check(entry.path().extension() != ".meta", "empty source does not manufacture a cache entry");
     }
     write(rollout, metadata() + start("turn") + tokens(17) + complete("turn"));
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17, "populated rollout establishes accepted history");
     write(rollout, "");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17 && page->incomplete_historical_coverage,
         "temporarily truncated rollout preserves accepted usage");
     fs::remove(rollout);
     fs::remove(sessions);
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
         "missing sessions collection retains accepted file cache");
     fs::remove(profile);
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "usage_sessions_unavailable",
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "usage_sessions_unavailable",
         "missing profile itself remains invalid");
 }
 
@@ -361,7 +378,7 @@ void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
     request.context.account_context = addon::Account_context{1, "account"};
     set_seed(&request, artifact, bytes);
     std::string error;
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
         "missing native rollout retained through typed cache seed");
     check(!page->records[0].source_counter_semantics, "usage2 native conversion remains unchanged");
@@ -369,22 +386,22 @@ void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
         page->records[0].cache_creation.coverage->support == addon::Usage_support::UNSUPPORTED,
         "native cached category evidence preserved exactly");
     write(source, metadata("legacy") + start("turn") + tokens(23) + complete("turn"));
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records[0].total_tokens == 23, "live file advances seeded stable turn");
     fs::remove(source);
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records[0].total_tokens == 23, "same consumed seed cannot overwrite newer retained counts");
     set_seed(&request, artifact, "");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records[0].total_tokens == 23, "empty host FILE_CACHE preserves durable package history");
     const auto cache = accepted_snapshot(storage);
     for (const auto& entry : fs::directory_iterator(cache)) {
         if (entry.path().extension() == ".records") fs::remove(entry.path());
     }
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "required_usage_cache_unavailable",
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "required_usage_cache_unavailable",
         "empty required seed plus lost retained cache fails before replacement");
     set_seed(&request, artifact, bytes);
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "required_usage_cache_unavailable",
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "required_usage_cache_unavailable",
         "consumed stale seed cannot resurrect older history after cache loss");
 }
 
@@ -418,16 +435,16 @@ void native_seed_fingerprint_uses_system_clock(const fs::path& fixture)
     request.context.account_context = addon::Account_context{1, "account"};
     set_seed(&request, artifact, addon::serialize_json(wrapper) + '\n');
     std::string error;
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
         "matching system-clock milliseconds reuse native cache evidence");
 
     request.native_file_cache.reset();
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
         "native timestamp identity survives accepted-cache reload");
     fs::last_write_time(source, file_modified + std::chrono::seconds{2});
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 23,
         "changed timestamp with unchanged size refreshes native cache evidence");
 }
@@ -444,7 +461,7 @@ void native_seed_cancellation_preserves_accepted_history(const fs::path& fixture
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
     std::string error;
-    const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(baseline && baseline->records.empty(), "establish accepted empty history");
     const auto accepted = accepted_snapshot(storage);
     set_seed(&request, artifact, bytes);
@@ -459,14 +476,14 @@ void native_seed_cancellation_preserves_accepted_history(const fs::path& fixture
         }
         return false;
     };
-    check(!codex::scan_usage(request, profile, storage, cancel_after_first_file, &error) && error == "cancelled",
+    check(!codex::scan_usage(request, profile, storage, cancel_after_first_file, quiet_progress, &error) && error == "cancelled",
         "cancel through production predicate after one native candidate file");
     check(accepted_snapshot(storage) == accepted, "cancelled native import cannot replace accepted evidence");
-    const auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 2 && page->records[0].total_tokens + page->records[1].total_tokens == 35,
         "retry imports every native file without acknowledging the cancelled partial import");
     request.native_file_cache->sha256_hex = std::string(64, '0');
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "native_usage_cache_digest_mismatch",
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "native_usage_cache_digest_mismatch",
         "digest mismatch cannot publish imported evidence");
 }
 
@@ -482,18 +499,18 @@ void rejected_scan_cannot_publish_refreshed_history_after_source_deletion(const 
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
     std::string error;
-    const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(baseline && baseline->records.size() == 1 && baseline->records[0].total_tokens == 17,
         "establish accepted history before whole-scan rejection");
     const auto accepted = accepted_snapshot(storage);
     write(source, metadata("retained") + start("turn") + tokens(310) + complete("turn"));
     write(duplicate, metadata("retained") + start("turn") + tokens(19) + complete("turn"));
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) && error == "duplicate_usage_record",
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "duplicate_usage_record",
         "both refreshed files are rejected together when snapshot identities collide");
     check(accepted_snapshot(storage) == accepted, "failed complete candidate leaves accepted authority intact");
     fs::remove(source);
     fs::remove(duplicate);
-    const auto retained = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto retained = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(retained && retained->records.size() == 1 && retained->records[0].total_tokens == 17,
         "source deletion after rejection retains only previously accepted evidence");
 }
@@ -508,7 +525,7 @@ void transient_refresh_discards_partial_records_before_acceptance(const fs::path
     write(source, metadata("transient") + start("turn") + tokens(17) + complete("turn"));
     addon::Usage_scan_request request;
     std::string error;
-    const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(baseline && baseline->records.size() == 1, "establish history before a concurrent source change");
 
     constexpr unsigned k_refresh_records = 500;
@@ -550,7 +567,7 @@ void transient_refresh_discards_partial_records_before_acceptance(const fs::path
         }
         return false;
     };
-    const auto retained = codex::scan_usage(request, profile, storage, change_during_read, &error);
+    const auto retained = codex::scan_usage(request, profile, storage, change_during_read, quiet_progress, &error);
     check(changed_after_output && records_at_mutation > 0 && records_at_mutation < k_refresh_records,
         "source must change during partial parsing, not at the post-fingerprint callback");
     const auto diagnostic = "transient source change preserves the accepted file evidence: partial_records=" +
@@ -577,19 +594,19 @@ void accepted_inventory_controls_cache_replay(const fs::path& fixture)
     write(source, metadata("inventory") + start("turn") + tokens(17) + complete("turn"));
     addon::Usage_scan_request request;
     std::string error;
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1, "establish inventory-bound cache");
     fs::remove(source);
     auto accepted = accepted_snapshot(storage);
     write(accepted / (std::string(64, 'a') + ".meta"), "{\"source\":\"unaccepted\"}\n");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
         "unlisted cache files cannot enter the next accepted generation");
     accepted = accepted_snapshot(storage);
     for (const auto& entry : fs::directory_iterator(accepted)) {
         if (entry.path().extension() == ".records") write(entry.path(), "");
     }
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) &&
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
         error == "required_usage_cache_unavailable", "changed accepted content fails its bound inventory digest");
 }
 
@@ -604,17 +621,17 @@ void empty_native_cache_is_accepted_evidence(const fs::path& fixture)
     request.context.account_context = addon::Account_context{1, "account"};
     set_seed(&request, artifact, "");
     std::string error;
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, &error) &&
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
         error == "required_usage_cache_unavailable", "absent required evidence is not a validated empty cache");
     auto wrapper = native_wrapper(profile / "sessions" / "rollout-empty.jsonl", "empty", 17);
     wrapper.set("records", addon::Json_value::array());
     set_seed(&request, artifact, addon::serialize_json(wrapper) + '\n');
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->complete && page->records.empty(), "valid native file with no completed turns is accepted evidence");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.empty(), "required empty native cache remains valid on seed replay");
     set_seed(&request, artifact, "");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.empty(), "empty host FILE_CACHE retains a validated empty accepted generation");
 }
 
@@ -668,7 +685,7 @@ void disk_limits_refuse_growth_without_publishing(const fs::path& fixture)
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
     std::string error;
-    const auto accepted = codex::scan_usage(request, profile, storage, [] { return false; }, &error);
+    const auto accepted = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(accepted && accepted->records.size() == 1, "budget fixture establishes retained history");
     const auto root = storage / "codex-usage-v1";
     const auto initial = tree_usage(root);
@@ -680,7 +697,7 @@ void disk_limits_refuse_growth_without_publishing(const fs::path& fixture)
         if (kind == "entries") limits.filesystem_entries = initial.entries + 1;
         if (kind == "lines") limits.persisted_lines = initial.lines;
         if (kind == "records") limits.candidate_records = 0;
-        const auto result = codex::scan_usage(request, profile, storage, [] { return false; }, &error, limits);
+        const auto result = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error, limits);
         check(!result && (error == "usage_disk_budget_exceeded" || error == "usage_candidate_budget_exceeded"),
             "resource limit must reject before publishing the changed candidate");
         const auto after = tree_usage(root);
@@ -691,7 +708,7 @@ void disk_limits_refuse_growth_without_publishing(const fs::path& fixture)
         auto replay = request;
         replay.snapshot_id = accepted->snapshot_id;
         replay.cursor = "0";
-        const auto retained = codex::scan_usage(replay, profile, storage, [] { return false; }, &error);
+        const auto retained = codex::scan_usage(replay, profile, storage, [] { return false; }, quiet_progress, &error);
         check(retained && retained->records.front().total_tokens == 17,
             "previous immutable snapshot survives resource-limit failure unchanged");
     }
@@ -702,7 +719,7 @@ void disk_limits_refuse_growth_without_publishing(const fs::path& fixture)
     set_seed(&request, artifact, addon::serialize_json(native_wrapper(imported_profile / "sessions" / "rollout-gone.jsonl", "gone", 17)) + '\n');
     codex::Usage_scan_limits limits;
     limits.candidate_records = 0;
-    check(!codex::scan_usage(request, imported_profile, imported_storage, [] { return false; }, &error, limits) &&
+    check(!codex::scan_usage(request, imported_profile, imported_storage, [] { return false; }, quiet_progress, &error, limits) &&
         error == "usage_candidate_budget_exceeded", "native import observes the same record budget before cache writes");
     const auto imported_root = imported_storage / "codex-usage-v1";
     check(fs::is_empty(imported_root / "snapshots") && !fs::exists(imported_root / "accepted"),
@@ -730,7 +747,7 @@ void selected_cache_preserves_host_authority(const fs::path& fixture)
     const auto cancelled = [] { return false; };
     std::string error;
     allocate("first");
-    const auto first = codex::scan_usage(request, profile, storage, cancelled, &error);
+    const auto first = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
     check(first && first->cache_candidate && first->records.front().total_tokens == 19, "first immutable candidate");
     check(first->records.front().aggregate_evidence == "partial", "parsing alone does not certify a complete aggregate");
     check(!fs::exists(storage / "codex-usage-v1"), "usage3 never creates or promotes the usage2 namespace");
@@ -738,31 +755,31 @@ void selected_cache_preserves_host_authority(const fs::path& fixture)
     allocate("rejected");
     request.cache_selection->accepted = first->cache_candidate;
     request.mode = "repair";
-    const auto rejected = codex::scan_usage(request, profile, storage, cancelled, &error);
+    const auto rejected = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
     check(rejected && rejected->records.front().total_tokens == 7 && rejected->cache_candidate,
         "lower partial candidate remains explicitly unaccepted");
     check(fs::remove(source), "remove source to expose selected cache identity");
     allocate("retry");
     request.cache_selection->accepted = first->cache_candidate;
-    const auto retry = codex::scan_usage(request, profile, storage, cancelled, &error);
+    const auto retry = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
     check(retry && retry->records.front().total_tokens == 19, "host-selected cache wins over newer rejected candidate");
     addon::Contract_failure failure;
     check(addon::validate_usage_cache_candidate(*first->cache_candidate, addon::path_to_utf8(storage),
         request.context.account_context, cancelled, &failure).has_value(), "original accepted cache remains intact");
     allocate("reset");
     request.mode = "reset";
-    const auto reset = codex::scan_usage(request, profile, storage, cancelled, &error);
+    const auto reset = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
     check(reset && reset->complete && reset->records.empty(), "usage3 reset successfully drops source-absent retained history");
     check(fs::exists(storage / "first" / "cache-manifest.json") && fs::exists(storage / "rejected" / "cache-manifest.json"),
         "provider never prunes accepted or unaccepted candidates");
     allocate("cancelled");
-    check(!codex::scan_usage(request, profile, storage, [] { return true; }, &error) && error == "cancelled",
+    check(!codex::scan_usage(request, profile, storage, [] { return true; }, quiet_progress, &error) && error == "cancelled",
         "cancellation does not publish any acceptance");
     write(storage / "first" / "records", "corrupt\n");
     allocate("corrupt-input");
     request.mode = "incremental";
     request.cache_selection->accepted = first->cache_candidate;
-    check(!codex::scan_usage(request, profile, storage, cancelled, &error) && error == "usage_cache_unavailable",
+    check(!codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error) && error == "usage_cache_unavailable",
         "corrupt host-selected cache cannot fall back to the valid newer candidate");
 }
 
@@ -797,7 +814,7 @@ void selected_cache_stays_compact_across_incremental_scans(const fs::path& fixtu
         request.snapshot_id.reset();
         request.cursor.reset();
         request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
-        const auto page = codex::scan_usage(request, profile, storage, cancelled, &error, limits);
+        const auto page = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error, limits);
         check(page && page->complete && page->cache_candidate, error.empty() ? "compact scan succeeds" : error.c_str());
         return *page;
     };
@@ -866,7 +883,7 @@ void selected_cache_reconciles_turns_by_identity(const fs::path& fixture)
         request.snapshot_id.reset();
         request.cursor.reset();
         request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
-        return codex::scan_usage(request, profile, storage, cancelled, &error);
+        return codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
     };
     const auto totals = [](const addon::Usage_scan_page& page) {
         std::map<std::string, std::uint64_t> result;
@@ -936,7 +953,7 @@ void selected_cache_retains_repository_attribution(const fs::path& fixture)
         check(fs::create_directory(path), "allocate repository candidate");
         request.mode = "incremental";
         request.cache_selection = addon::Usage_cache_selection{accepted, addon::path_to_utf8(path)};
-        auto page = codex::scan_usage(request, profile, storage, cancelled, &error);
+        auto page = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
         check(page && page->complete && page->cache_candidate, error.empty() ? "repository scan succeeds" : error.c_str());
         return *page;
     };
@@ -1007,7 +1024,7 @@ void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::
         check(fs::create_directory(path), "allocate imported candidate");
         request.mode = mode;
         request.cache_selection = addon::Usage_cache_selection{accepted, utf8(path)};
-        auto page = codex::scan_usage(request, profile, storage, cancelled, &error);
+        auto page = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
         check(page && page->complete && page->cache_candidate, error.empty() ? "imported scan succeeds" : error.c_str());
         return *page;
     };
@@ -1046,6 +1063,170 @@ void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::
 // Rebuilds a sealed current candidate in the per-rollout layout of @1 or @2:
 // a `.meta` and a `.records` file per rollout beside the sorted `records`.
 // @1 records use the usage2 grammar, which carries no counter provenance.
+void progress_stays_within_the_frame_bound_and_the_silence()
+{
+    // The core protocol allows 4,096 progress frames per request, and the
+    // host ends a request whose package sends nothing for its deadline. A
+    // scan that keeps working reports within a quarter of that silence for
+    // three days, and never exceeds the bound, not even for a new stage.
+    using namespace std::chrono;
+    const milliseconds silence = minutes(15);
+    steady_clock::time_point now{};
+    std::vector<steady_clock::time_point> frames;
+    codex::Usage_scan_progress progress(
+        [&](std::uint64_t, const std::string&) { frames.push_back(now); }, silence, [&now] { return now; });
+    progress.begin("Reading Codex sessions");
+    const auto end = now + hours(72);
+    while (now < end) {
+        now += milliseconds(100);
+        progress.poll();
+    }
+    check(frames.size() > 1 && frames.size() <= addon::limits::k_max_progress_frames_per_request,
+        "a working scan reports within the frame bound");
+    for (std::size_t index = 1; index < frames.size(); ++index) {
+        check(frames[index] - frames[index - 1] <= silence / 4, "a working scan reports within a quarter of the silence");
+    }
+    check(end - frames.back() <= silence / 4, "a scan still working after three days still reports");
+    while (frames.size() < addon::limits::k_max_progress_frames_per_request) {
+        now += hours(1);
+        progress.poll();
+    }
+    now += hours(1);
+    progress.poll();
+    progress.begin("Saving the usage cache");
+    check(frames.size() == addon::limits::k_max_progress_frames_per_request, "a spent frame bound sends nothing more");
+}
+
+void scans_report_each_stage_while_they_work(const fs::path& fixture)
+{
+    // A scan reports each stage as it begins and, while the stage works, how
+    // many items it has handled. This clock advances a second at every
+    // reading, so each of the scan's polls is due to report. The second scan
+    // of each layout validates an accepted cache, parses every rollout and
+    // sorts through merged runs, so every stage of it has work to report.
+    const auto profile = fixture / "pgp";
+    fs::create_directories(profile / "sessions");
+    constexpr std::uint64_t rollouts = 3;
+    for (std::uint64_t index = 0; index < rollouts; ++index) {
+        const auto id = "progress-" + std::to_string(index);
+        write(profile / "sessions" / ("rollout-" + id + ".jsonl"),
+            metadata(id) + start("turn") + tokens(5) + complete("turn"));
+    }
+    std::chrono::steady_clock::time_point now{};
+    std::vector<std::uint64_t> counts;
+    std::vector<std::string> notes;
+    codex::Usage_scan_progress progress(
+        [&](std::uint64_t completed, const std::string& note) { counts.push_back(completed); notes.push_back(note); },
+        std::chrono::minutes(15),
+        [&now] { return now += std::chrono::seconds(1); });
+    const auto check_frames = [&](const std::vector<std::string>& stages, const char* message) {
+        check(stage_notes(notes) == stages, message);
+        std::uint64_t sessions_read = 0;
+        std::size_t stage_frames = 0;
+        for (std::size_t index = 0; index < notes.size(); ++index) {
+            if (index == 0 || notes[index] != notes[index - 1]) {
+                check(index == 0 || stage_frames > 1, "each stage reports while it works");
+                check(counts[index] == 0, "a stage counts from zero");
+                stage_frames = 0;
+            }
+            else {
+                check(counts[index] >= counts[index - 1], "a stage's count never decreases");
+            }
+            ++stage_frames;
+            if (notes[index] == "Reading Codex sessions") sessions_read = std::max(sessions_read, counts[index]);
+        }
+        check(stage_frames > 1, "each stage reports while it works");
+        check(sessions_read > 0 && sessions_read <= rollouts, "the reading stage counts the session files it read");
+        counts.clear();
+        notes.clear();
+    };
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "progress-account"};
+    codex::Usage_scan_limits limits;
+    limits.sort_run_bytes = 64;
+    std::string error;
+
+    const auto storage = fixture / "pgs";
+    const auto selected_scan = [&](const char* name, std::optional<addon::Usage_cache_reference> accepted) {
+        check(fs::create_directories(storage / name), "allocate progress candidate");
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(storage / name)};
+        const auto page = codex::scan_usage(request, profile, storage, [] { return false; }, progress, &error, limits);
+        check(page && page->complete && page->cache_candidate, error.empty() ? "selected-cache scan succeeds" : error.c_str());
+        return page->cache_candidate;
+    };
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    const auto first = selected_scan("first", std::nullopt);
+    counts.clear();
+    notes.clear();
+    request.mode = "repair";
+    selected_scan("repair", first);
+    check_frames({"Preparing the usage cache", "Reading Codex sessions", "Sorting usage records",
+        "Merging usage history", "Saving the usage cache"}, "a selected-cache scan reports each stage in order");
+
+    const auto legacy_storage = fixture / "pgl";
+    fs::create_directory(legacy_storage);
+    request.context.profile_storage.reset();
+    request.cache_selection.reset();
+    for (const char* mode : {"incremental", "repair"}) {
+        counts.clear();
+        notes.clear();
+        request.mode = mode;
+        const auto legacy = codex::scan_usage(request, profile, legacy_storage, [] { return false; }, progress, &error, limits);
+        check(legacy && legacy->complete, error.empty() ? "per-rollout scan succeeds" : error.c_str());
+    }
+    check_frames({"Preparing the usage cache", "Reading Codex sessions", "Sorting usage records", "Saving the usage cache"},
+        "a per-rollout scan reports each stage in order");
+}
+
+void waiting_for_another_scan_reports_nothing(const fs::path& fixture)
+{
+    // The host restarts every request's deadline on any frame of the package,
+    // so frames sent while a scan waits for another one would hide that the
+    // other scan stalled.
+    const auto profile = fixture / "waiting-profile";
+    const auto storage = fixture / "waiting-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    write(profile / "sessions" / "rollout-waiting.jsonl", metadata("waiting") + start("turn") + tokens(5) + complete("turn"));
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "waiting-account"};
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool holding  = false;
+    bool released = false;
+    std::string holder_error;
+    std::thread holder([&] {
+        // The first poll after taking the package's scan lock holds it here.
+        const auto hold = [&] {
+            std::unique_lock lock(mutex);
+            holding = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+            return false;
+        };
+        codex::scan_usage(request, profile, storage, hold, quiet_progress, &holder_error);
+    });
+    {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return holding; });
+    }
+    std::vector<std::string> notes;
+    codex::Usage_scan_progress progress(
+        [&notes](std::uint64_t, const std::string& note) { notes.push_back(note); }, std::chrono::minutes(15));
+    unsigned polls = 0;
+    std::string error;
+    const auto waited = codex::scan_usage(request, profile, storage, [&] { return ++polls > 4; }, progress, &error);
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    changed.notify_all();
+    holder.join();
+    check(!waited && error == "cancelled", "the waiting scan ends when it is cancelled");
+    check(notes.empty(), "a scan waiting for another one reports nothing");
+    check(holder_error.empty(), "the holding scan completes");
+}
+
 std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usage_cache_reference& current,
     const fs::path& fixture_root, const std::string& profile_root,
     const std::optional<addon::Account_context>& account, int format)
@@ -1117,7 +1298,7 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
         check(fs::create_directory(path), "allocate predecessor candidate");
         request.mode = mode;
         request.cache_selection = addon::Usage_cache_selection{accepted, utf8(path)};
-        auto page = codex::scan_usage(request, profile, storage, cancelled, &error);
+        auto page = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
         check(page && page->complete && page->cache_candidate, error.empty() ? "predecessor scan succeeds" : error.c_str());
         return *page;
     };
@@ -1201,11 +1382,26 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     const auto acknowledged = host.wait_outcome(acknowledge_id, 6000);
     check(acknowledged && acknowledged->status == addon::Host_status::SUCCESS, "adapter acknowledges real profile allocation");
     const auto scan = [&] {
+        const bool continuation = request.snapshot_id.has_value();
         const auto id = host.invoke({"usage-scan", 3}, "scan",
             addon::encode_usage_scan_request(request, 3), 15000, invocation);
         const auto outcome = host.wait_outcome(id, 16000);
         check(outcome && outcome->status == addon::Host_status::SUCCESS,
             outcome ? outcome->reason_code.c_str() : "actual packaged adapter scan timed out");
+        // A scan reports its stages through the core protocol; a continuation
+        // page, read from the finished snapshot, reports nothing.
+        std::vector<std::string> notes;
+        for (const auto& frame : host.progress(id)) {
+            notes.push_back(frame.note);
+        }
+        std::vector<std::string> expected;
+        if (!continuation) {
+            expected.push_back("Preparing the usage cache");
+            if (request.native_file_cache) expected.push_back("Importing earlier usage history");
+            expected.insert(expected.end(), {
+                "Reading Codex sessions", "Sorting usage records", "Merging usage history", "Saving the usage cache"});
+        }
+        check(stage_notes(notes) == expected, "actual adapter reports each stage of a scan and none for a continuation page");
         check(!addon::account_context_acknowledgment_failure(*request.context.account_context, outcome->payload),
             "actual adapter acknowledges exact account context on every page");
         check(!addon::profile_storage_acknowledgment_failure(*request.context.profile_storage, outcome->payload),
@@ -1342,6 +1538,9 @@ int main(int argc, char** argv)
         selected_cache_retains_repository_attribution(fixture.path);
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
+        progress_stays_within_the_frame_bound_and_the_silence();
+        scans_report_each_stage_while_they_work(fixture.path);
+        waiting_for_another_scan_reports_nothing(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "short-allocation", false);
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "long-allocation", true);

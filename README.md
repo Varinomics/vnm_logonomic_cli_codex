@@ -94,6 +94,17 @@ inventory can seed a later scan. Failed candidates cannot replace accepted
 history, and a validated empty cache remains evidence. Source diagnostics are
 included only when the public usage contract can represent their exact meaning.
 
+A scan that builds a snapshot reports progress: a frame names each stage as it
+begins (preparing the cache, importing earlier usage history, reading Codex
+sessions, sorting, merging, saving) and, while the stage works, counts the
+items it has handled. Frames grow sparser as the scan goes on, from one a
+second to one per quarter of the request's deadline, the silence the host
+tolerates, so a scan that keeps working reports within that silence for days
+without exceeding the core protocol's 4,096 frames per request; a scan still
+working when those are spent, about six days in under a 15-minute silence,
+falls silent. A page read from a finished snapshot, and a scan waiting for
+another scan of this package, report nothing.
+
 `CMakeLists.txt` fetches the SDK from the owned Logonomic `master` branch. Set
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to an explicit local
 `sdk/logonomic_cli_addon_sdk` directory for coordinated development. The
