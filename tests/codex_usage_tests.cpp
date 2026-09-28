@@ -1220,6 +1220,55 @@ void selected_cache_spools_a_rollout_while_it_is_read(const fs::path& fixture)
     }
 }
 
+void selected_cache_requires_the_rollout_of_each_accepted_record(const fs::path& fixture)
+{
+    // Every accepted record must belong to a rollout the new candidate lists:
+    // one the accepted cache lists, or a live rollout that lists it again.
+    const auto profile = fixture / "listed-profile";
+    const auto storage = fixture / "listed-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto unlisted = profile / "sessions" / "rollout-unlisted.jsonl";
+    write(profile / "sessions" / "rollout-kept.jsonl", metadata("kept") + start("turn") + tokens(11) + complete("turn"));
+    write(unlisted, metadata("unlisted") + start("turn") + tokens(13) + complete("turn"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "listed-account"};
+    std::string error;
+    const auto scan = [&](const char* name, std::optional<addon::Usage_cache_reference> accepted) {
+        check(fs::create_directory(storage / name), "allocate listed candidate");
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(storage / name)};
+        return codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    };
+    const auto first = scan("first", std::nullopt);
+    check(first && first->records.size() == 2 && first->cache_candidate, "establish two accepted rollouts");
+
+    // The same candidate without the second rollout's metadata line.
+    const auto tampered_root = storage / "tampered";
+    check(fs::create_directory(tampered_root), "allocate tampered candidate");
+    for (const auto* name : {"records", "snapshot", "cache-state"}) {
+        check(fs::copy_file(storage / "first" / name, tampered_root / name), "copy an accepted candidate file");
+    }
+    std::ifstream rollouts(storage / "first" / "rollouts", std::ios::binary);
+    std::string listed;
+    std::string line;
+    while (std::getline(rollouts, line)) {
+        if (line.find("rollout-unlisted") == std::string::npos) listed += line + '\n';
+    }
+    write(tampered_root / "rollouts", listed);
+    addon::Contract_failure failure;
+    const auto tampered = addon::seal_usage_cache_candidate(utf8(tampered_root), utf8(storage),
+        request.context.account_context, first->snapshot_id, "codex-rollout-cache@3", [] { return false; }, &failure);
+    check(tampered.has_value(), "seal the tampered candidate");
+
+    const auto relisted = scan("relisted", tampered);
+    check(relisted && relisted->records.size() == 2,
+        error.empty() ? "a live rollout lists an accepted record's rollout again" : error.c_str());
+    check(fs::remove(unlisted), "remove the unlisted rollout");
+    check(!scan("refused", tampered) && error == "usage_cache_identity_mismatch",
+        "an accepted record whose rollout nothing lists fails the scan");
+}
+
 std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usage_cache_reference& current,
     const fs::path& fixture_root, const std::string& profile_root,
     const std::optional<addon::Account_context>& account, int format)
@@ -1531,6 +1580,7 @@ int main(int argc, char** argv)
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
         selected_cache_spools_a_rollout_while_it_is_read(fixture.path);
+        selected_cache_requires_the_rollout_of_each_accepted_record(fixture.path);
         progress_stays_within_the_frame_bound_and_the_silence();
         scans_report_each_stage_while_they_work(fixture.path);
         waiting_for_another_scan_reports_nothing(fixture.path);

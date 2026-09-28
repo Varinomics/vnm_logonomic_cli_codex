@@ -373,11 +373,15 @@ bool fingerprint_matches(const addon::Json_value& metadata, const Fingerprint& v
     return member(metadata, "modified_native_msecs") == addon::Json_value(std::to_string(native_msecs));
 }
 
+// A line to sort and the key it sorts by.
 struct Sort_record
 {
-    std::string id;
+    std::string key;
     std::string line;
 };
+
+// Recovers the sort key of a line read back from a sorted run.
+using Sort_key = std::function<std::string(const std::string& line)>;
 
 struct Rollout_refresh
 {
@@ -680,22 +684,22 @@ fs::path run_path(const fs::path& work, std::string_view name, std::uint64_t lev
 }
 
 void merge_runs(const fs::path& left_path, const fs::path& right_path, const fs::path& destination,
-    const std::function<bool()>& cancelled, std::uint16_t version, bool unique_ids)
+    const std::function<bool()>& cancelled, const Sort_key& key_of, bool unique_ids)
 {
     std::ifstream left(left_path, std::ios::binary), right(right_path, std::ios::binary);
     std::ofstream output(destination, std::ios::binary | std::ios::trunc);
     require(left && right && output, "usage_storage_open_failed");
     Sort_record a, b;
-    const auto next = [version](std::istream& input, Sort_record* record) {
+    const auto next = [&key_of](std::istream& input, Sort_record* record) {
         if (!read_line(input, &record->line)) return false;
-        record->id = decode_record(record->line, version).usage.record_id;
+        record->key = key_of(record->line);
         return true;
     };
     bool have_a = next(left, &a), have_b = next(right, &b);
     while (have_a || have_b) {
         check_cancel(cancelled);
-        require(!unique_ids || !have_a || !have_b || a.id != b.id, "duplicate_usage_record");
-        if (have_a && (!have_b || id_less(a.id, b.id))) { write_line(output, a.line); have_a = next(left, &a); }
+        require(!unique_ids || !have_a || !have_b || a.key != b.key, "duplicate_usage_record");
+        if (have_a && (!have_b || id_less(a.key, b.key))) { write_line(output, a.line); have_a = next(left, &a); }
         else { write_line(output, b.line); have_b = next(right, &b); }
     }
     output.close();
@@ -704,21 +708,21 @@ void merge_runs(const fs::path& left_path, const fs::path& right_path, const fs:
     fs::remove(left_path); fs::remove(right_path);
 }
 
-// Sorts encoded records by ID while holding at most one run of them in
-// memory: each full run is written sorted, and runs merge pairwise. Records
-// sharing an ID are refused when `unique_ids` is set and kept adjacent
+// Sorts lines by key while holding at most one run of them in memory: each
+// full run is written sorted, and runs merge pairwise. Lines sharing a key
+// are refused as duplicate records when `unique_ids` is set and kept adjacent
 // otherwise.
 class Record_sorter final
 {
 public:
     Record_sorter(fs::path work, std::string name, std::uint64_t run_bytes,
-        const std::function<bool()>& cancelled, std::uint16_t version, bool unique_ids)
+        const std::function<bool()>& cancelled, Sort_key key_of, bool unique_ids)
     :
         m_work(std::move(work)),
         m_name(std::move(name)),
         m_run_bytes(run_bytes),
         m_cancelled(cancelled),
-        m_version(version),
+        m_key_of(std::move(key_of)),
         m_unique_ids(unique_ids)
     {}
 
@@ -729,7 +733,7 @@ public:
         m_chunk.push_back(std::move(record));
     }
 
-    // Moves every added record, sorted by ID, to `destination`.
+    // Moves every added line, sorted by key, to `destination`.
     void finish(const fs::path& destination)
     {
         flush();
@@ -741,7 +745,7 @@ public:
                 const auto merged = run_path(m_work, m_name, level + 1, index);
                 if (index * 2 + 1 == m_runs) fs::rename(run_path(m_work, m_name, level, index * 2), merged);
                 else merge_runs(run_path(m_work, m_name, level, index * 2), run_path(m_work, m_name, level, index * 2 + 1),
-                    merged, m_cancelled, m_version, m_unique_ids);
+                    merged, m_cancelled, m_key_of, m_unique_ids);
             }
             ++level; m_runs = next_runs;
         }
@@ -753,14 +757,14 @@ private:
     void flush()
     {
         if (m_chunk.empty()) return;
-        std::sort(m_chunk.begin(), m_chunk.end(), [](const auto& a, const auto& b) { return id_less(a.id, b.id); });
+        std::sort(m_chunk.begin(), m_chunk.end(), [](const auto& a, const auto& b) { return id_less(a.key, b.key); });
         std::ofstream output(run_path(m_work, m_name, 0, m_runs++), std::ios::binary | std::ios::trunc);
         require(static_cast<bool>(output), "usage_storage_write_failed");
         std::string previous;
         for (const auto& record : m_chunk) {
-            require(!m_unique_ids || previous.empty() || previous != record.id, "duplicate_usage_record");
+            require(!m_unique_ids || previous.empty() || previous != record.key, "duplicate_usage_record");
             write_line(output, record.line);
-            previous = record.id;
+            previous = record.key;
         }
         output.close();
         require(static_cast<bool>(output), "usage_storage_write_failed");
@@ -772,18 +776,24 @@ private:
     std::string                     m_name;
     std::uint64_t                   m_run_bytes;
     const std::function<bool()>&    m_cancelled;
-    std::uint16_t                   m_version;
+    Sort_key                        m_key_of;
     bool                            m_unique_ids;
     std::vector<Sort_record>        m_chunk;
     std::size_t                     m_bytes = 0;
     std::uint64_t                   m_runs  = 0;
 };
 
+// The sort key of an encoded usage record: its record ID.
+Sort_key record_id_key(std::uint16_t version)
+{
+    return [version](const std::string& line) { return decode_record(line, version).usage.record_id; };
+}
+
 // The usage-scan@1/2 layout: sorts the records of every per-rollout file.
 void sorted_snapshot(const fs::path& work, std::uint64_t sort_run_bytes, const std::function<bool()>& cancelled,
     std::uint16_t version = 2)
 {
-    Record_sorter sorter(work, "run", sort_run_bytes, cancelled, version, true);
+    Record_sorter sorter(work, "run", sort_run_bytes, cancelled, record_id_key(version), true);
     Repository_memo repositories;
     for (const auto& entry : fs::directory_iterator(work)) {
         check_cancel(cancelled);
@@ -968,7 +978,7 @@ bool confirms(const Rollout_usage_record& accepted, const Rollout_usage_record& 
 // it and every new turn carry the attribution their parse found. Differing
 // observations of one turn within this scan fail it.
 void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>& accepted,
-    std::uint16_t accepted_version, const std::map<std::string, addon::Json_value>& rollouts,
+    std::uint16_t accepted_version, Record_sorter& accepted_rollout_keys,
     const fs::path& seeded_path, const fs::path& parsed_path, const std::function<bool()>& cancelled)
 {
     std::optional<Record_stream> retained;
@@ -1010,8 +1020,9 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
         std::optional<Rollout_usage_record> accepted_record;
         if (retained && retained->head() && retained->head()->usage.record_id == *id) {
             accepted_record = retained->take();
-            require(accepted_record->usage.source_path &&
-                rollouts.contains(cache_key(*accepted_record->usage.source_path)), "usage_cache_identity_mismatch");
+            require(accepted_record->usage.source_path.has_value(), "usage_cache_identity_mismatch");
+            auto key = cache_key(*accepted_record->usage.source_path);
+            accepted_rollout_keys.add({key, key});
             require(previous_accepted.empty() || id_less(previous_accepted, *id), "usage_cache_invalid");
             previous_accepted = *id;
         }
@@ -1033,6 +1044,31 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
     }
     output.close();
     require(static_cast<bool>(output), "usage_storage_write_failed");
+}
+
+// Requires that every accepted record's rollout, keyed in `keys_path`, is one
+// the candidate's `rollouts` lists, whether from the accepted cache, the
+// native seed or a live rollout. Both files are sorted by cache key, so one
+// pass joins them.
+void require_listed_rollouts(const fs::path& keys_path, const fs::path& rollouts_path,
+    const std::function<bool()>& cancelled)
+{
+    std::ifstream keys(keys_path, std::ios::binary);
+    std::ifstream rollouts(rollouts_path, std::ios::binary);
+    require(keys && rollouts, "usage_storage_read_failed");
+    std::string key;
+    std::string line;
+    std::optional<std::string> listed;
+    while (read_line(keys, &key)) {
+        check_cancel(cancelled);
+        while ((!listed || id_less(*listed, key)) && read_line(rollouts, &line)) {
+            check_cancel(cancelled);
+            const auto metadata = addon::parse_json(line, {}, nullptr);
+            require(metadata && metadata->is_object(), "usage_cache_invalid");
+            listed = cache_key(string_member(*metadata, "source"));
+        }
+        require(listed == key, "usage_cache_identity_mismatch");
+    }
 }
 
 void write_rollouts(const fs::path& work, const std::map<std::string, addon::Json_value>& rollouts,
@@ -1134,8 +1170,8 @@ addon::Usage_scan_page scan_selected_cache(
     }
     // Turns converted from a native seed and turns parsed in this scan, each
     // sorted by ID for reconciliation with the accepted records.
-    Record_sorter seeded(work, "seeded-run", limits.sort_run_bytes, working, 3, false);
-    Record_sorter parsed(work, "parsed-run", limits.sort_run_bytes, working, 3, false);
+    Record_sorter seeded(work, "seeded-run", limits.sort_run_bytes, working, record_id_key(3), false);
+    Record_sorter parsed(work, "parsed-run", limits.sort_run_bytes, working, record_id_key(3), false);
     if (request.native_file_cache) progress.begin("Importing earlier usage history");
     seed_native_cache(request, storage, selection.accepted.has_value(), &seeds,
         [&rollouts](const std::string& key) {
@@ -1193,15 +1229,21 @@ addon::Usage_scan_page scan_selected_cache(
     }
     const auto seeded_path = work / "seeded-records";
     const auto parsed_path = work / "parsed-records";
+    const auto accepted_keys_path = work / "accepted-rollout-keys";
     progress.begin("Sorting usage records");
     seeded.finish(seeded_path);
     parsed.finish(parsed_path);
     progress.begin("Merging usage history");
-    merge_snapshot_records(work, accepted_records, accepted_version, rollouts, seeded_path, parsed_path, working);
+    Record_sorter accepted_keys(work, "key-run", limits.sort_run_bytes, working,
+        [](const std::string& line) { return line; }, false);
+    merge_snapshot_records(work, accepted_records, accepted_version, accepted_keys, seeded_path, parsed_path, working);
+    accepted_keys.finish(accepted_keys_path);
     fs::remove(seeded_path);
     fs::remove(parsed_path);
     progress.begin("Saving the usage cache");
     write_rollouts(work, rollouts, working);
+    require_listed_rollouts(accepted_keys_path, work / "rollouts", working);
+    fs::remove(accepted_keys_path);
     const auto identifier = nonce();
     addon::Observation_scope scope;
     if (request.context.account_context) {
