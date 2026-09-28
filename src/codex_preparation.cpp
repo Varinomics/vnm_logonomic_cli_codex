@@ -35,24 +35,6 @@ bool environment_name_equal(std::string_view left, std::string_view right)
 #endif
 }
 
-std::string shell_quote(std::string_view value)
-{
-    std::string result = "'";
-    for (const char character : value) {
-        if (character == '\'') {
-#ifdef _WIN32
-            result += "''";
-#else
-            result += "'\"'\"'";
-#endif
-        }
-        else {
-            result += character;
-        }
-    }
-    return result + '\'';
-}
-
 std::string toml_array(const std::vector<std::string>& values)
 {
     std::string result = "[";
@@ -63,25 +45,6 @@ std::string toml_array(const std::vector<std::string>& values)
         result += toml_string(value);
     }
     return result + ']';
-}
-
-std::string control_wrapper(const addon::Delegated_task_server& server)
-{
-    std::string result;
-#ifdef _WIN32
-    result = "$ErrorActionPreference = 'Stop'\n";
-    for (const auto& [name, value] : server.environment) {
-        result += "$env:" + name + " = " + shell_quote(value) + '\n';
-    }
-    result += "& " + shell_quote(server.program) + "\nexit $LASTEXITCODE\n";
-#else
-    result = "#!/bin/sh\n";
-    for (const auto& [name, value] : server.environment) {
-        result += "export " + name + "=" + shell_quote(value) + '\n';
-    }
-    result += "exec " + shell_quote(server.program) + "\n";
-#endif
-    return result;
 }
 
 std::vector<std::string> hook_arguments()
@@ -254,6 +217,10 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
+    if (!request->control.connection) {
+        context.fail(addon::Result_status::UNAVAILABLE, "task_server_connection_unavailable");
+        return;
+    }
     const auto profile = selected_profile(request->context, context);
     if (!profile) return;
     if (request->purpose != addon::Structured_purpose::IMPLEMENTATION) {
@@ -287,31 +254,21 @@ void prepare_delegated(addon::Invocation_context& context)
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();
         const std::string key = "mcp_servers.logonomic_" + nonce + ".";
-        const std::string stem = "mcp/" + request->control.task_id + "-" + server.server_id + "-" + nonce;
-#ifdef _WIN32
-        const auto relative_path = stem + ".ps1";
-        const auto program = "powershell.exe";
-        std::vector<std::string> arguments{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"};
-#else
-        const auto relative_path = stem + ".sh";
-        const auto program = "/bin/sh";
-        std::vector<std::string> arguments;
-#endif
-        const auto path = (addon::path_from_utf8(request->control.private_artifact_root) / relative_path).u8string();
-        arguments.emplace_back(reinterpret_cast<const char*>(path.data()), path.size());
-        result.private_artifacts.push_back({relative_path, control_wrapper(server)});
+        const auto& connection = *request->control.connection;
+        const std::vector<std::string> arguments{
+            "--descriptor", connection.descriptor_path, "--server", server.server_id};
         result.acknowledgment.server_ids.push_back(server.server_id);
         const auto overlay = [&](std::string value) {
             result.process.argv.push_back("-c");
             result.process.argv.push_back(key + std::move(value));
         };
-        overlay("command=" + toml_string(program));
+        overlay("command=" + toml_string(connection.relay_program));
         overlay("args=" + toml_array(arguments));
-        overlay("env_vars=" + toml_array({"LOGONOMIC_SESSION_CAPABILITY", "VNM_CONTROL_ENDPOINT", "VNM_CONTROL_TOKEN", "LOGONOMIC_VNMCTL_PATH"}));
         overlay("required=true");
         overlay("enabled_tools=" + toml_array(server.actions));
         overlay("default_tools_approval_mode=\"approve\"");
     }
+    result.acknowledgment.connection_version = addon::k_delegated_connection_version;
     result.process.argv.push_back("-");
     result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
     result.process.stdin_payload  = request->prompt;

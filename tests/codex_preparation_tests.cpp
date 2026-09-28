@@ -143,6 +143,8 @@ int main(int argc, char** argv)
         delegated.prompt = "Implement the selected repository change.";
         delegated.control.task_id = "task-a";
         delegated.control.private_artifact_root = utf8(root);
+        delegated.control.connection = addon::Delegated_connection{
+            utf8(root / "host relay"), utf8(root / ".logonomic/task-servers.json")};
         addon::Delegated_task_server server;
         server.server_id = "control";
         server.program = argv[1];
@@ -158,40 +160,32 @@ int main(int argc, char** argv)
         task.input = {"delegated", {"delegated-session", 2}, "prepare", addon::encode_delegated_prepare_request(delegated, 2)};
         codex::handle_preparation(task);
         const auto task_process = addon::decode_delegated_prepare_result(task.output, &failure, 2);
-        require(task.succeeded && task_process && task_process->private_artifacts.size() == 1 &&
-            task_process->acknowledgment.server_ids == std::vector<std::string>{"control"}, "Delegated control acknowledgment or private wrapper missing");
-        require(task_process->private_artifacts.front().content.find(" mcp --stdio") == std::string::npos,
-            "Exact task-server entrypoint must not acquire provider-invented arguments");
-        // Assert the actual emitted private wrapper, not a second producer.
-        const auto quote = [](std::string_view value) {
-            std::string result = "'";
-            for (const char character : value) {
-                if (character == '\'') {
-#ifdef _WIN32
-                    result += "''";
-#else
-                    result += "'\"'\"'";
-#endif
-                } else result += character;
-            }
-            return result + '\'';
+        require(task.succeeded && task_process && task_process->private_artifacts.empty() &&
+            task_process->acknowledgment.server_ids == std::vector<std::string>{"control"} &&
+            task_process->acknowledgment.connection_version == addon::k_delegated_connection_version,
+            "Delegation must acknowledge the configured relay");
+        const auto has_overlay = [&](const std::string& suffix) {
+            return std::any_of(task_process->process.argv.begin(), task_process->process.argv.end(),
+                [&](const auto& argument) {
+                    return argument.starts_with("mcp_servers.logonomic_") && argument.ends_with(suffix);
+                });
         };
-        const auto& wrapper = task_process->private_artifacts.front().content;
-#ifdef _WIN32
-        const auto exact_execution = "& " + quote(server.program) + "\nexit $LASTEXITCODE\n";
-#else
-        const auto exact_execution = "exec " + quote(server.program) + "\n";
-#endif
-        require(wrapper.ends_with(exact_execution), "Exact supplied control entrypoint gained arguments");
-        for (const auto& [name, value] : server.environment) {
-#ifdef _WIN32
-            const auto assignment = "$env:" + name + " = " + quote(value) + '\n';
-#else
-            const auto assignment = "export " + name + "=" + quote(value) + '\n';
-#endif
-            require(wrapper.find(assignment) != std::string::npos,
-                "Control wrapper changed an exact supplied environment assignment");
-        }
+        require(has_overlay("command=" + codex::toml_string(delegated.control.connection->relay_program)),
+            "Native MCP command is the supplied relay");
+        require(has_overlay("args=[\"--descriptor\"," + codex::toml_string(delegated.control.connection->descriptor_path) +
+                ",\"--server\",\"control\"]"),
+            "Native MCP arguments preserve the exact descriptor and server");
+        require(has_overlay("enabled_tools=[\"task_status\"]") &&
+            has_overlay("default_tools_approval_mode=\"approve\""), "Native tool configuration is preserved");
+        require(addon::serialize_json(task.output).find(std::string(64, 'c')) == std::string::npos,
+            "Host credentials cannot enter protocol results");
+        auto disconnected = delegated;
+        disconnected.control.connection.reset();
+        Context refused;
+        refused.input = task.input;
+        refused.input.payload = addon::encode_delegated_prepare_request(disconnected, 2);
+        codex::handle_preparation(refused);
+        require(!refused.succeeded, "Missing connection refuses delegation");
         require(addon::validate_structured_process_proposal(task_process->process, &failure),
             "Delegated producer must satisfy the host process policy");
         require(std::find(task_process->process.environment_names.begin(), task_process->process.environment_names.end(),
