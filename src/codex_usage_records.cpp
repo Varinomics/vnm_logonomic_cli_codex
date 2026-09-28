@@ -2,6 +2,7 @@
 #include "codex_jsonl_projector.h"
 
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/usage_cross_source_event.h>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -239,6 +240,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
     std::uint64_t latest = 0, pending = 0;
     Cumulative_category input_tokens, output_tokens, cache_tokens;
     bool have_identity = false, have_total = false, forked = false, local_activity = false;
+    bool complete_turn_event = false, saw_turn_sample = false;
     const auto fail = [error](const char* reason) { *error = reason; return false; };
     Codex_jsonl_projector projector([&](const addon::Json_value& event) {
         const auto& payload = member(event, "payload");
@@ -271,6 +273,11 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             }
             local_activity = true;
             turn = next_turn;
+            // A completed turn's total is one complete event, comparable across
+            // profiles, only from a known cumulative baseline: an earlier sample,
+            // and no tokens pending from a turn that never completed.
+            complete_turn_event = have_total && pending == 0;
+            saw_turn_sample = false;
             input_tokens.reset(); output_tokens.reset(); cache_tokens.reset();
             return true;
         }
@@ -282,6 +289,8 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             if (!total) return fail("token_total_invalid");
             const bool reset = have_total && *total < latest;
             if (!turn.empty()) {
+                saw_turn_sample = true;
+                if (reset) complete_turn_event = false;
                 const auto delta = !have_total || reset ? *total : *total - latest;
                 if (delta > k_max_exact_count - pending) return fail("token_total_overflow");
                 pending += delta;
@@ -316,10 +325,21 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
         record.usage.coverage_unit = addon::Usage_coverage_unit::SESSIONS;
         if (!model.empty()) record.usage.model = model;
         record.usage.counter_field = "total_token_usage.total_tokens";
+        // The proof also needs observed samples and no counter reset within
+        // the turn. An event ID the SDK codec rejects leaves the record
+        // without one.
+        if (complete_turn_event && saw_turn_sample) {
+            const addon::Usage_cross_source_event event{
+                "openai.codex.completed-turn", rollout + ":" + turn};
+            record.usage.cross_source_event = addon::decode_usage_cross_source_event(
+                addon::encode_usage_cross_source_event(event), nullptr);
+        }
         record.recorded_cwd = cwd;
         refresh_repository(&record);
         if (!emit(record)) return false;
         pending = 0;
+        complete_turn_event = false;
+        saw_turn_sample = false;
         input_tokens.reset(); output_tokens.reset(); cache_tokens.reset();
         turn.clear();
         return true;

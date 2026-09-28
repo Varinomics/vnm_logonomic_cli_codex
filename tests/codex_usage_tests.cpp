@@ -122,6 +122,48 @@ void reducer_keeps_turn_deltas_resets_and_fork_baselines(const fs::path& path)
         "cache creation retains the native unsupported category");
 }
 
+bool proves(const codex::Rollout_usage_record& record, std::string_view event_id)
+{
+    const auto& proof = record.usage.cross_source_event;
+    return proof && proof->authority_namespace == "openai.codex.completed-turn" && proof->event_id == event_id;
+}
+
+void reducer_proves_only_complete_turns(const fs::path& path)
+{
+    // A turn's total is proved to be one complete event only when its
+    // cumulative counter had a baseline before the turn, the turn observed
+    // samples, and no counter reset or tokens left pending by a turn that
+    // never completed entered the total.
+    auto records = reduce(metadata() + start("first") + tokens(10) + complete("first") +
+        start("second") + tokens(25) + complete("second"), path);
+    check(records.size() == 2 && !records[0].usage.cross_source_event,
+        "a rollout's first turn has no baseline and no proof");
+    check(records[1].usage.total_tokens == 15 && proves(records[1], "rollout:second"),
+        "a turn with a known baseline is proved by its rollout and turn IDs");
+
+    records = reduce(metadata() + start("first") + tokens(10) + complete("first") +
+        start("reset") + tokens(15) + tokens(3) + complete("reset") +
+        start("after") + tokens(9) + complete("after"), path);
+    check(records.size() == 3 && records[1].usage.total_tokens == 8 && !records[1].usage.cross_source_event,
+        "a counter reset keeps the exact total but withholds the proof");
+    check(records[2].usage.total_tokens == 6 && proves(records[2], "rollout:after"),
+        "the sample after a reset is the next turn's baseline");
+
+    records = reduce(metadata() + start("first") + tokens(10) + complete("first") +
+        start("abandoned") + tokens(14) + start("next") + tokens(20) + complete("next") +
+        start("quiet") + complete("quiet"), path);
+    check(records.size() == 3 && records[1].usage.record_id == "codex:rollout:next" &&
+        records[1].usage.total_tokens == 10 && !records[1].usage.cross_source_event,
+        "tokens pending from a turn that never completed withhold the next turn's proof");
+    check(records[2].usage.record_id == "codex:rollout:quiet" && records[2].usage.total_tokens == 0 &&
+        !records[2].usage.cross_source_event, "a turn without samples has no proof");
+
+    records = reduce(metadata("fork", true) + start("inherited", 1767225599) + tokens(100) + complete("inherited") +
+        start("local") + tokens(107) + complete("local"), path);
+    check(records.size() == 1 && proves(records[0], "fork:local"),
+        "a fork's replayed history is the baseline of its first local turn");
+}
+
 void write(const fs::path& path, std::string_view bytes)
 {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -1080,6 +1122,7 @@ int main(int argc, char** argv)
         Temporary_directory fixture;
         projector_does_not_retain_ignored_large_payloads();
         reducer_keeps_turn_deltas_resets_and_fork_baselines(fixture.path / "rollout-fixture.jsonl");
+        reducer_proves_only_complete_turns(fixture.path / "rollout-fixture.jsonl");
         scanner_sorts_pages_and_preserves_cache_on_retry(fixture.path);
         scanner_accepts_new_profiles_and_retains_transient_empty_history(fixture.path);
         native_seed_replay_and_required_cache_loss(fixture.path);

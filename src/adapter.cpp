@@ -8,6 +8,7 @@
 #include "codex_usage.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
@@ -166,7 +167,9 @@ int main()
         {"launch-preparation", 3}, {"structured-session", 2}, {"delegated-session", 2},
         {"interactive-resume", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
-        {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1},
+        {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3},
+        {addon::k_usage_cross_source_event_capability_id, addon::k_usage_cross_source_event_version},
+        {"legacy-state-import", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

@@ -15,7 +15,11 @@ pre-cutover scanner used, because rollouts are append-only and repair rereads
 every rollout. Turns reconcile by their stable record IDs: a rollout parsed
 again keeps its accepted turns that it no longer holds, a moved rollout keeps
 one observation of each turn under its accepted identity, and differing
-observations of one turn within a scan fail it. A selected
+observations of one turn within a scan fail it. A turn whose cumulative counter
+had a baseline before it, which observed samples, and whose total took in no
+counter reset or tokens pending from an unfinished turn, carries a
+usage-cross-source-event@1 proof in namespace `openai.codex.completed-turn`
+with event ID `<rollout>:<turn>`. A selected
 `codex-rollout-cache@1` or `@2` cache, which kept two files per rollout, is
 validated and converted into a fresh candidate without modifying the selected
 input or inventing provenance absent from its records. Native imports preserve
