@@ -367,6 +367,38 @@ int main(int argc, char** argv)
         require(std::any_of(task_process->process.argv.begin(), task_process->process.argv.end(), [](const auto& argument) {
             return argument.starts_with("mcp_servers.logonomic_") && argument.ends_with("required=true");
         }), "Task control MCP server was not required");
+        // Oracle: the owner's rule that a delegated run keeps its launcher's
+        // permission posture and the package grants only its own Task tools
+        // (2026-09-28), and codex-cli 0.157.0 recorded against a scripted
+        // endpoint: `codex exec` runs a Task tool its server entry approves
+        // without --yolo, and refuses a directory with no `.git` entry in it or
+        // an ancestor unless --yolo is passed.
+        require(std::count(task_process->process.argv.begin(), task_process->process.argv.end(), "--yolo") == 1,
+            "The launcher's own --yolo is kept, once");
+        auto plain = delegated;
+        plain.context.launcher.script_body = "codex";
+        plain.context.launcher_argv        = {argv[1]};
+        Context outside;
+        outside.input = {"delegated", {"delegated-session", 2}, "prepare", addon::encode_delegated_prepare_request(plain, 2)};
+        codex::handle_preparation(outside);
+        require(!outside.succeeded && outside.output == addon::Json_value("untrusted_working_directory") &&
+            outside.failure_detail.find("Git repository") != std::string::npos,
+            "Without --yolo a directory outside a Git repository is refused, saying why");
+        fs::create_directories(root / "repository" / ".git");
+        fs::create_directories(root / "repository" / "src");
+        plain.context.working_directory = utf8(root / "repository" / "src");
+        Context inside;
+        inside.input = {"delegated", {"delegated-session", 2}, "prepare", addon::encode_delegated_prepare_request(plain, 2)};
+        codex::handle_preparation(inside);
+        const auto plain_process = addon::decode_delegated_prepare_result(inside.output, &failure, 2);
+        require(inside.succeeded && plain_process &&
+            std::find(plain_process->process.argv.begin(), plain_process->process.argv.end(), "--yolo") ==
+                plain_process->process.argv.end() &&
+            std::any_of(plain_process->process.argv.begin(), plain_process->process.argv.end(), [](const auto& argument) {
+                return argument.starts_with("mcp_servers.logonomic_") &&
+                    argument.ends_with("default_tools_approval_mode=\"approve\"");
+            }),
+            "A launcher without --yolo runs in its own sandbox; only the Task tools are approved");
         addon::Resume_prepare_request resume;
         resume.context.launcher           = prepare.launcher;
         resume.context.launcher_argv      = prepare.launcher_argv;

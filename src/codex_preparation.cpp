@@ -74,6 +74,21 @@ std::vector<std::string> hook_arguments()
     return result;
 }
 
+// Codex's own test: the directory or an ancestor holds a `.git` entry.
+bool inside_git_repository(std::filesystem::path directory)
+{
+    for (;;) {
+        std::error_code error;
+        if (std::filesystem::exists(directory / ".git", error)) {
+            return true;
+        }
+        if (!directory.has_relative_path()) {
+            return false;
+        }
+        directory = directory.parent_path();
+    }
+}
+
 bool add_hooks(Verified_launch& launch, addon::Invocation_context& context)
 {
     if (hooks_configuration_conflicts(launch.argv, launch.prefix_size)) {
@@ -324,6 +339,18 @@ void prepare_delegated(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
         return;
     }
+    // `codex exec` refuses a directory outside a Git repository unless the
+    // launcher's --yolo lifts its sandbox; its own message reaches only stderr.
+    if (std::find(launch->argv.begin() + static_cast<std::ptrdiff_t>(launch->prefix_size), launch->argv.end(), "--yolo") ==
+            launch->argv.end() &&
+        !inside_git_repository(addon::path_from_utf8(request->context.working_directory)))
+    {
+        context.fail(addon::Result_status::UNAVAILABLE, "untrusted_working_directory",
+            "Codex runs a non-interactive task only inside a Git repository. Delegate the task into a Git "
+            "working directory; a launcher that passes --yolo also lifts this check, and with it Codex's "
+            "sandbox and approvals.");
+        return;
+    }
     addon::Delegated_prepare_result result;
     result.profile_storage = request->context.profile_storage;
     result.account_context = request->context.account_context;
@@ -332,10 +359,10 @@ void prepare_delegated(addon::Invocation_context& context)
 #else
     result.process.executable = "helpers/codex_launch_bridge";
 #endif
+    // The run keeps the launcher's sandbox and approval posture: its --yolo,
+    // configuration and profile, and the user's config.toml. The package's
+    // only grant is the per-server approval of its own Task tools below.
     result.process.argv = launch->argv;
-    if (std::find(result.process.argv.begin() + launch->prefix_size, result.process.argv.end(), "--yolo") == result.process.argv.end()) {
-        result.process.argv.push_back("--yolo");
-    }
     result.process.argv.insert(result.process.argv.end(), {"exec", "--json", "--ephemeral"});
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();

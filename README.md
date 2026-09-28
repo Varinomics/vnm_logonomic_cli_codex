@@ -88,6 +88,17 @@ advertised. Lifecycle support requires Codex 0.146.0 or newer; delegated
 implementation requires 0.150.1 or newer. Version checks have no upper bound,
 and accepted protocol records still undergo structural and identity validation.
 
+A delegated implementation runs as `codex <launcher options> exec` and keeps the
+launcher's permission posture: its sandbox and approvals come from the
+launcher's own `--yolo`, `-c` settings or `-p` profile and from the user's
+`config.toml`, while `codex exec` itself never asks for approval. The package's
+only grant is `default_tools_approval_mode = "approve"` on the task's own Task
+servers, whose tools are limited to the task's actions. A task that edits files
+needs a launcher or configuration that allows writes, for example
+`-c sandbox_mode="workspace-write"`. Without `--yolo`, `codex exec` runs only
+inside a Git repository, so preparation refuses another working directory with
+`untrusted_working_directory`.
+
 Usage scans publish one durable generation containing per-file evidence, sorted
 pages, and native import receipts. Only files bound by that generation's digest
 inventory can seed a later scan. Failed candidates cannot replace accepted
