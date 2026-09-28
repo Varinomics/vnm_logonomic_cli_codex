@@ -1062,14 +1062,37 @@ bool same_observation(Rollout_usage_record left, Rollout_usage_record right)
     return encode_record(left, 3) == encode_record(right, 3);
 }
 
+// Whether an observation of an accepted turn confirms the accepted record
+// rather than changing it. A proved observation's total is exactly the turn's
+// tokens, so only an equal total confirms it. An unproved total can include
+// tokens that a missing earlier sample would have accounted for, as when a
+// rollout lost the events before the turn, so it cannot raise an accepted
+// total; a lower one still contradicts it.
+bool confirms(const Rollout_usage_record& accepted, const Rollout_usage_record& observed)
+{
+    return observed.usage.cross_source_event
+        ? observed.usage.total_tokens == accepted.usage.total_tokens
+        : observed.usage.total_tokens >= accepted.usage.total_tokens;
+}
+
 // Writes the snapshot's `records`, reconciling every turn by its stable record
 // ID. A turn parsed in this scan wins over one converted from a native seed,
 // which wins over the accepted record, and a turn missing from a rollout parsed
-// again keeps its accepted record. When the winning observation matches the
-// accepted record apart from where its rollout lives, the accepted record
-// stays, so a moved rollout keeps one observation with its accepted identity.
-// Differing observations of one turn within this scan fail it. Every record is
-// attributed to its repository again.
+// again keeps its accepted record. An observation that confirms an accepted
+// turn leaves the accepted record whole: where its rollout lived, its
+// repository attribution, completion date, provenance and category detail are
+// facts of the accepted observation, which the host compares a partial
+// observation against and rejects when they change. So a moved rollout keeps
+// one observation under its accepted identity, a checkout removed or moved
+// since acceptance cannot retract the accepted attribution, and a turn
+// imported from the native cache keeps its native provenance when its rollout
+// is parsed. A confirmed record without an event proof takes the
+// observation's, so a turn accepted before its proof could be established
+// gains it when its rollout is parsed again; the host adds a proof to an
+// accepted record and keeps one an observation lacks. An observation that
+// contradicts an accepted turn is presented for the host to accept or reject;
+// it and every new turn carry the attribution their parse found. Differing
+// observations of one turn within this scan fail it.
 void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>& accepted,
     std::uint16_t accepted_version, const std::map<std::string, addon::Json_value>& rollouts,
     const fs::path& seeded_path, const fs::path& parsed_path, const std::function<bool()>& cancelled)
@@ -1085,7 +1108,6 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
         while (stream.head() && stream.head()->usage.record_id == id) group.push_back(stream.take());
         return group;
     };
-    Repository_memo repositories;
     std::uint64_t candidate_records = 0;
     std::uint64_t candidate_bytes = 0;
     std::string previous_accepted;
@@ -1116,9 +1138,14 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
                 require(same_observation(observation, *chosen), "duplicate_usage_record");
                 if (observation.usage.source_path.value_or("") < chosen->usage.source_path.value_or("")) chosen = &observation;
             }
-            if (!accepted_record || !same_observation(*accepted_record, *chosen)) record = chosen;
+            if (!accepted_record || !confirms(*accepted_record, *chosen)) {
+                record = chosen;
+            }
+            else
+            if (!accepted_record->usage.cross_source_event) {
+                accepted_record->usage.cross_source_event = chosen->usage.cross_source_event;
+            }
         }
-        repositories.refresh(record);
         const auto encoded = encode_record(*record, 3);
         admit_candidate_record(&candidate_records, &candidate_bytes, encoded.size());
         write_line(output, encoded);

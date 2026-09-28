@@ -42,6 +42,18 @@ std::string metadata(std::string_view id = "rollout", bool forked = false)
         (forked ? ",\"forked_from_id\":\"parent\"" : "") + "}}\n";
 }
 
+std::string metadata_with_cwd(std::string_view id, const fs::path& cwd)
+{
+    auto payload = addon::Json_value::object();
+    payload.set("id", addon::Json_value(std::string(id)));
+    payload.set("timestamp", addon::Json_value("2026-01-01T00:00:00Z"));
+    payload.set("cwd", addon::Json_value(addon::path_to_utf8(cwd)));
+    auto event = addon::Json_value::object();
+    event.set("type", addon::Json_value("session_meta"));
+    event.set("payload", std::move(payload));
+    return addon::serialize_json(event) + '\n';
+}
+
 std::string start(std::string_view turn, int seconds = 1767225601)
 {
     return "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"" +
@@ -898,6 +910,139 @@ void selected_cache_reconciles_turns_by_identity(const fs::path& fixture)
         "conflicting observations of one turn fail the scan");
 }
 
+void selected_cache_retains_repository_attribution(const fs::path& fixture)
+{
+    // The host rejects a partial observation whose repository attribution
+    // differs from the accepted one, so a checkout that disappears after
+    // acceptance must not change the attribution of turns already accepted.
+    const auto profile  = fixture / "repository-profile";
+    const auto storage  = fixture / "repository-storage";
+    const auto checkout = fixture / "repository-checkout";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    fs::create_directories(checkout / ".git");
+    const auto source  = profile / "sessions" / "rollout-repository.jsonl";
+    const auto renamed = profile / "sessions" / "rollout-repository-renamed.jsonl";
+    const auto original = metadata_with_cwd("repository", checkout) + start("first") + tokens(17) + complete("first");
+    write(source, original);
+
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, addon::path_to_utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "repository-account"};
+    const auto cancelled = [] { return false; };
+    std::string error;
+    const auto scan = [&](const char* name, const std::optional<addon::Usage_cache_reference>& accepted) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate repository candidate");
+        request.mode = "incremental";
+        request.cache_selection = addon::Usage_cache_selection{accepted, addon::path_to_utf8(path)};
+        auto page = codex::scan_usage(request, profile, storage, cancelled, &error);
+        check(page && page->complete && page->cache_candidate, error.empty() ? "repository scan succeeds" : error.c_str());
+        return *page;
+    };
+    const auto keeps_accepted = [](const addon::Usage_scan_page& page, const std::string& repository) {
+        const auto& first = page.records.front();
+        return first.record_id == "codex:repository:first" && first.repository_usage &&
+            first.repository_usage->allocations.size() == 1 &&
+            first.repository_usage->allocations.front().repository_path == repository &&
+            first.repository_usage->allocations.front().total_tokens == 17;
+    };
+
+    const auto first = scan("first", std::nullopt);
+    check(first.records.size() == 1 && first.records.front().repository_usage &&
+        first.records.front().repository_usage->allocations.size() == 1,
+        "first scan attributes the completed turn to its Git checkout");
+    const auto repository = first.records.front().repository_usage->allocations.front().repository_path;
+
+    check(fs::remove(checkout / ".git"), "remove the fixture Git marker");
+    write(source, original + start("second") + tokens(29) + complete("second"));
+    const auto second = scan("second", first.cache_candidate);
+    check(second.records.size() == 2 && keeps_accepted(second, repository),
+        "a turn parsed again after its checkout disappears keeps its accepted attribution");
+    check(second.records.back().record_id == "codex:repository:second" &&
+        second.records.back().repository_usage &&
+        second.records.back().repository_usage->allocations.empty() &&
+        second.records.back().repository_usage->unattributed_tokens == 12,
+        "a new turn is attributed as its checkout stands now");
+
+    const auto third = scan("third", second.cache_candidate);
+    check(third.records.size() == 2 && keeps_accepted(third, repository),
+        "an accepted turn whose rollout is not parsed again keeps its attribution");
+
+    fs::rename(source, renamed);
+    const auto moved = scan("moved", third.cache_candidate);
+    check(moved.records.size() == 2 && keeps_accepted(moved, repository) &&
+        moved.records.front().source_path == utf8(fs::absolute(source).lexically_normal()),
+        "a moved rollout keeps its accepted location and attribution");
+}
+
+void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::path& fixture)
+{
+    // A turn imported from the native cache carries native counter provenance,
+    // model and category detail that a parse of its rollout does not
+    // reproduce. The host rejects a partial observation that changes them, so
+    // parsing the rollout later must confirm the accepted record, not replace it.
+    const auto profile  = fixture / "imported-profile";
+    const auto storage  = fixture / "imported-storage";
+    const auto checkout = fixture / "imported-checkout";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    fs::create_directories(checkout / ".git");
+    const auto source = profile / "sessions" / "rollout-imported.jsonl";
+    auto wrapper = native_wrapper(source, "imported", 19);
+    wrapper.find("records")->as_array().front().set("recorded_cwd", addon::Json_value(utf8(checkout)));
+    const auto seed_path  = storage / "native-file-cache.jsonl";
+    const auto seed_bytes = addon::serialize_json(wrapper) + '\n';
+    write(seed_path, seed_bytes);
+
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "imported-account"};
+    request.native_file_cache = addon::Usage_native_file_cache{
+        utf8(seed_path), addon::to_hex(addon::Sha256::digest(seed_bytes)), "imported-account", true};
+    const auto cancelled = [] { return false; };
+    std::string error;
+    const auto scan = [&](const char* name, const char* mode, const std::optional<addon::Usage_cache_reference>& accepted) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate imported candidate");
+        request.mode = mode;
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(path)};
+        auto page = codex::scan_usage(request, profile, storage, cancelled, &error);
+        check(page && page->complete && page->cache_candidate, error.empty() ? "imported scan succeeds" : error.c_str());
+        return *page;
+    };
+    const auto encoded = [](const addon::Usage_record& record) {
+        return addon::serialize_json(addon::encode_usage_record(record, 3));
+    };
+
+    const auto first = scan("first", "incremental", std::nullopt);
+    check(first.records.size() == 1 && first.records.front().record_id == "codex:imported:turn" &&
+        first.records.front().source_counter_semantics == "cumulative_turn_delta" &&
+        first.records.front().repository_usage && first.records.front().repository_usage->allocations.size() == 1,
+        "the imported turn is accepted with its native provenance and attribution");
+
+    check(fs::remove(checkout / ".git"), "remove the fixture Git marker");
+    // The rollout's leading sample is a baseline, so its parse proves the turn.
+    write(source, metadata("imported") + tokens(4) + start("turn") + tokens(23) + complete("turn") +
+        start("next") + tokens(30) + complete("next"));
+    request.native_file_cache.reset();
+    auto accepted = first.cache_candidate;
+    for (const auto* mode : {"incremental", "repair"}) {
+        // Records are sorted by ID, so the new turn comes first.
+        const auto page = scan(mode, mode, accepted);
+        check(page.records.size() == 2, "the imported rollout holds two turns");
+        auto confirmed = page.records.back();
+        check(confirmed.cross_source_event && confirmed.cross_source_event->event_id == "imported:turn",
+            "a confirmed imported turn gains the proof its parse established");
+        confirmed.cross_source_event.reset();
+        check(encoded(confirmed) == encoded(first.records.front()),
+            "parsing an imported turn's rollout keeps its accepted record");
+        check(page.records.front().record_id == "codex:imported:next" && page.records.front().total_tokens == 7,
+            "the rollout's new turn adds exactly its delta");
+        accepted = page.cache_candidate;
+    }
+}
+
 // Rebuilds a sealed current candidate in the per-rollout layout of @1 or @2:
 // a `.meta` and a `.records` file per rollout beside the sorted `records`.
 // @1 records use the usage2 grammar, which carries no counter provenance.
@@ -946,6 +1091,63 @@ std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usa
     }
     return addon::seal_usage_cache_candidate(addon::path_to_utf8(fixture_root), profile_root, account,
         current.snapshot_id, "codex-rollout-cache@" + std::to_string(format), [] { return false; }, &failure);
+}
+
+void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixture)
+{
+    // A rollout that lost the events before a turn leaves that turn's first
+    // sample without a baseline, so its parse counts the whole cumulative
+    // counter. That unproved total cannot replace the accepted one, and the
+    // accepted record keeps its proof.
+    const auto profile = fixture / "predecessor-profile";
+    const auto storage = fixture / "predecessor-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-predecessor.jsonl";
+    write(source, metadata("predecessor") + start("a") + tokens(10) + complete("a") +
+        start("b") + tokens(25) + complete("b"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "predecessor-account"};
+    const auto cancelled = [] { return false; };
+    std::string error;
+    unsigned allocations = 0;
+    const auto scan = [&](const char* mode, const std::optional<addon::Usage_cache_reference>& accepted) {
+        const auto path = storage / ("candidate-" + std::to_string(allocations++));
+        check(fs::create_directory(path), "allocate predecessor candidate");
+        request.mode = mode;
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(path)};
+        auto page = codex::scan_usage(request, profile, storage, cancelled, &error);
+        check(page && page->complete && page->cache_candidate, error.empty() ? "predecessor scan succeeds" : error.c_str());
+        return *page;
+    };
+    const auto find = [](const addon::Usage_scan_page& page, std::string_view id) {
+        const auto found = std::find_if(page.records.begin(), page.records.end(),
+            [id](const addon::Usage_record& record) { return record.record_id == id; });
+        check(found != page.records.end(), "the scan reports every accepted turn");
+        return *found;
+    };
+    const auto proved_b = [&](const addon::Usage_scan_page& page) {
+        const auto b = find(page, "codex:predecessor:b");
+        return b.total_tokens == 15 && b.cross_source_event &&
+            b.cross_source_event->authority_namespace == "openai.codex.completed-turn" &&
+            b.cross_source_event->event_id == "predecessor:b";
+    };
+    const auto first = scan("incremental", std::nullopt);
+    check(first.records.size() == 2 && find(first, "codex:predecessor:a").total_tokens == 10 &&
+        !find(first, "codex:predecessor:a").cross_source_event && proved_b(first),
+        "the scan carries the proof of the turn with a baseline");
+
+    write(source, metadata("predecessor") + start("b") + tokens(25) + complete("b") +
+        start("c") + tokens(30) + complete("c"));
+    auto accepted = first.cache_candidate;
+    for (const auto* mode : {"incremental", "repair"}) {
+        const auto page = scan(mode, accepted);
+        check(page.records.size() == 3 && find(page, "codex:predecessor:a").total_tokens == 10 && proved_b(page),
+            "a turn whose predecessor was lost keeps its accepted total and proof");
+        check(find(page, "codex:predecessor:c").total_tokens == 5, "the next turn adds exactly its delta");
+        accepted = page.cache_candidate;
+    }
 }
 
 void adapter_cache_selection_contract(const fs::path& package, const fs::path& fixture, bool long_allocation)
@@ -1137,6 +1339,9 @@ int main(int argc, char** argv)
         selected_cache_preserves_host_authority(fixture.path);
         selected_cache_stays_compact_across_incremental_scans(fixture.path);
         selected_cache_reconciles_turns_by_identity(fixture.path);
+        selected_cache_retains_repository_attribution(fixture.path);
+        selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
+        selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "short-allocation", false);
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "long-allocation", true);

@@ -19,7 +19,17 @@ observations of one turn within a scan fail it. A turn whose cumulative counter
 had a baseline before it, which observed samples, and whose total took in no
 counter reset or tokens pending from an unfinished turn, carries a
 usage-cross-source-event@1 proof in namespace `openai.codex.completed-turn`
-with event ID `<rollout>:<turn>`. A selected
+with event ID `<rollout>:<turn>`. A turn observed again keeps its accepted
+record whole unless the observation contradicts it: a proved observation with
+another total, or an unproved one with a lower total, since an unproved total
+can include tokens of events lost before the turn. So a checkout removed or
+moved since acceptance does not change the accepted attribution, a turn
+imported from the native cache keeps its native provenance, and a confirmed
+record without a proof gains one when its rollout is parsed again, for example
+by a repair scan.
+New turns, and turns an observation contradicts, are attributed as their
+checkout stands at the scan; a contradicting observation is presented for the
+host to accept or reject. A selected
 `codex-rollout-cache@1` or `@2` cache, which kept two files per rollout, is
 validated and converted into a fresh candidate without modifying the selected
 input or inventing provenance absent from its records. Native imports preserve
