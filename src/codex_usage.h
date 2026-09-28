@@ -12,14 +12,13 @@
 
 namespace codex {
 
-// A scan's records never accumulate in memory: sorting holds at most one run
-// of encoded records, and a parsed rollout's records wait on disk. What it
-// keeps in memory for the whole scan is one metadata entry per rollout and,
-// in the usage-scan@1/2 layout, the repository of each working directory. Its
-// storage grows with the history it holds, and the package sets it no ceiling:
-// running out of disk fails the scan without publishing it. The runtime always
-// uses the default run; a smaller one lets pure filesystem fixtures sort
-// through merged runs.
+// A scan's memory does not grow with the history: records and rollout
+// metadata are sorted on disk, holding at most one run of lines in memory, and
+// are reconciled as key-ordered streams; a parsed rollout's records wait on
+// disk. Its storage grows with the history it holds, and the package sets it
+// no ceiling: running out of disk fails the scan without publishing it. The
+// runtime always uses the default run; a smaller one lets pure filesystem
+// fixtures sort through merged runs.
 struct Usage_scan_limits
 {
     std::uint64_t sort_run_bytes = 64ull * 1024 * 1024;

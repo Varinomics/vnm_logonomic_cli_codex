@@ -22,7 +22,6 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -576,12 +575,12 @@ addon::Json_value accepted_generation(const fs::path& work, const addon::Json_va
     return accepted;
 }
 
-// Converts a host-staged native cache once per seed digest. `cached` reports
-// the metadata already held for a rollout key; `adopt` stores a converted
-// rollout in the caller's cache layout.
+// Converts a host-staged native cache once per seed digest. `adopt` stores a
+// converted rollout in the caller's cache layout, whose metadata names the
+// seed; a layout refuses a rollout one seed names twice with
+// native_usage_cache_duplicate_path.
 void seed_native_cache(const addon::Usage_scan_request& request, const fs::path& storage,
     bool have_accepted, addon::Json_value* seeds,
-    const std::function<std::optional<addon::Json_value>(const std::string& key)>& cached,
     const std::function<void(const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records)>& adopt,
     const std::function<bool()>& cancelled, std::uint16_t version = 2)
 {
@@ -624,11 +623,7 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
         checked_hash.update(line); checked_hash.update("\n");
         const auto wrapper = addon::parse_json(line, {}, nullptr);
         require(wrapper && wrapper->is_object(), "native_usage_cache_invalid");
-        const auto source = string_member(*wrapper, "path");
-        const auto key = cache_key(source);
-        const auto previous = cached(key);
-        require(!previous || member(*previous, "native_seed") != addon::Json_value(descriptor.sha256_hex),
-            "native_usage_cache_duplicate_path");
+        const auto key = cache_key(string_member(*wrapper, "path"));
         std::vector<Sort_record> records;
         std::string error;
         const auto file = convert_native_cache_file(*wrapper, [&](const Rollout_usage_record& record) {
@@ -789,6 +784,63 @@ Sort_key record_id_key(std::uint16_t version)
     return [version](const std::string& line) { return decode_record(line, version).usage.record_id; };
 }
 
+// A rollout spool line holds a rollout's cache key, a tab, a 20-digit ordinal,
+// a tab and a JSON object. Sorting by the first two fields orders rollouts by
+// key and keeps those of one key in the order they were spooled.
+constexpr std::size_t k_spool_key_size = 64 + 1 + 20;
+
+Sort_record spool_record(const std::string& key, std::uint64_t ordinal, const addon::Json_value& payload)
+{
+    const auto number = std::to_string(ordinal);
+    auto line = key + '\t' + std::string(20 - number.size(), '0') + number + '\t' + addon::serialize_json(payload);
+    return {line.substr(0, k_spool_key_size), std::move(line)};
+}
+
+Sort_key spool_key()
+{
+    return [](const std::string& line) { return line.substr(0, k_spool_key_size); };
+}
+
+// A sorted rollout spool read one line at a time.
+class Spool_stream final
+{
+public:
+    explicit Spool_stream(const fs::path& path)
+    :
+        m_input(path, std::ios::binary)
+    {
+        require(static_cast<bool>(m_input), "usage_storage_read_failed");
+        advance();
+    }
+
+    // The cache key of the next line.
+    const std::optional<std::string>& key() const { return m_key; }
+
+    addon::Json_value take()
+    {
+        auto payload = addon::parse_json(std::string_view(m_line).substr(k_spool_key_size + 1), {}, nullptr);
+        require(payload && payload->is_object(), "usage_storage_read_failed");
+        advance();
+        return std::move(*payload);
+    }
+
+private:
+    void advance()
+    {
+        if (read_line(m_input, &m_line)) {
+            require(m_line.size() > k_spool_key_size, "usage_storage_read_failed");
+            m_key = m_line.substr(0, 64);
+        }
+        else {
+            m_key.reset();
+        }
+    }
+
+    std::ifstream              m_input;
+    std::string                m_line;
+    std::optional<std::string> m_key;
+};
+
 // The usage-scan@1/2 layout: sorts the records of every per-rollout file.
 void sorted_snapshot(const fs::path& work, std::uint64_t sort_run_bytes, const std::function<bool()>& cancelled,
     std::uint16_t version = 2)
@@ -871,34 +923,75 @@ addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& iden
     return page;
 }
 
-// Loads a selected cache's rollout metadata by cache key: the `rollouts`
-// lines of the current format, or the `.meta` files of @1 and @2.
-void load_accepted_rollouts(const addon::Usage_cache_manifest& accepted, const fs::path& source,
-    std::map<std::string, addon::Json_value>* rollouts, const std::function<bool()>& cancelled)
+// A selected cache's rollout metadata in cache-key order: the `rollouts`
+// lines of the current format, which it writes in that order, or the `.meta`
+// files of @1 and @2, which are named by their keys and listed, with the
+// manifest's other files, in the manifest the SDK bounds.
+class Accepted_rollouts final
 {
-    if (accepted.format == k_cache_format) {
-        std::ifstream input(source / "rollouts", std::ios::binary);
-        require(static_cast<bool>(input), "usage_cache_unavailable");
-        std::string line;
-        while (read_line(input, &line)) {
-            check_cancel(cancelled);
-            auto metadata = addon::parse_json(line, {}, nullptr);
-            require(metadata && metadata->is_object(), "usage_cache_invalid");
-            auto key = cache_key(string_member(*metadata, "source"));
-            require(rollouts->emplace(std::move(key), std::move(*metadata)).second, "usage_cache_invalid");
+public:
+    Accepted_rollouts(const addon::Usage_cache_manifest& accepted, fs::path source)
+    :
+        m_source(std::move(source))
+    {
+        if (accepted.format == k_cache_format) {
+            m_lines.emplace(m_source / "rollouts", std::ios::binary);
+            require(static_cast<bool>(*m_lines), "usage_cache_unavailable");
         }
-        return;
+        else {
+            for (const auto& file : accepted.files) {
+                if (file.path.ends_with(".meta") && cache_file_name(file.path)) m_files.push_back(file.path);
+            }
+            std::sort(m_files.begin(), m_files.end(), id_less);
+        }
+        advance();
     }
-    for (const auto& file : accepted.files) {
-        check_cancel(cancelled);
-        if (!file.path.ends_with(".meta") || !cache_file_name(file.path)) continue;
-        auto metadata = read_json(source / file.path);
-        require(metadata.has_value(), "usage_cache_unavailable");
-        const auto key = file.path.substr(0, 64);
-        require(cache_key(string_member(*metadata, "source")) == key, "usage_cache_identity_mismatch");
-        rollouts->emplace(key, std::move(*metadata));
+
+    const std::optional<std::string>& key() const { return m_key; }
+
+    addon::Json_value take()
+    {
+        auto metadata = std::move(*m_metadata);
+        advance();
+        return metadata;
     }
-}
+
+private:
+    void advance()
+    {
+        std::optional<addon::Json_value> metadata;
+        std::string key;
+        std::string line;
+        if (m_lines && read_line(*m_lines, &line)) {
+            metadata = addon::parse_json(line, {}, nullptr);
+            require(metadata && metadata->is_object(), "usage_cache_invalid");
+            key = cache_key(string_member(*metadata, "source"));
+        }
+        else
+        if (!m_lines && m_next_file < m_files.size()) {
+            const auto& name = m_files[m_next_file++];
+            metadata = read_json(m_source / name);
+            require(metadata.has_value(), "usage_cache_unavailable");
+            key = name.substr(0, 64);
+            require(cache_key(string_member(*metadata, "source")) == key, "usage_cache_identity_mismatch");
+        }
+        if (!metadata) {
+            m_key.reset();
+            m_metadata.reset();
+            return;
+        }
+        require(!m_key || id_less(*m_key, key), "usage_cache_invalid");
+        m_key      = std::move(key);
+        m_metadata = std::move(metadata);
+    }
+
+    fs::path                         m_source;
+    std::optional<std::ifstream>     m_lines;
+    std::vector<std::string>         m_files;
+    std::size_t                      m_next_file = 0;
+    std::optional<std::string>       m_key;
+    std::optional<addon::Json_value> m_metadata;
+};
 
 // A sorted record file read one record at a time.
 class Record_stream final
@@ -1071,18 +1164,65 @@ void require_listed_rollouts(const fs::path& keys_path, const fs::path& rollouts
     }
 }
 
-void write_rollouts(const fs::path& work, const std::map<std::string, addon::Json_value>& rollouts,
-    const std::function<bool()>& cancelled)
+// Writes the snapshot's `rollouts` in cache-key order, reconciling by key the
+// accepted metadata, the seed's and the rollouts found in the sessions
+// directory, and parses each found rollout whose metadata does not describe
+// it, passing the records of every parse that holds to `parsed`. A seed's
+// metadata replaces the accepted metadata of its rollout. Rollouts found under
+// one key are refreshed in the order they were found, each against the
+// metadata the one before left. A key no source supplies metadata for gets no
+// line. Returns whether a rollout could not be read at rest.
+bool reconcile_rollouts(const fs::path& work, std::optional<Accepted_rollouts>& accepted,
+    const fs::path& seed_path, const fs::path& found_path, bool force, Record_sorter& parsed,
+    Usage_scan_progress& progress, const std::function<bool()>& cancelled)
 {
+    Spool_stream seed(seed_path);
+    Spool_stream found(found_path);
+    // A parsed rollout's records wait here until its parse is known to hold.
+    const auto spool = work / "rollout-records";
     std::ofstream output(work / "rollouts", std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
-    for (const auto& [key, metadata] : rollouts) {
-        (void)key;
+    const std::optional<std::string> none;
+    bool incomplete = false;
+    for (;;) {
         check_cancel(cancelled);
-        write_line(output, addon::serialize_json(metadata));
+        std::optional<std::string> key;
+        for (const auto* head : {accepted ? &accepted->key() : &none, &seed.key(), &found.key()}) {
+            if (*head && (!key || id_less(**head, *key))) key = *head;
+        }
+        if (!key) break;
+        std::optional<addon::Json_value> metadata;
+        if (accepted && accepted->key() == key) metadata = accepted->take();
+        if (seed.key() == key) {
+            auto seeded = seed.take();
+            require(seed.key() != key && (!metadata || member(*metadata, "native_seed") != member(seeded, "native_seed")),
+                "native_usage_cache_duplicate_path");
+            metadata = std::move(seeded);
+        }
+        while (found.key() == key) {
+            const auto rollout = found.take();
+            auto refreshed = refresh_rollout(addon::path_from_utf8(string_member(rollout, "path")),
+                string_member(rollout, "source"), metadata, force, cancelled, 3, spool);
+            progress.advance();
+            if (refreshed.incomplete) incomplete = true;
+            if (!refreshed.metadata) continue;
+            metadata = std::move(refreshed.metadata);
+            std::ifstream spooled(spool, std::ios::binary);
+            require(static_cast<bool>(spooled), "usage_storage_read_failed");
+            std::string line;
+            while (read_line(spooled, &line)) {
+                check_cancel(cancelled);
+                auto id = decode_record(line, 3).usage.record_id;
+                parsed.add({std::move(id), std::move(line)});
+            }
+            spooled.close();
+            fs::remove(spool);
+        }
+        if (metadata) write_line(output, addon::serialize_json(*metadata));
     }
     output.close();
     require(static_cast<bool>(output), "usage_storage_write_failed");
+    return incomplete;
 }
 
 std::string selection_digest(addon::Usage_scan_request request)
@@ -1148,9 +1288,9 @@ addon::Usage_scan_page scan_selected_cache(
     const std::function<bool()> working = [&] { progress.poll(); return cancelled(); };
     progress.begin("Preparing the usage cache");
     auto seeds = addon::Json_value::array();
-    // Rollout metadata by cache key; the accepted records stay on disk and are
-    // streamed once into the new snapshot.
-    std::map<std::string, addon::Json_value> rollouts;
+    // The accepted rollout metadata and records stay on disk and are streamed
+    // once into the new snapshot.
+    std::optional<Accepted_rollouts> accepted_rollouts;
     std::optional<fs::path> accepted_records;
     std::uint16_t accepted_version = 3;
     if (selection.accepted) {
@@ -1164,7 +1304,7 @@ addon::Usage_scan_page scan_selected_cache(
         require(state.has_value(), "usage_cache_unavailable");
         seeds = member(*state, "native_seeds");
         require(seeds.is_array(), "usage_cache_unavailable");
-        load_accepted_rollouts(*accepted, source, &rollouts, working);
+        accepted_rollouts.emplace(*accepted, source);
         accepted_records = source / "records";
         accepted_version = accepted->format == "codex-rollout-cache@1" ? 2 : 3;
     }
@@ -1172,14 +1312,16 @@ addon::Usage_scan_page scan_selected_cache(
     // sorted by ID for reconciliation with the accepted records.
     Record_sorter seeded(work, "seeded-run", limits.sort_run_bytes, working, record_id_key(3), false);
     Record_sorter parsed(work, "parsed-run", limits.sort_run_bytes, working, record_id_key(3), false);
+    // The seed's rollout metadata and the rollouts found in the sessions
+    // directory, each sorted by cache key for reconciliation with the
+    // accepted metadata.
+    Record_sorter seed_rollouts(work, "seed-rollout-run", limits.sort_run_bytes, working, spool_key(), false);
+    Record_sorter found_rollouts(work, "found-rollout-run", limits.sort_run_bytes, working, spool_key(), false);
+    std::uint64_t ordinal = 0;
     if (request.native_file_cache) progress.begin("Importing earlier usage history");
     seed_native_cache(request, storage, selection.accepted.has_value(), &seeds,
-        [&rollouts](const std::string& key) {
-            const auto found = rollouts.find(key);
-            return found == rollouts.end() ? std::nullopt : std::optional(found->second);
-        },
-        [&rollouts, &seeded, &progress](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
-            rollouts[key] = std::move(metadata);
+        [&](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
+            seed_rollouts.add(spool_record(key, ordinal++, metadata));
             for (auto& record : records) {
                 seeded.add(std::move(record));
             }
@@ -1189,9 +1331,6 @@ addon::Usage_scan_page scan_selected_cache(
     const auto sessions = vendor_profile / "sessions";
     const bool have_sessions = fs::exists(sessions);
     require(!have_sessions || fs::is_directory(sessions), "usage_sessions_not_directory");
-    bool incomplete = false;
-    // A parsed rollout's records wait here until its parse is known to hold.
-    const auto spool = work / "rollout-records";
     progress.begin("Reading Codex sessions");
     fs::recursive_directory_iterator entries;
     if (have_sessions) {
@@ -1207,26 +1346,19 @@ addon::Usage_scan_page scan_selected_cache(
         const auto name = addon::ascii_lowercase(entry.path().filename().string());
         if (!entry.is_regular_file() || !name.starts_with("rollout-") || !name.ends_with(".jsonl")) continue;
         const auto source = path_text(fs::absolute(entry.path()).lexically_normal());
-        const auto key = cache_key(source);
-        const auto cached = rollouts.find(key);
-        auto refreshed = refresh_rollout(entry.path(), source,
-            cached == rollouts.end() ? std::nullopt : std::optional(cached->second),
-            request.mode != "incremental", working, 3, spool);
-        progress.advance();
-        if (refreshed.incomplete) incomplete = true;
-        if (!refreshed.metadata) continue;
-        rollouts[key] = std::move(*refreshed.metadata);
-        std::ifstream spooled(spool, std::ios::binary);
-        require(static_cast<bool>(spooled), "usage_storage_read_failed");
-        std::string line;
-        while (read_line(spooled, &line)) {
-            check_cancel(working);
-            auto id = decode_record(line, 3).usage.record_id;
-            parsed.add({std::move(id), std::move(line)});
-        }
-        spooled.close();
-        fs::remove(spool);
+        auto rollout = addon::Json_value::object();
+        rollout.set("source", addon::Json_value(source));
+        rollout.set("path", addon::Json_value(addon::path_to_utf8(entry.path())));
+        found_rollouts.add(spool_record(cache_key(source), ordinal++, rollout));
     }
+    const auto seed_rollouts_path  = work / "seed-rollouts";
+    const auto found_rollouts_path = work / "found-rollouts";
+    seed_rollouts.finish(seed_rollouts_path);
+    found_rollouts.finish(found_rollouts_path);
+    const bool incomplete = reconcile_rollouts(work, accepted_rollouts, seed_rollouts_path, found_rollouts_path,
+        request.mode != "incremental", parsed, progress, working);
+    fs::remove(seed_rollouts_path);
+    fs::remove(found_rollouts_path);
     const auto seeded_path = work / "seeded-records";
     const auto parsed_path = work / "parsed-records";
     const auto accepted_keys_path = work / "accepted-rollout-keys";
@@ -1241,7 +1373,6 @@ addon::Usage_scan_page scan_selected_cache(
     fs::remove(seeded_path);
     fs::remove(parsed_path);
     progress.begin("Saving the usage cache");
-    write_rollouts(work, rollouts, working);
     require_listed_rollouts(accepted_keys_path, work / "rollouts", working);
     fs::remove(accepted_keys_path);
     const auto identifier = nonce();
@@ -1369,8 +1500,10 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         }
         if (request.native_file_cache) progress.begin("Importing earlier usage history");
         seed_native_cache(request, storage, accepted.has_value(), &seeds,
-            [&work](const std::string& key) { return read_json(work / (key + ".meta")); },
             [&work, &progress](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
+                const auto previous = read_json(work / (key + ".meta"));
+                require(!previous || member(*previous, "native_seed") != member(metadata, "native_seed"),
+                    "native_usage_cache_duplicate_path");
                 write_rollout_records(work / (key + ".records"), records);
                 write_json(work / (key + ".meta"), metadata);
                 progress.advance();

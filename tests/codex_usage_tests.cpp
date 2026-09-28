@@ -635,6 +635,28 @@ void empty_native_cache_is_accepted_evidence(const fs::path& fixture)
     check(page && page->records.empty(), "empty host FILE_CACHE retains a validated empty accepted generation");
 }
 
+void native_seed_names_each_rollout_once(const fs::path& fixture)
+{
+    // A native seed that names one rollout twice fails the scan in both cache
+    // layouts.
+    const auto profile = fixture / "twice-profile";
+    const auto storage = fixture / "twice-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto wrapper = addon::serialize_json(native_wrapper(profile / "sessions" / "rollout-twice.jsonl", "twice", 17)) + '\n';
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "account"};
+    set_seed(&request, storage / "native-file-cache.jsonl", wrapper + wrapper);
+    std::string error;
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
+        error == "native_usage_cache_duplicate_path", "a per-rollout scan refuses a seed that names a rollout twice");
+    check(fs::create_directory(storage / "candidate"), "allocate a candidate for the doubled seed");
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(storage / "candidate")};
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
+        error == "native_usage_cache_duplicate_path", "a selected-cache scan refuses a seed that names a rollout twice");
+}
+
 void native_turn_identity_remains_validated(const fs::path& source)
 {
     auto wrapper = native_wrapper(source, "native", 17);
@@ -1572,6 +1594,7 @@ int main(int argc, char** argv)
         transient_refresh_discards_partial_records_before_acceptance(fixture.path);
         accepted_inventory_controls_cache_replay(fixture.path);
         empty_native_cache_is_accepted_evidence(fixture.path);
+        native_seed_names_each_rollout_once(fixture.path);
         native_turn_identity_remains_validated(fixture.path / "rollout-native.jsonl");
         selected_cache_preserves_host_authority(fixture.path);
         selected_cache_stays_compact_across_incremental_scans(fixture.path);
