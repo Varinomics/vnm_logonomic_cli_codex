@@ -652,21 +652,26 @@ bool id_less(std::string_view left, std::string_view right)
         [](unsigned char a, unsigned char b) { return a < b; });
 }
 
-// Records share a few working directories; each is resolved once per scan.
+// A rollout's records share its working directory, so each run of records
+// from one directory resolves its repository once, and the memo holds one
+// directory however many a history has.
 class Repository_memo final
 {
 public:
     void refresh(Rollout_usage_record* record)
     {
-        auto found = m_roots.find(record->recorded_cwd);
-        if (found == m_roots.end()) {
-            found = m_roots.emplace(record->recorded_cwd, repository_for_cwd(record->recorded_cwd)).first;
+        if (!m_resolved || m_cwd != record->recorded_cwd) {
+            m_cwd      = record->recorded_cwd;
+            m_root     = repository_for_cwd(record->recorded_cwd);
+            m_resolved = true;
         }
-        refresh_repository(record, found->second);
+        refresh_repository(record, m_root);
     }
 
 private:
-    std::map<std::string, std::optional<std::string>> m_roots;
+    std::string                m_cwd;
+    std::optional<std::string> m_root;
+    bool                       m_resolved = false;
 };
 
 fs::path run_path(const fs::path& work, std::string_view name, std::uint64_t level, std::uint64_t index)
