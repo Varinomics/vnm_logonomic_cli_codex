@@ -1227,6 +1227,71 @@ void waiting_for_another_scan_reports_nothing(const fs::path& fixture)
     check(holder_error.empty(), "the holding scan completes");
 }
 
+void selected_cache_spools_a_rollout_while_it_is_read(const fs::path& fixture)
+{
+    // A rollout parsed again writes its records to a spool in the candidate
+    // as they are read, so a rollout of any size holds none of them in memory,
+    // and one that changes while it is read keeps its accepted records and
+    // leaves no spool in the sealed candidate.
+    const auto profile = fixture / "spool-profile";
+    const auto storage = fixture / "spool-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-spool.jsonl";
+    write(source, metadata("spool") + start("turn") + tokens(17) + complete("turn"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "spool-account"};
+    std::string error;
+    const auto scan = [&](const char* name, std::optional<addon::Usage_cache_reference> accepted,
+        const std::function<bool()>& cancelled)
+    {
+        check(fs::create_directory(storage / name), "allocate spool candidate");
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(storage / name)};
+        return codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
+    };
+    const auto baseline = scan("baseline", std::nullopt, [] { return false; });
+    check(baseline && baseline->records.size() == 1 && baseline->cache_candidate, "establish accepted history");
+
+    constexpr unsigned k_refresh_records = 500;
+    std::string bytes = metadata("spool");
+    for (unsigned index = 0; index < k_refresh_records; ++index) {
+        const auto turn = "turn-" + std::to_string(index);
+        bytes += start(turn) + tokens(index + 1) + complete(turn);
+    }
+    check(bytes.size() > 65536, "fixture spans multiple rollout reader chunks");
+    write(source, bytes);
+    const auto original_modified = fs::last_write_time(source);
+    const auto spool = storage / "changed" / "rollout-records";
+    bool changed = false;
+    std::size_t spooled_records = 0;
+    const auto change_during_read = [&] {
+        if (changed || !fs::exists(spool)) return false;
+        std::ifstream pending(spool, std::ios::binary);
+        check(static_cast<bool>(pending), "open the spool while the rollout is read");
+        const auto records = std::count(std::istreambuf_iterator<char>(pending), std::istreambuf_iterator<char>{}, '\n');
+        if (records == 0 || records >= k_refresh_records) return false;
+        fs::last_write_time(source, original_modified + std::chrono::seconds(5));
+        spooled_records = static_cast<std::size_t>(records);
+        changed = true;
+        return false;
+    };
+    const auto retained = scan("changed", baseline->cache_candidate, change_during_read);
+    check(changed && spooled_records > 0 && spooled_records < k_refresh_records,
+        "a rollout's records reach the spool while the rollout is read");
+    check(retained && retained->complete && retained->incomplete_historical_coverage &&
+        retained->records.size() == 1 && retained->records[0].total_tokens == 17,
+        error.empty() ? "a rollout changed while it is read keeps its accepted records" : error.c_str());
+    check(!fs::exists(spool), "the discarded spool is removed");
+    addon::Contract_failure failure;
+    const auto manifest = addon::validate_usage_cache_candidate(*retained->cache_candidate, utf8(storage),
+        request.context.account_context, [] { return false; }, &failure);
+    check(manifest.has_value(), "the candidate seals without the spool");
+    for (const auto& file : manifest->files) {
+        check(file.path != "rollout-records", "the sealed candidate holds no spool");
+    }
+}
+
 std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usage_cache_reference& current,
     const fs::path& fixture_root, const std::string& profile_root,
     const std::optional<addon::Account_context>& account, int format)
@@ -1538,6 +1603,7 @@ int main(int argc, char** argv)
         selected_cache_retains_repository_attribution(fixture.path);
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
+        selected_cache_spools_a_rollout_while_it_is_read(fixture.path);
         progress_stays_within_the_frame_bound_and_the_silence();
         scans_report_each_stage_while_they_work(fixture.path);
         waiting_for_another_scan_reports_nothing(fixture.path);

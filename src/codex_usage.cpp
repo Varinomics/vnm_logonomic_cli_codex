@@ -492,18 +492,19 @@ struct Sort_record
 struct Rollout_refresh
 {
     bool                             incomplete = false;
-    // Present when the rollout was parsed again; its emitted records then
-    // replace the cached ones.
+    // Present when the rollout was parsed again; the records in its spool
+    // then replace the cached ones.
     std::optional<addon::Json_value> metadata;
 };
 
-// Parses a rollout unless its cached metadata still describes it, passing each
-// record to `emit` as it is read. The emitted records count only when the
-// result carries new metadata. A rollout that cannot be read at rest keeps its
-// cached evidence and marks the history incomplete.
+// Parses a rollout unless its cached metadata still describes it, writing each
+// record to `spool` as it is read, so a rollout of any size holds no records in
+// memory. The spool is left in place only when the result carries new metadata.
+// A rollout that cannot be read at rest keeps its cached evidence and marks the
+// history incomplete.
 Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
     const std::optional<addon::Json_value>& metadata, bool force, const std::function<bool()>& cancelled,
-    std::uint16_t version, const std::function<void(Sort_record)>& emit)
+    std::uint16_t version, const fs::path& spool)
 {
     check_cancel(cancelled);
     Rollout_refresh result;
@@ -521,19 +522,24 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
         result.incomplete = true;
         return result;
     }
+    Budget_output output(spool, std::ios::binary | std::ios::trunc);
+    require(static_cast<bool>(output), "usage_storage_write_failed");
     std::string error;
     std::uint64_t file_records = 0;
     std::uint64_t file_bytes = 0;
     const bool parsed = read_rollout_usage(input, addon::path_from_utf8(source), [&](const Rollout_usage_record& record) {
-        auto encoded = encode_record(record, version);
+        const auto encoded = encode_record(record, version);
         admit_candidate_record(&file_records, &file_bytes, encoded.size());
-        emit({record.usage.record_id, std::move(encoded)});
+        write_line(output, encoded);
         return true;
     }, cancelled, &error);
+    output.close();
+    require(static_cast<bool>(output), "usage_storage_write_failed");
     const auto after = fingerprint(path);
     if (!after || *after != *before || error == "rollout_read_failed" ||
         (!parsed && metadata && !current && fingerprint_matches(*metadata, *before) && error != "cancelled"))
     {
+        remove_owned_path(spool);
         result.incomplete = true;
         return result;
     }
@@ -567,27 +573,9 @@ void refresh_file(const fs::path& path, const fs::path& work,
     const auto key = cache_key(source);
     const auto metadata_path = work / (key + ".meta");
     const auto pending = work / (key + ".pending-records");
-    std::optional<Budget_output> output;
-    const auto open_pending = [&] {
-        if (output) return;
-        output.emplace(pending, std::ios::binary | std::ios::trunc);
-        require(static_cast<bool>(*output), "usage_storage_write_failed");
-    };
-    const auto refreshed = refresh_rollout(path, source, read_json(metadata_path), force, cancelled, version,
-        [&](Sort_record record) {
-            open_pending();
-            write_line(*output, record.line);
-        });
-    if (refreshed.metadata) open_pending();
-    if (output) {
-        output->close();
-        require(static_cast<bool>(*output), "usage_storage_write_failed");
-    }
+    const auto refreshed = refresh_rollout(path, source, read_json(metadata_path), force, cancelled, version, pending);
     if (refreshed.incomplete) *incomplete = true;
-    if (!refreshed.metadata) {
-        if (output) remove_owned_path(pending);
-        return;
-    }
+    if (!refreshed.metadata) return;
     replace_file(pending, work / (key + ".records"));
     write_json(metadata_path, *refreshed.metadata);
 }
@@ -1279,6 +1267,8 @@ addon::Usage_scan_page scan_selected_cache(
     const bool have_sessions = fs::exists(sessions);
     require(!have_sessions || fs::is_directory(sessions), "usage_sessions_not_directory");
     bool incomplete = false;
+    // A parsed rollout's records wait here until its parse is known to hold.
+    const auto spool = work / "rollout-records";
     progress.begin("Reading Codex sessions");
     fs::recursive_directory_iterator entries;
     if (have_sessions) {
@@ -1296,18 +1286,23 @@ addon::Usage_scan_page scan_selected_cache(
         const auto source = path_text(fs::absolute(entry.path()).lexically_normal());
         const auto key = cache_key(source);
         const auto cached = rollouts.find(key);
-        std::vector<Sort_record> records;
         auto refreshed = refresh_rollout(entry.path(), source,
             cached == rollouts.end() ? std::nullopt : std::optional(cached->second),
-            request.mode != "incremental", working, 3,
-            [&records](Sort_record record) { records.push_back(std::move(record)); });
+            request.mode != "incremental", working, 3, spool);
         progress.advance();
         if (refreshed.incomplete) incomplete = true;
         if (!refreshed.metadata) continue;
         rollouts[key] = std::move(*refreshed.metadata);
-        for (auto& record : records) {
-            parsed.add(std::move(record));
+        std::ifstream spooled(spool, std::ios::binary);
+        require(static_cast<bool>(spooled), "usage_storage_read_failed");
+        std::string line;
+        while (read_line(spooled, &line)) {
+            check_cancel(working);
+            auto id = decode_record(line, 3).usage.record_id;
+            parsed.add({std::move(id), std::move(line)});
         }
+        spooled.close();
+        remove_owned_path(spool);
     }
     const auto seeded_path = work / "seeded-records";
     const auto parsed_path = work / "parsed-records";
