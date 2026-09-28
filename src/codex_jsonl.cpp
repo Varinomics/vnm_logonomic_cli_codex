@@ -137,7 +137,15 @@ addon::Structured_inspect_result inspect_implementation(const addon::Structured_
         else
         if (type == "item.started" || type == "item.updated" || type == "item.completed") {
             const auto* item = event->find("item");
-            if (!started || !item || !item->is_object() || text(*item, "id").empty() || text(*item, "type").empty()) {
+            if (!item || !item->is_object() || text(*item, "id").empty() || text(*item, "type").empty()) {
+                return protocol_failure();
+            }
+            // Codex exec reports a warning (configuration, deprecation, a model
+            // without metadata, a rerouted model) as a completed "error" item, its
+            // non-fatal notice, whenever it arises, so also before the turn starts.
+            // Its fatal errors are the top-level "error" event and turn.failed.
+            const bool notice = type == "item.completed" && text(*item, "type") == "error";
+            if (!started && !notice) {
                 return protocol_failure();
             }
             if (type != "item.completed") {
