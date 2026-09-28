@@ -60,102 +60,6 @@ void check_cancel(const std::function<bool()>& cancelled)
     require(!cancelled(), "cancelled");
 }
 
-struct Disk_usage
-{
-    std::uint64_t bytes = 0;
-    std::uint64_t entries = 0;
-    std::uint64_t lines = 0;
-};
-
-Disk_usage path_usage(const fs::path& path, const std::function<bool()>& cancelled, const Usage_scan_limits* limits = nullptr)
-{
-    std::error_code error;
-    const auto status = fs::symlink_status(path, error);
-    if (!fs::exists(status)) return {};
-    require(!error && !fs::is_symlink(status), "usage_storage_invalid");
-    Disk_usage usage{0, 1, 0};
-    if (fs::is_directory(status)) return usage;
-    require(fs::is_regular_file(status), "usage_storage_invalid");
-    usage.bytes = fs::file_size(path);
-    if (limits) require(usage.bytes <= limits->disk_bytes, "usage_disk_budget_exceeded");
-    if (usage.bytes == 0) return usage; // Includes the exclusively held storage lock.
-    std::ifstream input(path, std::ios::binary);
-    require(static_cast<bool>(input), "usage_storage_read_failed");
-    std::array<char, 65536> bytes{};
-    while (input.read(bytes.data(), bytes.size()) || input.gcount() > 0) {
-        check_cancel(cancelled);
-        usage.lines += static_cast<std::uint64_t>(std::count(bytes.begin(), bytes.begin() + input.gcount(), '\n'));
-        if (limits) require(usage.lines <= limits->persisted_lines, "usage_disk_budget_exceeded");
-    }
-    require(!input.bad(), "usage_storage_read_failed");
-    return usage;
-}
-
-class Disk_budget final
-{
-public:
-    Disk_budget(const fs::path& root, const Usage_scan_limits& limits, const std::function<bool()>& cancelled)
-    : m_limits(limits), m_cancelled(cancelled)
-    {
-        reserve(path_usage(root, cancelled, &limits));
-        for (const auto& entry : fs::recursive_directory_iterator(root)) {
-            check_cancel(cancelled);
-            reserve(path_usage(entry.path(), cancelled, &limits));
-        }
-    }
-    void reserve(const Disk_usage& usage)
-    {
-        require(usage.bytes <= m_limits.disk_bytes - std::min(m_usage.bytes, m_limits.disk_bytes) &&
-            usage.entries <= m_limits.filesystem_entries - std::min(m_usage.entries, m_limits.filesystem_entries) &&
-            usage.lines <= m_limits.persisted_lines - std::min(m_usage.lines, m_limits.persisted_lines), "usage_disk_budget_exceeded");
-        m_usage.bytes += usage.bytes; m_usage.entries += usage.entries; m_usage.lines += usage.lines;
-    }
-    void release(const Disk_usage& usage)
-    {
-        require(usage.bytes <= m_usage.bytes && usage.entries <= m_usage.entries && usage.lines <= m_usage.lines, "usage_budget_accounting_invalid");
-        m_usage.bytes -= usage.bytes; m_usage.entries -= usage.entries; m_usage.lines -= usage.lines;
-    }
-    Disk_usage inspect(const fs::path& path) const { return path_usage(path, m_cancelled); }
-    void prepare_file(const fs::path& path)
-    {
-        const auto old = inspect(path);
-        if (old.entries == 0) reserve({0, 1, 0});
-        else release({old.bytes, 0, old.lines});
-    }
-    const Usage_scan_limits& limits() const { return m_limits; }
-private:
-    const Usage_scan_limits& m_limits;
-    const std::function<bool()>& m_cancelled;
-    Disk_usage m_usage;
-};
-
-thread_local Disk_budget* active_budget = nullptr;
-
-class Budget_scope final
-{
-public:
-    explicit Budget_scope(Disk_budget& budget) : m_previous(active_budget) { active_budget = &budget; }
-    ~Budget_scope() { active_budget = m_previous; }
-private:
-    Disk_budget* m_previous;
-};
-
-class Budget_output final : public std::ofstream
-{
-public:
-    Budget_output(const fs::path& path, std::ios::openmode mode)
-    {
-        if (active_budget) active_budget->prepare_file(path);
-        open(path, mode);
-    }
-};
-
-void remove_owned_path(const fs::path& path)
-{
-    const auto usage = active_budget ? active_budget->inspect(path) : Disk_usage{};
-    if (fs::remove(path) && active_budget) active_budget->release(usage);
-}
-
 // A retired generation may still be unwinding a scan while its replacement
 // starts. The storage lock therefore covers process generations as well as
 // concurrent calls in this process; no cache mutation relies on RPC ordering.
@@ -257,7 +161,6 @@ fs::path directory(const fs::path& parent, const std::string& name)
     require(!fs::is_symlink(status), "usage_storage_link");
     if (!fs::exists(status)) {
         error.clear();
-        if (active_budget) active_budget->reserve({0, 1, 0});
         fs::create_directory(path, error);
         require(!error, "usage_storage_create_failed");
     }
@@ -265,17 +168,18 @@ fs::path directory(const fs::path& parent, const std::string& name)
     return path;
 }
 
-void remove_snapshot(const fs::path& path)
+void remove_snapshot(const fs::path& path, const std::function<bool()>& cancelled)
 {
     require(digest_name(path.filename().string()), "usage_snapshot_invalid");
     require(fs::is_directory(fs::symlink_status(path)), "usage_storage_invalid");
     // All entries written here are files. Refuse foreign directories instead
     // of following or recursively removing anything in an unexpected shape.
     for (const auto& entry : fs::directory_iterator(path)) {
+        check_cancel(cancelled);
         require(!fs::is_directory(entry.symlink_status()), "usage_storage_invalid");
-        remove_owned_path(entry.path());
+        fs::remove(entry.path());
     }
-    remove_owned_path(path);
+    fs::remove(path);
 }
 
 class Pending_snapshot final
@@ -285,10 +189,9 @@ public:
     ~Pending_snapshot()
     {
         if (!m_committed) {
-            const auto budget = active_budget;
-            active_budget = nullptr; // Cleanup only removes files; cancellation must not inhibit it.
-            try { remove_snapshot(m_path); } catch (...) { /* The next scan retries owned scratch cleanup. */ }
-            active_budget = budget;
+            // Cancellation must not stop this cleanup.
+            try { remove_snapshot(m_path, [] { return false; }); }
+            catch (...) { /* The next scan retries owned scratch cleanup. */ }
         }
     }
     void commit() { m_committed = true; }
@@ -297,12 +200,13 @@ private:
     bool m_committed = false;
 };
 
-void prune_snapshots(const fs::path& snapshots, std::string_view current)
+void prune_snapshots(const fs::path& snapshots, std::string_view current, const std::function<bool()>& cancelled)
 {
     for (const auto& entry : fs::directory_iterator(snapshots)) {
+        check_cancel(cancelled);
         const auto name = entry.path().filename().string();
         if (digest_name(name) && name != current) {
-            remove_snapshot(entry.path());
+            remove_snapshot(entry.path(), cancelled);
         }
     }
 }
@@ -323,7 +227,6 @@ bool read_line(std::istream& input, std::string* line)
 
 void write_line(std::ostream& output, std::string_view line)
 {
-    if (active_budget) active_budget->reserve({static_cast<std::uint64_t>(line.size()) + 1, 0, 1});
     output.write(line.data(), static_cast<std::streamsize>(line.size()));
     output.put('\n');
     require(static_cast<bool>(output), "usage_storage_write_failed");
@@ -354,7 +257,6 @@ void sync_path(const fs::path& path, bool is_directory)
 
 void replace_file(const fs::path& source, const fs::path& destination)
 {
-    const auto replaced = active_budget ? active_budget->inspect(destination) : Disk_usage{};
     std::error_code error;
     require(!fs::is_symlink(fs::symlink_status(destination, error)), "usage_storage_link");
 #if defined(_WIN32)
@@ -365,7 +267,6 @@ void replace_file(const fs::path& source, const fs::path& destination)
     fs::rename(source, destination, error);
     require(!error, "usage_storage_replace_failed");
 #endif
-    if (active_budget) active_budget->release(replaced);
 }
 
 void write_json(const fs::path& path, const addon::Json_value& value, Pending_snapshot* generation = nullptr)
@@ -374,7 +275,7 @@ void write_json(const fs::path& path, const addon::Json_value& value, Pending_sn
     require(encoded.size() <= k_line_limit, "usage_cache_record_too_large");
     const auto temporary = path.parent_path() / (path.filename().string() + ".pending");
     require(!fs::is_symlink(fs::symlink_status(temporary)), "usage_storage_link");
-    Budget_output output(temporary, std::ios::binary | std::ios::trunc);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
     write_line(output, encoded);
     output.close();
@@ -472,17 +373,6 @@ bool fingerprint_matches(const addon::Json_value& metadata, const Fingerprint& v
     return member(metadata, "modified_native_msecs") == addon::Json_value(std::to_string(native_msecs));
 }
 
-// Counts one encoded record against the candidate budget of its scope.
-void admit_candidate_record(std::uint64_t* records, std::uint64_t* bytes, std::size_t encoded_size)
-{
-    const auto& limits = active_budget->limits();
-    require(*records < limits.candidate_records &&
-        encoded_size + 1 <= limits.candidate_bytes - std::min(*bytes, limits.candidate_bytes),
-        "usage_candidate_budget_exceeded");
-    ++*records;
-    *bytes += encoded_size + 1;
-}
-
 struct Sort_record
 {
     std::string id;
@@ -522,15 +412,11 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
         result.incomplete = true;
         return result;
     }
-    Budget_output output(spool, std::ios::binary | std::ios::trunc);
+    std::ofstream output(spool, std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
     std::string error;
-    std::uint64_t file_records = 0;
-    std::uint64_t file_bytes = 0;
     const bool parsed = read_rollout_usage(input, addon::path_from_utf8(source), [&](const Rollout_usage_record& record) {
-        const auto encoded = encode_record(record, version);
-        admit_candidate_record(&file_records, &file_bytes, encoded.size());
-        write_line(output, encoded);
+        write_line(output, encode_record(record, version));
         return true;
     }, cancelled, &error);
     output.close();
@@ -539,7 +425,7 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
     if (!after || *after != *before || error == "rollout_read_failed" ||
         (!parsed && metadata && !current && fingerprint_matches(*metadata, *before) && error != "cancelled"))
     {
-        remove_owned_path(spool);
+        fs::remove(spool);
         result.incomplete = true;
         return result;
     }
@@ -556,7 +442,7 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
 
 void write_rollout_records(const fs::path& path, const std::vector<Sort_record>& records)
 {
-    Budget_output output(path, std::ios::binary | std::ios::trunc);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
     for (const auto& record : records) {
         write_line(output, record.line);
@@ -614,6 +500,9 @@ void copy_accepted_cache(const addon::Json_value& accepted, const fs::path& snap
     const auto identifier = string_member(accepted, "snapshot");
     require(digest_name(identifier), "required_usage_cache_unavailable");
     const auto source_root = snapshots / identifier;
+    // The generation is read in place, so it must be a directory of the
+    // package's storage rather than a link that leads elsewhere.
+    require(fs::is_directory(fs::symlink_status(source_root)), "required_usage_cache_unavailable");
     require(hash_file(source_root / "inventory", cancelled) == string_member(accepted, "inventory_sha256"),
         "required_usage_cache_unavailable");
     std::ifstream inventory(source_root / "inventory", std::ios::binary);
@@ -635,7 +524,7 @@ void copy_accepted_cache(const addon::Json_value& accepted, const fs::path& snap
         if (name == "records")  { have_records  = true; continue; }
         require(!fs::exists(fs::symlink_status(work / name)), "required_usage_cache_unavailable");
         std::ifstream input(source, std::ios::binary);
-        Budget_output output(work / name, std::ios::binary | std::ios::trunc);
+        std::ofstream output(work / name, std::ios::binary | std::ios::trunc);
         require(input && output, "usage_storage_open_failed");
         std::string record;
         while (read_line(input, &record)) {
@@ -657,7 +546,7 @@ void copy_accepted_cache(const addon::Json_value& accepted, const fs::path& snap
 addon::Json_value accepted_generation(const fs::path& work, const addon::Json_value& seeds,
     const std::optional<addon::Account_context>& account, const std::function<bool()>& cancelled)
 {
-    Budget_output inventory(work / "inventory", std::ios::binary | std::ios::trunc);
+    std::ofstream inventory(work / "inventory", std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(inventory), "usage_storage_write_failed");
     for (const auto& entry : fs::directory_iterator(work)) {
         check_cancel(cancelled);
@@ -708,13 +597,6 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
     }
     std::ifstream input(path, std::ios::binary);
     require(static_cast<bool>(input), "native_usage_cache_unavailable");
-    const auto input_bytes = fs::file_size(path);
-    require(active_budget && input_bytes <= active_budget->limits().candidate_bytes, "usage_disk_budget_exceeded");
-    active_budget->reserve({input_bytes, 1, 0});
-    struct Input_reservation {
-        std::uint64_t bytes;
-        ~Input_reservation() { active_budget->release({bytes, 1, 0}); }
-    } input_reservation{input_bytes};
     addon::Sha256 hash;
     std::array<char, 65536> bytes{};
     std::uint64_t length = 0;
@@ -733,8 +615,6 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
     input.clear(); input.seekg(0);
     addon::Sha256 checked_hash;
     std::string line;
-    std::uint64_t imported_records = 0;
-    std::uint64_t imported_bytes = 0;
     while (read_line(input, &line)) {
         check_cancel(cancelled);
         checked_hash.update(line); checked_hash.update("\n");
@@ -749,9 +629,7 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
         std::string error;
         const auto file = convert_native_cache_file(*wrapper, [&](const Rollout_usage_record& record) {
             check_cancel(cancelled);
-            auto encoded = encode_record(record, version);
-            admit_candidate_record(&imported_records, &imported_bytes, encoded.size());
-            records.push_back({record.usage.record_id, std::move(encoded)});
+            records.push_back({record.usage.record_id, encode_record(record, version)});
             return true;
         }, &error, version);
         require(file.has_value(), error);
@@ -800,7 +678,7 @@ void merge_runs(const fs::path& left_path, const fs::path& right_path, const fs:
     const std::function<bool()>& cancelled, std::uint16_t version, bool unique_ids)
 {
     std::ifstream left(left_path, std::ios::binary), right(right_path, std::ios::binary);
-    Budget_output output(destination, std::ios::binary | std::ios::trunc);
+    std::ofstream output(destination, std::ios::binary | std::ios::trunc);
     require(left && right && output, "usage_storage_open_failed");
     Sort_record a, b;
     const auto next = [version](std::istream& input, Sort_record* record) {
@@ -818,7 +696,7 @@ void merge_runs(const fs::path& left_path, const fs::path& right_path, const fs:
     output.close();
     require(static_cast<bool>(output), "usage_storage_write_failed");
     left.close(); right.close();
-    remove_owned_path(left_path); remove_owned_path(right_path);
+    fs::remove(left_path); fs::remove(right_path);
 }
 
 // Sorts encoded records by ID while holding at most one run of them in
@@ -828,11 +706,12 @@ void merge_runs(const fs::path& left_path, const fs::path& right_path, const fs:
 class Record_sorter final
 {
 public:
-    Record_sorter(fs::path work, std::string name, const std::function<bool()>& cancelled,
-        std::uint16_t version, bool unique_ids)
+    Record_sorter(fs::path work, std::string name, std::uint64_t run_bytes,
+        const std::function<bool()>& cancelled, std::uint16_t version, bool unique_ids)
     :
         m_work(std::move(work)),
         m_name(std::move(name)),
+        m_run_bytes(run_bytes),
         m_cancelled(cancelled),
         m_version(version),
         m_unique_ids(unique_ids)
@@ -840,7 +719,7 @@ public:
 
     void add(Sort_record record)
     {
-        if (!m_chunk.empty() && m_bytes + record.line.size() > active_budget->limits().sort_run_bytes) flush();
+        if (!m_chunk.empty() && m_bytes + record.line.size() > m_run_bytes) flush();
         m_bytes += record.line.size();
         m_chunk.push_back(std::move(record));
     }
@@ -862,7 +741,7 @@ public:
             ++level; m_runs = next_runs;
         }
         if (m_runs == 1) fs::rename(run_path(m_work, m_name, level, 0), destination);
-        else { Budget_output empty(destination, std::ios::binary); require(static_cast<bool>(empty), "usage_storage_write_failed"); }
+        else { std::ofstream empty(destination, std::ios::binary); require(static_cast<bool>(empty), "usage_storage_write_failed"); }
     }
 
 private:
@@ -870,7 +749,7 @@ private:
     {
         if (m_chunk.empty()) return;
         std::sort(m_chunk.begin(), m_chunk.end(), [](const auto& a, const auto& b) { return id_less(a.id, b.id); });
-        Budget_output output(run_path(m_work, m_name, 0, m_runs++), std::ios::binary | std::ios::trunc);
+        std::ofstream output(run_path(m_work, m_name, 0, m_runs++), std::ios::binary | std::ios::trunc);
         require(static_cast<bool>(output), "usage_storage_write_failed");
         std::string previous;
         for (const auto& record : m_chunk) {
@@ -886,6 +765,7 @@ private:
 
     fs::path                        m_work;
     std::string                     m_name;
+    std::uint64_t                   m_run_bytes;
     const std::function<bool()>&    m_cancelled;
     std::uint16_t                   m_version;
     bool                            m_unique_ids;
@@ -895,12 +775,11 @@ private:
 };
 
 // The usage-scan@1/2 layout: sorts the records of every per-rollout file.
-void sorted_snapshot(const fs::path& work, const std::function<bool()>& cancelled, std::uint16_t version = 2)
+void sorted_snapshot(const fs::path& work, std::uint64_t sort_run_bytes, const std::function<bool()>& cancelled,
+    std::uint16_t version = 2)
 {
-    Record_sorter sorter(work, "run", cancelled, version, true);
+    Record_sorter sorter(work, "run", sort_run_bytes, cancelled, version, true);
     Repository_memo repositories;
-    std::uint64_t candidate_records = 0;
-    std::uint64_t candidate_bytes = 0;
     for (const auto& entry : fs::directory_iterator(work)) {
         check_cancel(cancelled);
         const auto filename = entry.path().filename().string();
@@ -919,9 +798,7 @@ void sorted_snapshot(const fs::path& work, const std::function<bool()>& cancelle
             auto record = decode_record(line, version);
             require(record.usage.source_path && cache_key(*record.usage.source_path) == cache_key(source), "usage_cache_identity_mismatch");
             repositories.refresh(&record);
-            auto encoded = encode_record(record, version);
-            admit_candidate_record(&candidate_records, &candidate_bytes, encoded.size());
-            sorter.add({record.usage.record_id, std::move(encoded)});
+            sorter.add({record.usage.record_id, encode_record(record, version)});
         }
     }
     sorter.finish(work / "records");
@@ -1093,15 +970,28 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
     if (accepted) retained.emplace(*accepted, accepted_version, "usage_cache_unavailable");
     Record_stream seeded(seeded_path, 3, "usage_storage_read_failed");
     Record_stream parsed(parsed_path, 3, "usage_storage_read_failed");
-    Budget_output output(work / "records", std::ios::binary | std::ios::trunc);
+    std::ofstream output(work / "records", std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
-    const auto take_group = [](Record_stream& stream, const std::string& id) {
-        std::vector<Rollout_usage_record> group;
-        while (stream.head() && stream.head()->usage.record_id == id) group.push_back(stream.take());
-        return group;
+    // Reads one turn's observations from a stream, keeping the one whose
+    // rollout path sorts first; differing observations fail the scan. A stream
+    // outranked by another one for this turn is drained unexamined.
+    const auto choose = [&cancelled](Record_stream& stream, const std::string& id, bool examine) {
+        std::optional<Rollout_usage_record> chosen;
+        while (stream.head() && stream.head()->usage.record_id == id) {
+            check_cancel(cancelled);
+            auto observation = stream.take();
+            if (!examine) continue;
+            if (!chosen) {
+                chosen = std::move(observation);
+                continue;
+            }
+            require(same_observation(observation, *chosen), "duplicate_usage_record");
+            if (observation.usage.source_path.value_or("") < chosen->usage.source_path.value_or("")) {
+                chosen = std::move(observation);
+            }
+        }
+        return chosen;
     };
-    std::uint64_t candidate_records = 0;
-    std::uint64_t candidate_bytes = 0;
     std::string previous_accepted;
     for (;;) {
         check_cancel(cancelled);
@@ -1120,27 +1010,21 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
             require(previous_accepted.empty() || id_less(previous_accepted, *id), "usage_cache_invalid");
             previous_accepted = *id;
         }
-        auto seeded_group = take_group(seeded, *id);
-        auto parsed_group = take_group(parsed, *id);
-        auto& observations = parsed_group.empty() ? seeded_group : parsed_group;
+        const bool parsed_again = parsed.head() && parsed.head()->usage.record_id == *id;
+        auto seeded_choice = choose(seeded, *id, !parsed_again);
+        auto parsed_choice = choose(parsed, *id, true);
+        auto& chosen = parsed_again ? parsed_choice : seeded_choice;
         Rollout_usage_record* record = accepted_record ? &*accepted_record : nullptr;
-        if (!observations.empty()) {
-            auto* chosen = &observations.front();
-            for (auto& observation : observations) {
-                require(same_observation(observation, *chosen), "duplicate_usage_record");
-                if (observation.usage.source_path.value_or("") < chosen->usage.source_path.value_or("")) chosen = &observation;
-            }
+        if (chosen) {
             if (!accepted_record || !confirms(*accepted_record, *chosen)) {
-                record = chosen;
+                record = &*chosen;
             }
             else
             if (!accepted_record->usage.cross_source_event) {
                 accepted_record->usage.cross_source_event = chosen->usage.cross_source_event;
             }
         }
-        const auto encoded = encode_record(*record, 3);
-        admit_candidate_record(&candidate_records, &candidate_bytes, encoded.size());
-        write_line(output, encoded);
+        write_line(output, encode_record(*record, 3));
     }
     output.close();
     require(static_cast<bool>(output), "usage_storage_write_failed");
@@ -1149,7 +1033,7 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
 void write_rollouts(const fs::path& work, const std::map<std::string, addon::Json_value>& rollouts,
     const std::function<bool()>& cancelled)
 {
-    Budget_output output(work / "rollouts", std::ios::binary | std::ios::trunc);
+    std::ofstream output(work / "rollouts", std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
     for (const auto& [key, metadata] : rollouts) {
         (void)key;
@@ -1222,8 +1106,6 @@ addon::Usage_scan_page scan_selected_cache(
     // sealing included, so the poll is where the working scan reports.
     const std::function<bool()> working = [&] { progress.poll(); return cancelled(); };
     progress.begin("Preparing the usage cache");
-    Disk_budget budget(work, limits, working);
-    Budget_scope budget_scope(budget);
     auto seeds = addon::Json_value::array();
     // Rollout metadata by cache key; the accepted records stay on disk and are
     // streamed once into the new snapshot.
@@ -1247,8 +1129,8 @@ addon::Usage_scan_page scan_selected_cache(
     }
     // Turns converted from a native seed and turns parsed in this scan, each
     // sorted by ID for reconciliation with the accepted records.
-    Record_sorter seeded(work, "seeded-run", working, 3, false);
-    Record_sorter parsed(work, "parsed-run", working, 3, false);
+    Record_sorter seeded(work, "seeded-run", limits.sort_run_bytes, working, 3, false);
+    Record_sorter parsed(work, "parsed-run", limits.sort_run_bytes, working, 3, false);
     if (request.native_file_cache) progress.begin("Importing earlier usage history");
     seed_native_cache(request, storage, selection.accepted.has_value(), &seeds,
         [&rollouts](const std::string& key) {
@@ -1302,7 +1184,7 @@ addon::Usage_scan_page scan_selected_cache(
             parsed.add({std::move(id), std::move(line)});
         }
         spooled.close();
-        remove_owned_path(spool);
+        fs::remove(spool);
     }
     const auto seeded_path = work / "seeded-records";
     const auto parsed_path = work / "parsed-records";
@@ -1311,8 +1193,8 @@ addon::Usage_scan_page scan_selected_cache(
     parsed.finish(parsed_path);
     progress.begin("Merging usage history");
     merge_snapshot_records(work, accepted_records, accepted_version, rollouts, seeded_path, parsed_path, working);
-    remove_owned_path(seeded_path);
-    remove_owned_path(parsed_path);
+    fs::remove(seeded_path);
+    fs::remove(parsed_path);
     progress.begin("Saving the usage cache");
     write_rollouts(work, rollouts, working);
     const auto identifier = nonce();
@@ -1399,8 +1281,6 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         if (request.cache_selection) {
             return scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits);
         }
-        // Bootstrap creates only these three zero-byte entries before inventory.
-        require(limits.filesystem_entries >= 3, "usage_disk_budget_exceeded");
         const auto root = directory(storage, "codex-usage-v1");
         Storage_lock storage_lock(root / "scan.lock", cancelled);
         const auto snapshots = directory(root, "snapshots");
@@ -1412,8 +1292,6 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         // As in scan_selected_cache, the working scan reports where it polls.
         const std::function<bool()> working = [&] { progress.poll(); return cancelled(); };
         progress.begin("Preparing the usage cache");
-        Disk_budget budget(root, limits, working);
-        Budget_scope budget_scope(budget);
         require(fs::is_directory(vendor_profile), "usage_sessions_unavailable");
         const auto sessions = vendor_profile / "sessions";
         const bool have_sessions = fs::exists(sessions);
@@ -1435,7 +1313,7 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
             sync_path(root, true);
             sync_path(storage, true);
         }
-        prune_snapshots(snapshots, accepted_identifier);
+        prune_snapshots(snapshots, accepted_identifier, working);
         const auto identifier = nonce();
         const auto work = directory(snapshots, identifier);
         Pending_snapshot pending(work);
@@ -1465,7 +1343,7 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
             }
         }
         progress.begin("Sorting usage records");
-        sorted_snapshot(work, working);
+        sorted_snapshot(work, limits.sort_run_bytes, working);
         check_cancel(working);
         progress.begin("Saving the usage cache");
         addon::Observation_scope scope;

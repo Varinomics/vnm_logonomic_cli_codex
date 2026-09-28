@@ -12,19 +12,16 @@
 
 namespace codex {
 
-// One GiB is the adopted host candidate bound. Eight GiB accommodates retained
-// two generations of per-file cache and snapshots, merge inputs/output, and
-// an imported replacement. Limits count the whole owned tree; history is never
-// evicted to make space. Sorting holds at most one run of encoded records in
-// memory. The runtime always uses these defaults; smaller limits let pure
-// filesystem fixtures exercise the same production admission checks.
+// A scan's records never accumulate in memory: sorting holds at most one run
+// of encoded records, and a parsed rollout's records wait on disk. What it
+// keeps in memory for the whole scan is one metadata entry per rollout and,
+// in the usage-scan@1/2 layout, the repository of each working directory. Its
+// storage grows with the history it holds, and the package sets it no ceiling:
+// running out of disk fails the scan without publishing it. The runtime always
+// uses the default run; a smaller one lets pure filesystem fixtures sort
+// through merged runs.
 struct Usage_scan_limits
 {
-    std::uint64_t disk_bytes = 8ull * 1024 * 1024 * 1024;
-    std::uint64_t filesystem_entries = 1024 * 1024;
-    std::uint64_t persisted_lines = 8ull * 1024 * 1024;
-    std::uint64_t candidate_bytes = 1024ull * 1024 * 1024;
-    std::uint64_t candidate_records = 1024 * 1024;
     std::uint64_t sort_run_bytes = 64ull * 1024 * 1024;
 };
 

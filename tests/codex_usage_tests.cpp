@@ -654,78 +654,6 @@ void native_turn_identity_remains_validated(const fs::path& source)
         "native cumulative-turn identity mismatch is still rejected");
 }
 
-struct Tree_usage
-{
-    std::uint64_t bytes = 0;
-    std::uint64_t entries = 1;
-    std::uint64_t lines = 0;
-};
-
-Tree_usage tree_usage(const fs::path& root)
-{
-    Tree_usage usage;
-    for (const auto& entry : fs::recursive_directory_iterator(root)) {
-        ++usage.entries;
-        if (!entry.is_regular_file()) continue;
-        usage.bytes += entry.file_size();
-        std::ifstream input(entry.path(), std::ios::binary);
-        char byte;
-        while (input.get(byte)) if (byte == '\n') ++usage.lines;
-    }
-    return usage;
-}
-
-void disk_limits_refuse_growth_without_publishing(const fs::path& fixture)
-{
-    const auto profile = fixture / "budget-profile";
-    const auto storage = fixture / "budget-storage";
-    fs::create_directories(profile / "sessions"); fs::create_directory(storage);
-    const auto source = profile / "sessions" / "rollout-budget.jsonl";
-    write(source, metadata("budget") + start("first") + tokens(17) + complete("first"));
-    addon::Usage_scan_request request;
-    request.context.account_context = addon::Account_context{1, "account"};
-    std::string error;
-    const auto accepted = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(accepted && accepted->records.size() == 1, "budget fixture establishes retained history");
-    const auto root = storage / "codex-usage-v1";
-    const auto initial = tree_usage(root);
-    const auto record_bytes = addon::serialize_json(addon::encode_usage_record(accepted->records.front(), 2)).size();
-    write(source, metadata("budget") + start("first") + tokens(310) + complete("first"));
-    for (const std::string kind : {"bytes", "entries", "lines", "records"}) {
-        codex::Usage_scan_limits limits;
-        if (kind == "bytes") limits.disk_bytes = initial.bytes + record_bytes - 1;
-        if (kind == "entries") limits.filesystem_entries = initial.entries + 1;
-        if (kind == "lines") limits.persisted_lines = initial.lines;
-        if (kind == "records") limits.candidate_records = 0;
-        const auto result = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error, limits);
-        check(!result && (error == "usage_disk_budget_exceeded" || error == "usage_candidate_budget_exceeded"),
-            "resource limit must reject before publishing the changed candidate");
-        const auto after = tree_usage(root);
-        check(after.bytes <= limits.disk_bytes && after.entries <= limits.filesystem_entries && after.lines <= limits.persisted_lines,
-            "failed attempt cannot exceed admitted disk resources");
-        check(after.bytes == initial.bytes && after.entries == initial.entries,
-            "repeated denied replacements leave no growing scratch artifacts");
-        auto replay = request;
-        replay.snapshot_id = accepted->snapshot_id;
-        replay.cursor = "0";
-        const auto retained = codex::scan_usage(replay, profile, storage, [] { return false; }, quiet_progress, &error);
-        check(retained && retained->records.front().total_tokens == 17,
-            "previous immutable snapshot survives resource-limit failure unchanged");
-    }
-    const auto imported_profile = fixture / "budget-import-profile";
-    const auto imported_storage = fixture / "budget-import-storage";
-    fs::create_directories(imported_profile / "sessions"); fs::create_directory(imported_storage);
-    const auto artifact = imported_storage / "native-file-cache.jsonl";
-    set_seed(&request, artifact, addon::serialize_json(native_wrapper(imported_profile / "sessions" / "rollout-gone.jsonl", "gone", 17)) + '\n');
-    codex::Usage_scan_limits limits;
-    limits.candidate_records = 0;
-    check(!codex::scan_usage(request, imported_profile, imported_storage, [] { return false; }, quiet_progress, &error, limits) &&
-        error == "usage_candidate_budget_exceeded", "native import observes the same record budget before cache writes");
-    const auto imported_root = imported_storage / "codex-usage-v1";
-    check(fs::is_empty(imported_root / "snapshots") && !fs::exists(imported_root / "accepted"),
-        "over-budget native evidence cannot publish an accepted generation");
-}
-
 void selected_cache_preserves_host_authority(const fs::path& fixture)
 {
     const auto profile = fixture / "selected-profile";
@@ -1596,7 +1524,6 @@ int main(int argc, char** argv)
         accepted_inventory_controls_cache_replay(fixture.path);
         empty_native_cache_is_accepted_evidence(fixture.path);
         native_turn_identity_remains_validated(fixture.path / "rollout-native.jsonl");
-        disk_limits_refuse_growth_without_publishing(fixture.path);
         selected_cache_preserves_host_authority(fixture.path);
         selected_cache_stays_compact_across_incremental_scans(fixture.path);
         selected_cache_reconciles_turns_by_identity(fixture.path);
