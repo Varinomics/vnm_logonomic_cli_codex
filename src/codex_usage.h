@@ -24,14 +24,9 @@ struct Usage_scan_limits
     std::uint64_t sort_run_bytes = 64ull * 1024 * 1024;
 };
 
-// Reports a usage scan's progress. A frame names the running stage and counts
-// the items it has handled. A stage reports when it begins; while it works, a
-// frame follows the previous one once an interval has passed that starts at
-// one second and doubles every 256 frames up to a quarter of the silence the
-// host tolerates. So a scan that keeps working reports within that silence for
-// days before the core protocol's bound of 4,096 frames per request is spent;
-// the scan never sends more, and one still working then falls silent. That
-// horizon, about six days under a 15-minute silence, is the protocol's.
+// Reports each stage immediately and coalesces working-item updates to one
+// frame per second, or a quarter of the host's tolerated silence when shorter.
+// Progress continues for as long as the scan works.
 class Usage_scan_progress final
 {
 public:
@@ -54,10 +49,9 @@ private:
 
     Sink                                  m_sink;
     Clock                                 m_clock;
-    std::chrono::milliseconds             m_longest_interval;
+    std::chrono::milliseconds             m_interval;
     std::string                           m_note;
     std::uint64_t                         m_completed = 0;
-    std::uint64_t                         m_frames    = 0;
     std::chrono::steady_clock::time_point m_last_frame;
 };
 

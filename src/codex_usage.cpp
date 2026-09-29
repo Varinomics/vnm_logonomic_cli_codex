@@ -3,7 +3,6 @@
 #include "codex_usage_records.h"
 #include "codex_native_usage.h"
 
-#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -42,9 +41,7 @@ constexpr int k_parser_revision = 1;
 // rollouts a home has. @1 and @2 kept a metadata and a records file per
 // rollout, which every scan had to copy, flush and hash again.
 constexpr std::string_view k_cache_format = "codex-rollout-cache@3";
-constexpr std::chrono::milliseconds k_first_progress_interval{1000};
-// The interval between progress frames doubles each time this many are sent.
-constexpr std::uint64_t k_progress_frames_per_doubling = addon::limits::k_max_progress_frames_per_request / 16;
+constexpr std::chrono::milliseconds k_progress_interval{1000};
 std::timed_mutex scan_mutex;
 
 struct Scan_failure { std::string reason; };
@@ -1270,8 +1267,6 @@ addon::Usage_scan_page scan_selected_cache(
         auto page = page_at(work, *request.snapshot_id, decimal(*request.cursor), request.context.account_context, cancelled, 3);
         page.account_context = request.context.account_context;
         page.profile_storage = request.context.profile_storage;
-        require(fs::file_size(work / "cache-manifest.json") <= addon::k_max_usage_cache_manifest_bytes,
-            "usage_cache_unavailable");
         page.cache_candidate = addon::Usage_cache_reference{
             selection.candidate_root, page.snapshot_id, hash_file(work / "cache-manifest.json", cancelled)};
         for (auto& record : page.records) {
@@ -1419,7 +1414,7 @@ Usage_scan_progress::Usage_scan_progress(
 :
     m_sink(std::move(sink)),
     m_clock(std::move(clock)),
-    m_longest_interval(tolerated_silence / 4)
+    m_interval(std::min(k_progress_interval, tolerated_silence / 4))
 {}
 
 void Usage_scan_progress::begin(std::string note)
@@ -1431,19 +1426,13 @@ void Usage_scan_progress::begin(std::string note)
 
 void Usage_scan_progress::poll()
 {
-    const auto doublings = static_cast<int>(m_frames / k_progress_frames_per_doubling);
-    const auto interval  = std::min(k_first_progress_interval * (std::int64_t{1} << doublings), m_longest_interval);
-    if (m_clock() - m_last_frame >= interval) {
+    if (m_clock() - m_last_frame >= m_interval) {
         emit();
     }
 }
 
 void Usage_scan_progress::emit()
 {
-    if (m_frames == addon::limits::k_max_progress_frames_per_request) {
-        return;
-    }
-    ++m_frames;
     m_last_frame = m_clock();
     m_sink(m_completed, m_note);
 }

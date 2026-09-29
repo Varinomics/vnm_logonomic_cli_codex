@@ -4,7 +4,6 @@
 #include "codex_native_usage.h"
 #include "codex_accounts.h"
 #include <logonomic_cli_addon/host_simulator.h>
-#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -1010,41 +1009,43 @@ void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::
     }
 }
 
-// Rebuilds a sealed current candidate in the per-rollout layout of @1 or @2:
-// a `.meta` and a `.records` file per rollout beside the sorted `records`.
-// @1 records use the usage2 grammar, which carries no counter provenance.
-void progress_stays_within_the_frame_bound_and_the_silence()
+void progress_continues_at_a_paced_rate_while_working()
 {
-    // The core protocol allows 4,096 progress frames per request, and the
-    // host ends a request whose package sends nothing for its deadline. A
-    // scan that keeps working reports within a quarter of that silence for
-    // three days, and never exceeds the bound, not even for a new stage.
     using namespace std::chrono;
     const milliseconds silence = minutes(15);
     steady_clock::time_point now{};
-    std::vector<steady_clock::time_point> frames;
+    steady_clock::time_point last{};
+    std::uint64_t frames = 0;
+    std::uint64_t completed = 0;
+    std::string note;
     codex::Usage_scan_progress progress(
-        [&](std::uint64_t, const std::string&) { frames.push_back(now); }, silence, [&now] { return now; });
+        [&](std::uint64_t count, const std::string& stage) {
+            ++frames;
+            last = now;
+            completed = count;
+            note = stage;
+        }, silence, [&now] { return now; });
     progress.begin("Reading Codex sessions");
     const auto end = now + hours(72);
     while (now < end) {
+        const auto before = frames;
         now += milliseconds(100);
+        progress.advance();
         progress.poll();
+        check(now - last <= silence / 4, "a working scan keeps reporting within the tolerated silence");
+        if (frames != before) {
+            progress.poll();
+            check(frames == before + 1, "repeated polls without elapsed time coalesce");
+        }
     }
-    check(frames.size() > 1 && frames.size() <= addon::limits::k_max_progress_frames_per_request,
-        "a working scan reports within the frame bound");
-    for (std::size_t index = 1; index < frames.size(); ++index) {
-        check(frames[index] - frames[index - 1] <= silence / 4, "a working scan reports within a quarter of the silence");
-    }
-    check(end - frames.back() <= silence / 4, "a scan still working after three days still reports");
-    while (frames.size() < addon::limits::k_max_progress_frames_per_request) {
-        now += hours(1);
-        progress.poll();
-    }
-    now += hours(1);
-    progress.poll();
+    const auto elapsed_seconds = static_cast<std::uint64_t>(duration_cast<seconds>(end.time_since_epoch()).count());
+    check(frames == elapsed_seconds + 1,
+        "each elapsed reporting interval delivers progress throughout a long scan");
+    check(completed > 0, "working progress reports its latest completed count");
+    const auto before_stage = frames;
     progress.begin("Saving the usage cache");
-    check(frames.size() == addon::limits::k_max_progress_frames_per_request, "a spent frame bound sends nothing more");
+    check(frames == before_stage + 1 && completed == 0 && note == "Saving the usage cache",
+        "a new stage still reports immediately after a long scan");
 }
 
 void scans_report_each_stage_while_they_work(const fs::path& fixture)
@@ -1604,7 +1605,7 @@ int main(int argc, char** argv)
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
         selected_cache_spools_a_rollout_while_it_is_read(fixture.path);
         selected_cache_requires_the_rollout_of_each_accepted_record(fixture.path);
-        progress_stays_within_the_frame_bound_and_the_silence();
+        progress_continues_at_a_paced_rate_while_working();
         scans_report_each_stage_while_they_work(fixture.path);
         waiting_for_another_scan_reports_nothing(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
