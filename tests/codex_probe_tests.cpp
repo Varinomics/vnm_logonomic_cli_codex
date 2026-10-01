@@ -6,16 +6,19 @@
 
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/presentation_record.h>
 
 #include "codex_launcher.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <chrono>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -800,6 +803,82 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
     }
 }
 
+#ifdef _WIN32
+void quota_batch_dispatch_matches_powershell(
+    const std::filesystem::path& executable, const std::filesystem::path& helper)
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() /
+        ("codex quota batch " + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(root);
+    const fs::path wrapper = root / "codex.CmD";
+    const fs::path receipt = root / "receipt.json";
+    {
+        std::ofstream output(wrapper, std::ios::binary);
+        output << "@echo off\r\nset \"CODEX_FIXTURE_CMDLINE=%CMDCMDLINE%\"\r\n"
+                  "set \"CODEX_FIXTURE_WRAPPER=selected batch\"\r\n\""
+               << addon::path_to_utf8(executable) << "\" --fixture-quota=notification %*\r\nexit /b %errorlevel%\r\n";
+    }
+    addon::Json_value frozen = addon::Json_value::object();
+    for (const char* name : {"PATH", "PATHEXT", "SystemRoot", "COMSPEC", "USERPROFILE", "TEMP", "TMP"}) {
+        if (const char* value = std::getenv(name)) {
+            frozen.set(name, addon::Json_value(value));
+        }
+    }
+    const fs::path processor = root / "selected command processor.exe";
+    fs::copy_file(addon::path_from_utf8(std::getenv("COMSPEC")), processor);
+    Context context;
+    for (const std::string& selected_processor : {
+            std::string{}, addon::path_to_utf8(processor), std::string("cmd.exe")})
+    {
+        addon::Environment environment{
+            {"CODEX_FIXTURE_RECEIPT", addon::path_to_utf8(receipt)},
+            {"CODEX_HOME", addon::path_to_utf8(root / "selected profile")},
+            {"CODEX_BATCH_EXPANSION", "expanded-value"},
+        };
+        for (const auto& item : frozen.as_object()) {
+            environment.emplace_back(item.name, item.value.as_string());
+        }
+        if (!selected_processor.empty()) {
+            addon::set_environment(environment, "COMSPEC", selected_processor);
+        }
+        for (const std::vector<std::string>& prefix : {
+                std::vector<std::string>{},
+                std::vector<std::string>{"--prefix", "space value", "trailing slash\\", "%CODEX_BATCH_EXPANSION%", "caret^value", "bang!value", ""},
+                codex::recognize_launcher("npx '@openai/codex@file:C:\\local\u00a0package'")->prefix_arguments})
+        {
+            codex::Launcher_command selected{addon::path_to_utf8(wrapper), prefix, {}};
+            std::string baseline;
+            for (const bool direct_batch : {false, true}) {
+                const auto resolved = codex::resolve_probe_launcher(
+                    selected, {"app-server", "--stdio"}, frozen, addon::path_to_utf8(root), direct_batch);
+                check(resolved && (resolved->front() == "--batch") == direct_batch,
+                    "quota selects native batch dispatch while AUTH retains PowerShell");
+                auto command = *resolved;
+                command.insert(command.begin(), addon::path_to_utf8(helper));
+                const auto output = codex::run_probe(command, environment, addon::path_to_utf8(root), 5000, context);
+                check(output && output->output.find("account/updated") != std::string::npos,
+                    "selected batch preserves the complete quota response and native EOF tail");
+                std::ifstream input(receipt, std::ios::binary);
+                const std::string observed{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+                check(!observed.empty(), "the selected wrapper reached the native process");
+                if (direct_batch) {
+                    check(observed == baseline,
+                        "batch command line, native argv, wrapper effects, profile and cwd match PowerShell");
+                }
+                else {
+                    baseline = observed;
+                }
+            }
+        }
+    }
+    codex::Launcher_command quoted{addon::path_to_utf8(wrapper), {"embedded\"quote"}, {}};
+    const auto resolved = codex::resolve_probe_launcher(quoted, {"app-server", "--stdio"}, frozen, "", true);
+    check(resolved && resolved->front() != "--batch", "embedded quotes retain the native PowerShell argument binder");
+    fs::remove_all(root);
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -819,6 +898,9 @@ int main(int argc, char** argv)
         launcher_discovery_returns_authenticated_codex_profiles(
             std::filesystem::absolute(argv[1]));
         probe_preparation_preserves_program_environment_and_custody(std::filesystem::absolute(argv[1]));
+#ifdef _WIN32
+        quota_batch_dispatch_matches_powershell(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
+#endif
         return 0;
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

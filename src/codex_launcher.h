@@ -63,7 +63,8 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
     const Launcher_command& command,
     const std::vector<std::string>& operation_arguments,
     const logonomic::cli_addon::Json_value& effective_environment,
-    std::string_view working_directory);
+    std::string_view working_directory,
+    bool direct_batch);
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
 std::optional<std::string> codex_profile_environment_text(std::string_view profile_path);

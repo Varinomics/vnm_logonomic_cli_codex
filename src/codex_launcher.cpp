@@ -944,7 +944,8 @@ std::optional<Probe_output> run_probe(
 
 std::optional<std::vector<std::string>> resolve_probe_launcher(
     const Launcher_command& command, const std::vector<std::string>& operation_arguments,
-    const addon::Json_value& effective_environment, std::string_view working_directory)
+    const addon::Json_value& effective_environment, std::string_view working_directory,
+    [[maybe_unused]] bool direct_batch)
 {
     Environment environment;
     for (const auto& member : effective_environment.as_object()) {
@@ -959,6 +960,16 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
     result.insert(result.end(), operation_arguments.begin(), operation_arguments.end());
 #ifdef _WIN32
     const auto extension = lower(program->extension().string());
+    if (direct_batch && (extension == ".cmd" || extension == ".bat") &&
+        std::ranges::none_of(result, [](const std::string& argument) {
+            return argument.find_first_of("\"\r\n") != std::string::npos;
+        }))
+    {
+        // Embedded quotes require PowerShell's native argument binder. The
+        // quota helper can reproduce its plain batch command line directly.
+        result.insert(result.begin(), "--batch");
+        return result;
+    }
     if (extension == ".cmd" || extension == ".bat" || extension == ".ps1") {
         const auto shell = resolve_program(
             "powershell.exe", environment, working_directory, Launcher_whitespace::ASCII);

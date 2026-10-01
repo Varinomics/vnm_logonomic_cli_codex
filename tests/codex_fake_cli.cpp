@@ -15,6 +15,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <initializer_list>
 #include <string>
@@ -100,6 +101,24 @@ std::vector<std::string> received_arguments([[maybe_unused]] int argc, [[maybe_u
 
 int main(int argc, char** argv)
 {
+    if (const char* receipt = std::getenv("CODEX_FIXTURE_RECEIPT")) {
+        Json arguments = Json::array();
+        for (const auto& argument : received_arguments(argc, argv)) {
+            arguments.push_back(Json(argument));
+        }
+        const auto cwd = std::filesystem::current_path().generic_u8string();
+        Json observed = object({
+            {"argv", std::move(arguments)},
+            {"cwd", Json(std::string(cwd.begin(), cwd.end()))},
+        });
+        for (const char* name : {"CODEX_FIXTURE_CMDLINE", "CODEX_FIXTURE_WRAPPER", "CODEX_HOME"}) {
+            if (const char* value = std::getenv(name)) {
+                observed.set(name, Json(value));
+            }
+        }
+        std::ofstream output(addon::path_from_utf8(receipt), std::ios::binary);
+        output << addon::serialize_json(observed);
+    }
     // Report the invocation instead of acting on it.
     if (std::getenv("CODEX_FIXTURE_ARGV")) {
         Json arguments = Json::array();

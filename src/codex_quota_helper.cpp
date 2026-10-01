@@ -164,6 +164,57 @@ std::wstring quote_argument(const std::wstring& argument)
     result.append(slashes * 2, L'\\');
     return result + L"\"";
 }
+
+std::wstring command_processor()
+{
+    const DWORD size = GetEnvironmentVariableW(L"COMSPEC", nullptr, 0);
+    if (size) {
+        std::wstring result(size, L'\0');
+        const DWORD written = GetEnvironmentVariableW(L"COMSPEC", result.data(), size);
+        if (written && written < size) {
+            result.resize(written);
+            return result;
+        }
+        return {};
+    }
+    const UINT system_size = GetSystemDirectoryW(nullptr, 0);
+    std::wstring result(system_size, L'\0');
+    const UINT written = GetSystemDirectoryW(result.data(), system_size);
+    if (!written || written >= system_size) {
+        return {};
+    }
+    result.resize(written);
+    return result + L"\\cmd.exe";
+}
+
+std::wstring batch_command(int argc, wchar_t** argv, const std::wstring& processor)
+{
+    // Match Windows PowerShell's batch dispatch, including cmd's AutoRun and
+    // expansion settings. CRT quoting would escape the command's inner quotes.
+    std::wstring result = processor.find_first_of(L" \t") == std::wstring::npos
+        ? processor : quote_argument(processor);
+    result += L" /c \"\"";
+    result += argv[2];
+    result += L'"';
+    // Windows PowerShell uses .NET Char.IsWhiteSpace when binding native
+    // arguments, including the Unicode separators that cmd does not split.
+    constexpr std::wstring_view whitespace =
+        L" \t\r\n\v\f\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004"
+        L"\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000";
+    for (int index = 3; index < argc; ++index) {
+        const std::wstring_view argument(argv[index]);
+        const bool quote = argument.find_first_of(whitespace) != std::wstring_view::npos;
+        result += L' ';
+        if (quote) {
+            result += L'"';
+        }
+        result += argument;
+        if (quote) {
+            result += L'"';
+        }
+    }
+    return result + L'"';
+}
 #endif
 
 } // namespace
@@ -172,7 +223,8 @@ std::wstring quote_argument(const std::wstring& argument)
 int wmain(int argc, wchar_t** argv)
 {
     const bool current_account = argc > 1 && std::wstring_view(argv[1]) == L"--current-account";
-    const int native_index = current_account ? 2 : 1;
+    const bool direct_batch = argc > 1 && std::wstring_view(argv[1]) == L"--batch";
+    const int native_index = current_account || direct_batch ? 2 : 1;
     if (argc <= native_index) {
         return 2;
     }
@@ -219,12 +271,19 @@ int wmain(int argc, wchar_t** argv)
     if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) {
         return 3;
     }
-    std::wstring command;
-    for (int i = native_index; i < argc; ++i) {
-        if (!command.empty()) {
-            command += L' ';
+    const std::wstring executable = direct_batch ? command_processor() : argv[native_index];
+    if (executable.empty()) {
+        DeleteProcThreadAttributeList(attributes);
+        return 3;
+    }
+    std::wstring command = direct_batch ? batch_command(argc, argv, executable) : L"";
+    if (!direct_batch) {
+        for (int i = native_index; i < argc; ++i) {
+            if (!command.empty()) {
+                command += L' ';
+            }
+            command += quote_argument(argv[i]);
         }
-        command += quote_argument(argv[i]);
     }
     STARTUPINFOEXW startup{};
     startup.StartupInfo.cb = sizeof(startup);
@@ -237,7 +296,7 @@ int wmain(int argc, wchar_t** argv)
     const DWORD console = GetConsoleCP() != 0 ? 0 : CREATE_NO_WINDOW;
     const bool started = UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         inherited, sizeof(inherited), nullptr, nullptr) &&
-        CreateProcessW(argv[native_index], command.data(), nullptr, nullptr, TRUE,
+        CreateProcessW(direct_batch ? nullptr : executable.c_str(), command.data(), nullptr, nullptr, TRUE,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | console,
             nullptr, nullptr, &startup.StartupInfo, &process);
     DeleteProcThreadAttributeList(attributes);
