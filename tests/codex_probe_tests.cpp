@@ -114,6 +114,7 @@ addon::Json_value current_account_observation(const addon::Json_value& account,
         requests.find("rateLimits") == std::string::npos, "identity acquisition is independent of quota");
     check(exchange.consume(response(2, account)) && exchange.consume(response(3, authentication)),
         "native current-account responses");
+    check(exchange.close_input(), "complete native pair closes input before its EOF tail");
     check(exchange.consume(tail) && exchange.finish(), "settled native AUTH transcript");
     return exchange.observation();
 }
@@ -196,7 +197,7 @@ void current_account_helper_keeps_native_output_private(
 {
     const auto utf8 = [](const auto& path) { const auto bytes = path.u8string(); return std::string(bytes.begin(), bytes.end()); };
     Context context;
-    for (const char* scenario : {"success", "unsupported"}) {
+    for (const char* scenario : {"success", "unsupported", "readiness", "changed", "repeated", "after-close"}) {
         const auto output = codex::run_probe({utf8(helper), "--current-account", utf8(executable),
             std::string("--fixture-identity=") + scenario}, {}, "", 5000, context);
         check(output && output->errors.empty(), "native AUTH stderr is private, including its EOF tail");
@@ -205,8 +206,19 @@ void current_account_helper_keeps_native_output_private(
         const auto payload = addon::parse_json(output->output, {}, nullptr);
         check(payload && payload->find("state") && *payload->find("state") == addon::Json_value("authenticated"),
             "unsupported identity does not discard independent native authentication evidence");
-        check((payload->find("identity_key") != nullptr) == (std::string_view(scenario) == "success"),
+        const bool identity_expected = std::string_view(scenario) != "unsupported" &&
+            std::string_view(scenario) != "after-close";
+        check((payload->find("identity_key") != nullptr) == identity_expected,
             "identity is present only after supported coherent native evidence");
+        if (identity_expected) {
+            const bool changed = std::string_view(scenario) == "changed" || std::string_view(scenario) == "repeated";
+            const auto expected = current_account_observation(
+                changed ? codex_fixture::account("changed-workspace") : codex_fixture::account(),
+                changed ? codex_fixture::authentication(codex_fixture::token("changed-user", "changed-workspace"))
+                    : codex_fixture::authentication());
+            check(*payload->find("identity_key") == *expected.find("identity_key"),
+                "native helper resynchronizes startup readiness and repeated real account changes");
+        }
     }
     for (const char* scenario : {"malformed", "native-failure"}) {
         codex::Probe_exchange observer;
@@ -219,6 +231,71 @@ void current_account_helper_keeps_native_output_private(
             std::string("--fixture-identity=") + scenario}, {}, "", 5000, context, &observer);
         check(!output, "malformed protocol and failed native exit retain failure semantics");
         check(exposed.find("secret") == std::string::npos, "failure paths cannot forward malformed token-bearing output");
+    }
+}
+
+void current_account_identity_reobserves_after_account_notifications()
+{
+    // Native startup announces completed workspace routing with account/updated.
+    // The same notification also covers real changes, so neither ignoring it
+    // nor permanently rejecting an otherwise authenticated profile is sound.
+    const auto response = [](int id, const addon::Json_value& result) {
+        auto message = addon::Json_value::object();
+        message.set("id", addon::Json_value(id));
+        message.set("result", result);
+        return addon::serialize_json(message) + '\n';
+    };
+    constexpr std::string_view notification = "{\"method\":\"account/updated\",\"params\":{}}\n";
+    for (const auto& [changed, auth_first] : {std::pair{false, false}, std::pair{false, true},
+        std::pair{true, false}, std::pair{true, true}})
+    {
+        codex::Current_account_exchange exchange;
+        check(exchange.consume("{\"id\":1,\"result\":{}}\n"), "AUTH initializes before identity reads");
+        exchange.take_input();
+        const auto first = auth_first ? response(3, codex_fixture::authentication()) : response(2, codex_fixture::account());
+        const auto second = auth_first ? response(2, codex_fixture::account()) : response(3, codex_fixture::authentication());
+        check(exchange.consume(first) && exchange.consume(notification) && exchange.consume(second),
+            "native routing readiness can arrive between account and token responses");
+        check(!exchange.close_input(), "account notification requires fresh native evidence before EOF");
+        const auto requests = exchange.take_input();
+        check(requests.find("\"id\":4") != std::string::npos && requests.find("\"id\":5") != std::string::npos &&
+            requests.find("account/read") != std::string::npos && requests.find("getAuthStatus") != std::string::npos,
+            "fresh account and token requests use distinct response IDs in the same native process");
+        const auto account = changed ? codex_fixture::account("changed-workspace") : codex_fixture::account();
+        const auto auth = changed ? codex_fixture::authentication(codex_fixture::token("changed-user", "changed-workspace"))
+            : codex_fixture::authentication();
+        check(exchange.consume(response(5, auth)) && exchange.consume(response(4, account)) &&
+            exchange.close_input() && exchange.finish(), "fresh account and token pair settles independently of reply order");
+        const auto observed = exchange.observation();
+        const auto expected = current_account_observation(account, auth);
+        check(observed.find("identity_key") && *observed.find("identity_key") == *expected.find("identity_key"),
+            "fresh evidence preserves readiness aliases and follows actual principal/workspace changes");
+        check(exchange.consume(notification) && exchange.finish() && !exchange.observation().find("identity_key"),
+            "a change after native input closes revokes identity without attempting another request");
+        check(exchange.take_input().empty(), "EOF cannot enqueue an unanswerable identity request");
+    }
+    for (const int error_id : {0, 4, 5}) {
+        codex::Current_account_exchange exchange;
+        check(exchange.consume("{\"id\":1,\"result\":{}}\n"), "AUTH initializes before interrupted reads");
+        exchange.take_input();
+        check(exchange.consume(response(2, codex_fixture::account()) +
+            response(3, codex_fixture::authentication()) + std::string(notification)) && !exchange.close_input(),
+            "notification in the final response buffer is observed before native input closes");
+        exchange.take_input();
+        if (error_id == 0) {
+            check(!exchange.finish() && !exchange.observation().find("identity_key"),
+                "EOF while fresh evidence is pending cannot publish the earlier identity");
+            continue;
+        }
+        const std::string error = "{\"id\":" + std::to_string(error_id) +
+            ",\"error\":{\"code\":-32601,\"message\":\"unsupported\"}}\n";
+        check(exchange.consume(error) && exchange.consume(error_id == 4
+                ? response(5, codex_fixture::authentication()) : response(4, codex_fixture::account())) &&
+            exchange.close_input() && exchange.finish(), "fresh response errors settle without reviving old evidence");
+        const auto observed = exchange.observation();
+        check(!observed.find("identity_key") &&
+            *observed.find("state") == addon::Json_value(error_id == 4 ? "authenticated" : "unknown"),
+            "optional account failure preserves independent authentication; auth failure remains unknown");
     }
 }
 
@@ -731,6 +808,7 @@ int main(int argc, char** argv)
     try {
         auth_output_is_exact_and_never_echoes_credentials();
         current_account_identity_uses_selected_principal_workspace_and_backend();
+        current_account_identity_reobserves_after_account_notifications();
         current_account_helper_keeps_native_output_private(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         quota_protocol_and_optional_windows();
         quota_errors_remain_redacted();

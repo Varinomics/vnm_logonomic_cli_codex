@@ -114,6 +114,19 @@ std::string current_identity(const addon::Json_value& account, const addon::Json
 
 } // namespace
 
+void Current_account_exchange::request_current_account()
+{
+    m_account_received = false;
+    m_auth_received = false;
+    m_account_changed = false;
+    m_account.reset();
+    m_auth.reset();
+    m_input += "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(m_account_request_id) +
+        ",\"method\":\"account/read\",\"params\":{\"refreshToken\":false}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(m_account_request_id + 1) +
+        ",\"method\":\"getAuthStatus\",\"params\":{\"includeToken\":true,\"refreshToken\":false}}\n";
+}
+
 bool Current_account_exchange::record(std::string_view line)
 {
     if (line.find_first_not_of(" \t\r\n") == std::string_view::npos) {
@@ -135,7 +148,7 @@ bool Current_account_exchange::record(std::string_view line)
         if (!method->is_string() || method->as_string().empty() || id || result || error) {
             return false;
         }
-        if ((m_account_received || m_auth_received) && method->as_string() == "account/updated") {
+        if (m_initialized && method->as_string() == "account/updated") {
             m_account_changed = true;
         }
         return true;
@@ -160,18 +173,16 @@ bool Current_account_exchange::record(std::string_view line)
             return false;
         }
         m_initialized = true;
-        m_input = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n"
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/read\",\"params\":{\"refreshToken\":false}}\n"
-            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"getAuthStatus\","
-            "\"params\":{\"includeToken\":true,\"refreshToken\":false}}\n";
+        m_input = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n";
+        request_current_account();
         return true;
     }
-    if (matches_id(*id, 2) && !m_account_received) {
+    if (matches_id(*id, m_account_request_id) && !m_account_received) {
         m_account_received = true;
         if (result) m_account = *result;
         return true;
     }
-    if (matches_id(*id, 3) && !m_auth_received) {
+    if (matches_id(*id, m_account_request_id + 1) && !m_auth_received) {
         m_auth_received = true;
         if (result) m_auth = *result;
         return true;
@@ -198,6 +209,14 @@ bool Current_account_exchange::consume(std::string_view bytes)
             m_failed = true;
             return false;
         }
+        if (m_account_received && m_auth_received && m_account_changed && !m_input_closed) {
+            // account/updated also announces initial workspace routing. Read a
+            // fresh pair after either event instead of treating readiness as an
+            // unknown account or publishing evidence from before a real change.
+            // The existing native deadline and stream bound govern this exchange.
+            m_account_request_id += 2;
+            request_current_account();
+        }
         begin = end + 1;
     }
     m_pending.erase(0, begin);
@@ -206,6 +225,7 @@ bool Current_account_exchange::consume(std::string_view bytes)
 
 bool Current_account_exchange::finish()
 {
+    m_input_closed = true;
     m_failed = m_failed || !record(m_pending);
     m_pending.clear();
     return !m_failed && m_account_received && m_auth_received;
@@ -216,9 +236,10 @@ std::string Current_account_exchange::take_input()
     return std::exchange(m_input, {});
 }
 
-bool Current_account_exchange::close_input() const
+bool Current_account_exchange::close_input()
 {
-    return m_failed || (m_account_received && m_auth_received);
+    m_input_closed = m_input_closed || m_failed || (m_account_received && m_auth_received);
+    return m_input_closed;
 }
 
 addon::Json_value Current_account_exchange::observation() const

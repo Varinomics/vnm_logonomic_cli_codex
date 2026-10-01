@@ -16,17 +16,20 @@ public:
     bool consume(std::string_view bytes);
     bool finish();
     std::string take_input();
-    bool close_input() const;
+    bool close_input();
     logonomic::cli_addon::Json_value observation() const;
 
 private:
     bool record(std::string_view line);
+    void request_current_account();
 
     bool m_initialized = false;
     bool m_failed = false;
     bool m_account_received = false;
     bool m_auth_received = false;
     bool m_account_changed = false;
+    bool m_input_closed = false;
+    int m_account_request_id = 2;
     std::size_t m_output_bytes = 0;
     std::string m_pending;
     std::string m_input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{"

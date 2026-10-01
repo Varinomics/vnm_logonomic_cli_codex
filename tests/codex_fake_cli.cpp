@@ -165,7 +165,8 @@ int main(int argc, char** argv)
                 std::cout << "{\"id\":2,\"error\":{\"code\":-32601,\"message\":\"secret-error-canary\"}}\n" << std::flush;
                 continue;
             }
-            result = codex_fixture::account();
+            result = (identity_scenario == "changed" || identity_scenario == "repeated") && *id != Json(2)
+                ? codex_fixture::account("changed-workspace") : codex_fixture::account();
         }
         else if (method == "getAuthStatus" && !identity_scenario.empty()) {
             const auto* params = message->find("params");
@@ -175,7 +176,9 @@ int main(int argc, char** argv)
             {
                 return 21;
             }
-            result = codex_fixture::authentication();
+            result = (identity_scenario == "changed" || identity_scenario == "repeated") && *id != Json(3)
+                ? codex_fixture::authentication(codex_fixture::token("changed-user", "changed-workspace"))
+                : codex_fixture::authentication();
             std::cerr << "secret-stderr-canary\n" << std::flush;
             if (identity_scenario == "malformed") {
                 std::cout << "secret-malformed-canary\n" << std::flush;
@@ -192,11 +195,18 @@ int main(int argc, char** argv)
             result = object({{"thread", object({{"id", Json(k_session)}, {"path", Json(std::string(path.begin(), path.end()))}})}});
         }
         std::cout << addon::serialize_json(object({{"id", *id}, {"result", result}})) << '\n' << std::flush;
+        if (method == "account/read" &&
+            (((identity_scenario == "readiness" || identity_scenario == "changed" || identity_scenario == "repeated") &&
+                *id == Json(2)) || (identity_scenario == "repeated" && *id == Json(4))))
+        {
+            std::cout << "{\"method\":\"account/updated\",\"params\":{}}\n" << std::flush;
+        }
         if (method == "thread/resume" && !endpoint.empty()) send_observation(endpoint, defect);
     }
     if (!identity_scenario.empty()) {
         std::cerr << "secret-stderr-tail-canary\n";
         std::cout << "{\"method\":\"fixture/privateNotification\",\"params\":{\"token\":\"secret-notification-canary\"}}\n";
+        if (identity_scenario == "after-close") std::cout << "{\"method\":\"account/updated\",\"params\":{}}\n";
         if (identity_scenario == "native-failure") return 19;
     }
     if (!quota_scenario.empty()) {
