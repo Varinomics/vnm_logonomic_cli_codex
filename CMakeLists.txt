@@ -63,6 +63,7 @@ add_library(codex_provider STATIC
     src/codex_lifecycle.cpp
     src/codex_preparation.cpp
     src/codex_probes.cpp
+    src/codex_quota_exchange.cpp
     src/codex_startup_observation.cpp
     src/codex_startup_probe.cpp
     src/codex_usage.cpp
@@ -82,6 +83,8 @@ add_executable(codex_helper src/codex_helper.cpp)
 codex_target(codex_helper)
 logonomic_cli_addon_add_launch_bridge(codex_launch_bridge)
 codex_target(codex_launch_bridge)
+add_executable(codex_quota_helper src/codex_quota_helper.cpp src/codex_quota_exchange.cpp)
+codex_target(codex_quota_helper)
 
 logonomic_cli_addon_package_platform(CODEX_PLATFORM)
 set(CODEX_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
@@ -111,12 +114,13 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_adapter>" "${CODEX_PACKAGE_DIRECTORY}/adapter/codex_adapter${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_helper>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_helper${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_launch_bridge>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_launch_bridge${CODEX_EXECUTABLE_SUFFIX}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_quota_helper>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_quota_helper${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${CODEX_PACKAGE_DIRECTORY}"
         --third-party "assets/openai.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
         --third-party "assets/openai-white.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
-    DEPENDS codex_adapter codex_helper codex_launch_bridge logonomic_cli_addon_index
+    DEPENDS codex_adapter codex_helper codex_launch_bridge codex_quota_helper logonomic_cli_addon_index
         "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
     VERBATIM)
 add_custom_target(codex_package ALL DEPENDS "${CODEX_PACKAGE_DIRECTORY}/package.files.json")
@@ -146,8 +150,8 @@ foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup
     target_link_libraries(${test_name} PRIVATE codex_provider)
     codex_target(${test_name})
     if(test_name STREQUAL "codex_probe_tests")
-        add_dependencies(${test_name} codex_fake_cli)
-        add_test(NAME ${test_name} COMMAND ${test_name} "$<TARGET_FILE:codex_fake_cli>")
+        add_dependencies(${test_name} codex_fake_cli codex_quota_helper)
+        add_test(NAME ${test_name} COMMAND ${test_name} "$<TARGET_FILE:codex_fake_cli>" "$<TARGET_FILE:codex_quota_helper>")
     elseif(test_name STREQUAL "codex_usage_tests" OR test_name STREQUAL "codex_lifecycle_tests")
         add_dependencies(${test_name} codex_package)
         add_test(NAME ${test_name} COMMAND ${test_name} "${CODEX_PACKAGE_DIRECTORY}")

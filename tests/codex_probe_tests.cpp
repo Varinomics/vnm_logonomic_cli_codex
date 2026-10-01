@@ -69,14 +69,14 @@ void auth_output_is_exact_and_never_echoes_credentials()
 void quota_protocol_and_optional_windows()
 {
     addon::Probe_inspect_request request;
-    request.inspection.protocol_state = "await_initialize";
+    request.inspection.protocol_state = "await_exit";
     request.inspection.stdout_bytes = "{\"id\":\"1\",\"result\":{}}\n";
     std::string failure;
     auto result = codex::inspect_quota(request, &failure);
-    check(!result.complete && result.protocol_state == "await_quota" && result.stdin_bytes, "initialization advances through stdin");
-    check(result.stdin_bytes->find("account/rateLimits/read") != std::string::npos, "native quota method");
-    request.inspection.protocol_state = result.protocol_state;
-    request.inspection.stdout_bytes = "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":null,"
+    check(!result.complete && !result.observation, "quota waits for the native process and streams to settle");
+    request.inspection.final = true;
+    request.inspection.exit_code = 0;
+    request.inspection.stdout_bytes += "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":null,"
         "\"secondary\":{\"usedPercent\":12.5,\"windowDurationMins\":10080,\"resetsAt\":1800000000},"
         "\"planType\":\"plus\",\"credits\":{\"balance\":\"12.3400\"}},"
         "\"rateLimitResetCredits\":{\"availableCount\":2}}}\n";
@@ -88,7 +88,8 @@ void quota_protocol_and_optional_windows()
     addon::Contract_failure codec_failure;
     check(addon::decode_quota_inspect_result(addon::encode_quota_inspect_result(result, 2), false, &codec_failure, 2).has_value(),
         "quota result public codec");
-    request.inspection.stdout_bytes = "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":1,\"windowDurationMins\":0}}}}\n";
+    request.inspection.stdout_bytes = "{\"id\":1,\"result\":{}}\n"
+        "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":1,\"windowDurationMins\":0}}}}\n";
     result = codex::inspect_quota(request, &failure);
     check(result.observation->state == addon::Quota_status::READY && !result.observation->primary->window_minutes,
         "native zero duration has no positive window metadata");
@@ -97,7 +98,10 @@ void quota_protocol_and_optional_windows()
 void quota_errors_remain_redacted()
 {
     addon::Probe_inspect_request request;
-    request.inspection.stdout_bytes = "{\"id\":2,\"error\":{\"message\":\"token secret-canary expired with 401\"}}\n";
+    request.inspection.final = true;
+    request.inspection.exit_code = 0;
+    request.inspection.stdout_bytes = "{\"id\":1,\"result\":{}}\n"
+        "{\"id\":2,\"error\":{\"code\":-32000,\"message\":\"token secret-canary expired with 401\"}}\n";
     std::string failure;
     auto result = codex::inspect_quota(request, &failure);
     check(result.complete && result.observation->state == addon::Quota_status::FAILED && failure == "authentication_required",
@@ -105,13 +109,70 @@ void quota_errors_remain_redacted()
     result.failure_reason = failure;
     const auto encoded = addon::serialize_json(addon::encode_quota_inspect_result(result, 2));
     check(encoded.find("secret-canary") == std::string::npos, "quota errors stay redacted");
-    request.inspection.stdout_bytes = "{\"id\":2,\"error\":{\"message\":\"token is near expiry\"}}\n";
+    request.inspection.stdout_bytes = "{\"id\":1,\"result\":{}}\n"
+        "{\"id\":2,\"error\":{\"code\":-32000,\"message\":\"token is near expiry\"}}\n";
     failure.clear();
     codex::inspect_quota(request, &failure);
     check(failure.empty(), "credential mention alone is not rejection");
     request.inspection.stdout_bytes.clear();
     request.inspection.final = true;
     check(codex::inspect_quota(request, &failure).complete, "final missing response cannot remain pending");
+}
+
+void quota_requires_a_settled_valid_exchange()
+{
+    const std::string transcript = "{\"id\":1,\"result\":{}}\n"
+        "{\"method\":\"remoteControl/status/changed\",\"params\":{}}\n"
+        "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":12.5}}}}\n";
+    const std::string notification = "{\"method\":\"account/updated\",\"params\":{}}";
+    addon::Probe_inspect_request request;
+    request.inspection.stdout_bytes = transcript + notification;
+    std::string failure;
+    check(!codex::inspect_quota(request, &failure).complete, "a quota response cannot end a live native stream");
+    request.inspection.final = true;
+    request.inspection.exit_code = 0;
+    check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::READY,
+        "valid notifications after the response survive final inspection, including a complete EOF record");
+    request.inspection.timed_out = true;
+    check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::FAILED,
+        "a valid reply cannot hide a native timeout");
+    request.inspection.timed_out = false;
+    request.inspection.exit_code = 19;
+    check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::FAILED,
+        "a valid reply cannot hide a failed native exit");
+    request.inspection.exit_code = 0;
+    for (const std::string tail : {"{", "{\"id\":2,\"result\":{}}",
+        "{\"id\":17,\"method\":\"account/refresh\",\"params\":{}}"})
+    {
+        request.inspection.stdout_bytes = transcript + tail;
+        check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::FAILED,
+            "malformed records, duplicate responses and unanswered server requests remain failures");
+    }
+}
+
+void quota_helper_drains_native_completion(
+    const std::filesystem::path& executable, const std::filesystem::path& helper)
+{
+    const auto utf8 = [](const auto& path) { const auto bytes = path.u8string(); return std::string(bytes.begin(), bytes.end()); };
+    Context context;
+    // The observed native exchange responds with quota, then account/updated.
+    // This fixture emits the notification after stdin EOF, without any sleeps.
+    const auto output = codex::run_probe(
+        {utf8(helper), utf8(executable), "--fixture-quota=notification"}, {}, "", 5000, context);
+    check(output.has_value(), "quota helper closes stdin and waits for the real child's successful exit");
+    check(output->output.find("account/updated") != std::string::npos,
+        "the actual helper preserves native output emitted after quota completion");
+    addon::Probe_inspect_request request;
+    request.inspection.final = true;
+    request.inspection.exit_code = 0;
+    request.inspection.stdout_bytes = output->output;
+    std::string failure;
+    check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::READY,
+        "the helper's settled native transcript yields usable quota");
+    for (const char* scenario : {"malformed", "native-failure", "initialize-error", "server-request"}) {
+        check(!codex::run_probe({utf8(helper), utf8(executable), std::string("--fixture-quota=") + scenario},
+            {}, "", 5000, context), "quota helper preserves protocol and native failure");
+    }
 }
 
 void account_resolution_uses_frozen_origin()
@@ -512,7 +573,8 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         const auto result = addon::decode_structured_prepare_result(context.output, &failure, 2);
         check(context.succeeded && result.has_value(), "probe preparation through actual dispatch and public codec");
         check(result->process.executable.kind == addon::Process_executable::Kind::PACKAGE_PATH &&
-            result->process.executable.path.starts_with("helpers/codex_launch_bridge"), "probe uses package bridge instead of frozen shell argv0");
+            result->process.executable.path.starts_with(quota ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge"),
+            "probe uses its package-owned native lifecycle helper");
         check(std::filesystem::equivalent(logonomic::cli_addon::path_from_utf8(result->process.argv.front()), executable),
             "recognized Codex executable preserved");
         check(result->process.argv[1] == (quota ? "app-server" : "login"), "native probe operation preserved");
@@ -522,8 +584,9 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         };
         check(contains("OPENAI_API_KEY", "frozen-credential-canary") && contains("CODEX_HOME", profile), "frozen account and auth environment preserved");
         check(result->account_context && result->account_context->profile_path == profile, "selected account locator echoed");
-        check(result->inspection.keep_stdin_open == quota && result->inspection.incremental == quota,
-            "quota alone keeps host-owned stdin open for continuation");
+        check(!result->inspection.keep_stdin_open && !result->inspection.incremental &&
+            result->process.stdin_behavior == addon::Stdin_behavior::CLOSED,
+            "probe inspection waits for native completion; the quota helper owns its child's exchange");
     }
 }
 
@@ -531,11 +594,13 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) return 2;
+    if (argc != 3) return 2;
     try {
         auth_output_is_exact_and_never_echoes_credentials();
         quota_protocol_and_optional_windows();
         quota_errors_remain_redacted();
+        quota_requires_a_settled_valid_exchange();
+        quota_helper_drains_native_completion(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         account_resolution_uses_frozen_origin();
         accounts_are_named_after_their_profile_folders();
         launcher_discovery_returns_authenticated_codex_profiles(

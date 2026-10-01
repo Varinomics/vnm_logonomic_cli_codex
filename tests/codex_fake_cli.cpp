@@ -108,6 +108,8 @@ int main(int argc, char** argv)
         return 0;
     }
     std::string endpoint;
+    std::string quota_scenario;
+    bool quota_received = false;
     bool configured_exporter = false;
     // Model an intrinsic producer defect across the isolated native probe.
     // User -c arguments are intentionally omitted by that probe.
@@ -115,6 +117,7 @@ int main(int argc, char** argv)
     std::string defect = fixture_defect ? fixture_defect : "";
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
+        if (argument.starts_with("--fixture-quota=")) quota_scenario = argument.substr(16);
 #ifndef _WIN32
         if (argument == "--fixture-custody") { std::cout << getpgrp() << ':' << getsid(0) << '\n'; return 0; }
 #endif
@@ -143,7 +146,15 @@ int main(int argc, char** argv)
         const auto method = text(*message, "method");
         Json result = Json::object();
         if (method == "initialize") {
+            if (quota_scenario == "initialize-error") {
+                std::cout << "{\"id\":1,\"error\":{\"code\":-32600,\"message\":\"Initialization failed\"}}\n" << std::flush;
+                continue;
+            }
             result = object({{"userAgent", Json("codex-fixture")}});
+        }
+        else if (method == "account/rateLimits/read") {
+            quota_received = true;
+            result = object({{"rateLimits", object({{"primary", object({{"usedPercent", Json(12.5)}})}})}});
         }
         else if (method == "config/read") {
             result = object({{"config", object({{"fixture_observer", Json(defect)}, {"otel", object({{"exporter", Json(configured_exporter ? "existing" : "none")}})}})}});
@@ -156,6 +167,13 @@ int main(int argc, char** argv)
         }
         std::cout << addon::serialize_json(object({{"id", *id}, {"result", result}})) << '\n' << std::flush;
         if (method == "thread/resume" && !endpoint.empty()) send_observation(endpoint, defect);
+    }
+    if (!quota_scenario.empty()) {
+        if (!quota_received) return 19;
+        if (quota_scenario == "malformed") std::cout << '{';
+        else if (quota_scenario == "server-request") std::cout << "{\"id\":17,\"method\":\"account/refresh\",\"params\":{}}\n";
+        else std::cout << "{\"method\":\"account/updated\",\"params\":{}}\n";
+        if (quota_scenario == "native-failure") return 19;
     }
     return 0;
 }

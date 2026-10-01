@@ -1,6 +1,7 @@
 #include "codex_probes.h"
 #include "codex_accounts.h"
 #include "codex_launcher.h"
+#include "codex_quota_exchange.h"
 
 #include <chrono>
 #include <cmath>
@@ -32,23 +33,6 @@ addon::Observation_scope scope(const addon::Probe_inspect_request& request)
     result.observed_at_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     return result;
-}
-
-std::optional<addon::Json_value> response_for_id(std::string_view output, int id)
-{
-    while (!output.empty()) {
-        const auto end = output.find('\n');
-        const auto line = trimmed(output.substr(0, end));
-        const auto value = addon::parse_json(line, {}, nullptr);
-        if (value && value->is_object()) {
-            const auto& identifier = member(*value, "id");
-            if ((identifier.is_number() && identifier.as_number() == id) ||
-                (identifier.is_string() && identifier.as_string() == std::to_string(id))) return value;
-        }
-        if (end == std::string_view::npos) break;
-        output.remove_prefix(end + 1);
-    }
-    return std::nullopt;
 }
 
 bool authentication_required(const addon::Json_value& error)
@@ -132,12 +116,19 @@ addon::Auth_inspect_result inspect_auth(const addon::Probe_inspect_request& requ
 addon::Quota_inspect_result inspect_quota(const addon::Probe_inspect_request& request, std::string* failure_reason)
 {
     addon::Quota_inspect_result result;
-    const auto response = response_for_id(request.inspection.stdout_bytes, 2);
-    if (response) {
-        result.complete = true;
-        addon::Quota_observation observation;
-        observation.scope = scope(request);
-        observation.state = addon::Quota_status::FAILED;
+    result.complete = request.inspection.final;
+    if (!result.complete) {
+        result.protocol_state = request.inspection.protocol_state;
+        return result;
+    }
+    addon::Quota_observation observation;
+    observation.scope = scope(request);
+    observation.state = addon::Quota_status::FAILED;
+    Quota_exchange exchange;
+    if (!request.inspection.timed_out && request.inspection.exit_code == 0 &&
+        exchange.consume(request.inspection.stdout_bytes) && exchange.finish())
+    {
+        const auto& response = exchange.response();
         const auto& error = member(*response, "error");
         const auto& payload = member(*response, "result");
         const auto& limits = member(payload, "rateLimits");
@@ -157,23 +148,8 @@ addon::Quota_inspect_result inspect_quota(const addon::Probe_inspect_request& re
                 observation.reset_credits = static_cast<std::int64_t>(count);
             }
         }
-        result.observation = observation;
-        return result;
     }
-    if (!request.inspection.final && request.inspection.protocol_state == "await_initialize" &&
-        response_for_id(request.inspection.stdout_bytes, 1)) {
-        result.protocol_state = "await_quota";
-        result.stdin_bytes = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n"
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}\n";
-        return result;
-    }
-    result.complete = request.inspection.final;
-    if (result.complete) {
-        addon::Quota_observation observation;
-        observation.scope = scope(request);
-        observation.state = addon::Quota_status::FAILED;
-        result.observation = std::move(observation);
-    } else result.protocol_state = request.inspection.protocol_state;
+    result.observation = std::move(observation);
     return result;
 }
 
@@ -195,9 +171,9 @@ void handle_probes(addon::Invocation_context& context)
         if (!argv) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_program_unavailable"); return; }
         addon::Structured_prepare_result result;
 #if defined(_WIN32)
-        result.process.executable = "helpers/codex_launch_bridge.exe";
+        result.process.executable = quota ? "helpers/codex_quota_helper.exe" : "helpers/codex_launch_bridge.exe";
 #else
-        result.process.executable = "helpers/codex_launch_bridge";
+        result.process.executable = quota ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge";
 #endif
         result.process.argv = *argv;
         const bool windows = environment.platform_id.starts_with("windows-");
@@ -210,14 +186,7 @@ void handle_probes(addon::Invocation_context& context)
         assign_environment(&result.process.environment, "CODEX_HOME", selected->profile_path, windows);
         result.profile_storage = request->context.profile_storage;
         result.account_context = request->context.account_context;
-        result.inspection.protocol_state = quota ? "await_initialize" : "await_exit";
-        if (quota) {
-            result.inspection.incremental = true;
-            result.inspection.keep_stdin_open = true;
-            result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
-            result.process.stdin_payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{"
-                "\"clientInfo\":{\"name\":\"logonomic\",\"version\":\"0\"},\"capabilities\":{\"experimentalApi\":true}}}\n";
-        }
+        result.inspection.protocol_state = "await_exit";
         context.succeed(addon::encode_structured_prepare_result(result, 2));
         return;
     }
