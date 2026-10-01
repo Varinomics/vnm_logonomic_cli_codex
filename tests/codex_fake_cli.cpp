@@ -1,6 +1,8 @@
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/package_source.h>
 
+#include "codex_current_account_fixture.h"
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -109,6 +111,7 @@ int main(int argc, char** argv)
     }
     std::string endpoint;
     std::string quota_scenario;
+    std::string identity_scenario;
     bool quota_received = false;
     bool configured_exporter = false;
     // Model an intrinsic producer defect across the isolated native probe.
@@ -118,6 +121,7 @@ int main(int argc, char** argv)
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument.starts_with("--fixture-quota=")) quota_scenario = argument.substr(16);
+        if (argument.starts_with("--fixture-identity=")) identity_scenario = argument.substr(19);
 #ifndef _WIN32
         if (argument == "--fixture-custody") { std::cout << getpgrp() << ':' << getsid(0) << '\n'; return 0; }
 #endif
@@ -156,6 +160,28 @@ int main(int argc, char** argv)
             quota_received = true;
             result = object({{"rateLimits", object({{"primary", object({{"usedPercent", Json(12.5)}})}})}});
         }
+        else if (method == "account/read" && !identity_scenario.empty()) {
+            if (identity_scenario == "unsupported") {
+                std::cout << "{\"id\":2,\"error\":{\"code\":-32601,\"message\":\"secret-error-canary\"}}\n" << std::flush;
+                continue;
+            }
+            result = codex_fixture::account();
+        }
+        else if (method == "getAuthStatus" && !identity_scenario.empty()) {
+            const auto* params = message->find("params");
+            if (!params || !params->find("includeToken") ||
+                *params->find("includeToken") != Json(true) ||
+                !params->find("refreshToken") || *params->find("refreshToken") != Json(false))
+            {
+                return 21;
+            }
+            result = codex_fixture::authentication();
+            std::cerr << "secret-stderr-canary\n" << std::flush;
+            if (identity_scenario == "malformed") {
+                std::cout << "secret-malformed-canary\n" << std::flush;
+                continue;
+            }
+        }
         else if (method == "config/read") {
             result = object({{"config", object({{"fixture_observer", Json(defect)}, {"otel", object({{"exporter", Json(configured_exporter ? "existing" : "none")}})}})}});
         }
@@ -167,6 +193,11 @@ int main(int argc, char** argv)
         }
         std::cout << addon::serialize_json(object({{"id", *id}, {"result", result}})) << '\n' << std::flush;
         if (method == "thread/resume" && !endpoint.empty()) send_observation(endpoint, defect);
+    }
+    if (!identity_scenario.empty()) {
+        std::cerr << "secret-stderr-tail-canary\n";
+        std::cout << "{\"method\":\"fixture/privateNotification\",\"params\":{\"token\":\"secret-notification-canary\"}}\n";
+        if (identity_scenario == "native-failure") return 19;
     }
     if (!quota_scenario.empty()) {
         if (!quota_received) return 19;

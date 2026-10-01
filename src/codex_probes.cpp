@@ -3,9 +3,14 @@
 #include "codex_launcher.h"
 #include "codex_quota_exchange.h"
 
+#include <logonomic_cli_addon/current_account.h>
+#include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/sha256.h>
+
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <filesystem>
 
 namespace codex {
 namespace {
@@ -101,6 +106,41 @@ addon::Auth_inspect_result inspect_auth(const addon::Probe_inspect_request& requ
     if (!result.complete) { result.protocol_state = request.inspection.protocol_state; return result; }
     addon::Auth_observation observation;
     observation.scope = scope(request);
+    if (request.observe_current_account) {
+        if (!request.inspection.timed_out && request.inspection.exit_code == 0) {
+            const auto payload = addon::parse_json(request.inspection.stdout_bytes, {}, nullptr);
+            if (payload && member(*payload, "version") == addon::Json_value(1)) {
+                const auto& state = member(*payload, "state");
+                if (state == addon::Json_value("authenticated")) {
+                    observation.state = addon::Auth_status::AUTHENTICATED;
+                    const auto& key = member(*payload, "identity_key");
+                    constexpr std::string_view prefix = "codex-current-";
+                    if (key.is_string() && key.as_string().starts_with(prefix) &&
+                        addon::sha256_from_hex(std::string_view(key.as_string()).substr(prefix.size())) &&
+                        request.account_context && request.account_context->profile_path)
+                    {
+                        addon::Current_account_observation identity;
+                        identity.scope = observation.scope;
+                        identity.identity_key = key.as_string();
+                        const auto filename = addon::path_from_utf8(*request.account_context->profile_path)
+                            .lexically_normal().filename().generic_u8string();
+                        std::string name(filename.begin(), filename.end());
+#ifdef _WIN32
+                        name = addon::ascii_lowercase(name);
+#endif
+                        identity.is_default_profile = name == ".codex";
+                        result.current_account = std::move(identity);
+                    }
+                }
+                else
+                if (state == addon::Json_value("not_logged_in")) {
+                    observation.state = addon::Auth_status::NOT_LOGGED_IN;
+                }
+            }
+        }
+        result.observation = std::move(observation);
+        return result;
+    }
     if (!request.inspection.timed_out && request.inspection.exit_code == 0) {
         observation.state = addon::Auth_status::AUTHENTICATED;
     }
@@ -166,16 +206,20 @@ void handle_probes(addon::Invocation_context& context)
         const auto command = recognize_launcher(request->context.launcher.script_body);
         if (!command) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_unrecognized"); return; }
         const auto& environment = *request->context.launch_environment;
-        const auto argv = resolve_probe_launcher(*command, quota ? std::vector<std::string>{"app-server", "--stdio"} :
+        const bool current_account = !quota && request->observe_current_account;
+        const auto argv = resolve_probe_launcher(*command, quota || current_account ? std::vector<std::string>{"app-server", "--stdio"} :
             std::vector<std::string>{"login", "status"}, environment.effective_environment, request->context.working_directory);
         if (!argv) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_program_unavailable"); return; }
         addon::Structured_prepare_result result;
 #if defined(_WIN32)
-        result.process.executable = quota ? "helpers/codex_quota_helper.exe" : "helpers/codex_launch_bridge.exe";
+        result.process.executable = quota || current_account ? "helpers/codex_quota_helper.exe" : "helpers/codex_launch_bridge.exe";
 #else
-        result.process.executable = quota ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge";
+        result.process.executable = quota || current_account ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge";
 #endif
         result.process.argv = *argv;
+        if (current_account) {
+            result.process.argv.insert(result.process.argv.begin(), "--current-account");
+        }
         const bool windows = environment.platform_id.starts_with("windows-");
         for (const auto& item : environment.effective_environment.as_object()) {
             assign_environment(&result.process.environment, item.name, item.value.as_string(), windows);

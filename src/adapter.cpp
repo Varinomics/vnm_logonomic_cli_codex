@@ -169,6 +169,7 @@ int main()
         {"interactive-resume", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3},
+        {"current-account", 1},
         {addon::k_usage_cross_source_event_capability_id, addon::k_usage_cross_source_event_version},
         {"legacy-state-import", 1},
     };

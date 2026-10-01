@@ -1,6 +1,8 @@
 #include <logonomic_cli_addon/package_source.h>
 #include "codex_accounts.h"
+#include "codex_current_account.h"
 #include "codex_probes.h"
+#include "codex_current_account_fixture.h"
 
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/limits.h>
@@ -16,6 +18,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -93,6 +96,130 @@ void quota_protocol_and_optional_windows()
     result = codex::inspect_quota(request, &failure);
     check(result.observation->state == addon::Quota_status::READY && !result.observation->primary->window_minutes,
         "native zero duration has no positive window metadata");
+}
+
+addon::Json_value current_account_observation(const addon::Json_value& account,
+    const addon::Json_value& authentication, std::string_view tail = {})
+{
+    const auto response = [](int id, const addon::Json_value& result) {
+        auto message = addon::Json_value::object();
+        message.set("id", addon::Json_value(id));
+        message.set("result", result);
+        return addon::serialize_json(message) + '\n';
+    };
+    codex::Current_account_exchange exchange;
+    check(exchange.consume("{\"id\":1,\"result\":{}}\n"), "native AUTH initialization");
+    const auto requests = exchange.take_input();
+    check(requests.find("account/read") != std::string::npos && requests.find("getAuthStatus") != std::string::npos &&
+        requests.find("rateLimits") == std::string::npos, "identity acquisition is independent of quota");
+    check(exchange.consume(response(2, account)) && exchange.consume(response(3, authentication)),
+        "native current-account responses");
+    check(exchange.consume(tail) && exchange.finish(), "settled native AUTH transcript");
+    return exchange.observation();
+}
+
+void current_account_identity_uses_selected_principal_workspace_and_backend()
+{
+    // Oracle: the native selected credential plus account/read routing, not
+    // email, plan or the profile path, decides current account equality.
+    const auto account = codex_fixture::account();
+    const auto auth = codex_fixture::authentication();
+    const auto observed = current_account_observation(account, auth);
+    check(observed.find("identity_key") && *observed.find("state") == addon::Json_value("authenticated"),
+        "complete native authority yields current identity");
+    const auto key = *observed.find("identity_key");
+    auto rotated = auth;
+    rotated.set("authToken", addon::Json_value(codex_fixture::token() + "-rotated"));
+    check(*current_account_observation(account, rotated).find("identity_key") == key,
+        "credential rotation does not change the stable current identity");
+    for (const auto& other : {
+        current_account_observation(account, codex_fixture::authentication(codex_fixture::token("other-user"))),
+        current_account_observation(codex_fixture::account("other-workspace"),
+            codex_fixture::authentication(codex_fixture::token("user-fixture", "other-workspace"))),
+        current_account_observation(codex_fixture::account("workspace-fixture", "https://other.example.test"), auth)})
+    {
+        check(other.find("identity_key") && *other.find("identity_key") != key,
+            "different principal, workspace or backend remains separate");
+    }
+    const auto mismatched = current_account_observation(codex_fixture::account("other-workspace"), auth);
+    check(!mismatched.find("identity_key"), "incoherent selected token and native workspace cannot group accounts");
+    auto missing_user = codex_fixture::authentication(codex_fixture::token(""));
+    check(!current_account_observation(account, missing_user).find("identity_key"),
+        "missing native principal is unknown instead of grouping by email");
+    auto opaque = auth;
+    opaque.set("authToken", addon::Json_value("opaque-secret-canary"));
+    check(!current_account_observation(account, opaque).find("identity_key"), "opaque credential cannot invent identity");
+    for (const char* method : {"headers", "agentIdentity", "personalAccessToken", "chatgpt"}) {
+        auto private_auth = auth;
+        private_auth.set("authMethod", addon::Json_value(method));
+        private_auth.set("authToken", addon::Json_value());
+        const auto private_observation = current_account_observation(account, private_auth);
+        check(*private_observation.find("state") == addon::Json_value("authenticated") &&
+            !private_observation.find("identity_key"), "nonexportable native credentials retain authentication without identity");
+    }
+    const auto changed = current_account_observation(account, auth,
+        "{\"method\":\"account/updated\",\"params\":{}}\n");
+    check(!changed.find("identity_key"), "a later account change revokes the captured identity");
+    const auto encoded = addon::serialize_json(observed);
+    for (const char* private_text : {"secret", "private-email", "workspace-fixture", "user-fixture", "chatgpt.com"}) {
+        check(encoded.find(private_text) == std::string::npos, "private native account data stays inside the helper");
+    }
+
+    addon::Probe_inspect_request request;
+    request.observe_current_account = true;
+    request.inspection.final = true;
+    request.inspection.exit_code = 0;
+    request.inspection.stdout_bytes = encoded;
+    request.account_context = addon::Account_context{2, "profile-default"};
+    request.account_context->profile_path = "/fixture/.codex";
+    auto first = codex::inspect_auth(request);
+    check(first.current_account && first.current_account->is_default_profile &&
+        first.current_account->scope.source_account_key == "profile-default", "identity retains its source profile");
+    request.account_context->adapter_account_key = "profile-named";
+    request.account_context->profile_path = "/fixture/.codex-dev";
+    auto second = codex::inspect_auth(request);
+    check(second.current_account && !second.current_account->is_default_profile &&
+        second.current_account->identity_key == first.current_account->identity_key &&
+        second.current_account->scope.source_account_key == "profile-named", "aliases remain independent historical sources");
+    request.inspection.final = false;
+    check(!codex::inspect_auth(request).current_account, "live helper output is not accepted before native retirement");
+    request.inspection.final = true;
+    request.inspection.exit_code = 19;
+    check(!codex::inspect_auth(request).current_account, "failed native exit cannot publish identity");
+    request.inspection.exit_code = 0;
+    request.inspection.timed_out = true;
+    check(!codex::inspect_auth(request).current_account, "timed-out native observation cannot publish identity");
+}
+
+void current_account_helper_keeps_native_output_private(
+    const std::filesystem::path& executable, const std::filesystem::path& helper)
+{
+    const auto utf8 = [](const auto& path) { const auto bytes = path.u8string(); return std::string(bytes.begin(), bytes.end()); };
+    Context context;
+    for (const char* scenario : {"success", "unsupported"}) {
+        const auto output = codex::run_probe({utf8(helper), "--current-account", utf8(executable),
+            std::string("--fixture-identity=") + scenario}, {}, "", 5000, context);
+        check(output && output->errors.empty(), "native AUTH stderr is private, including its EOF tail");
+        check(output->output.find("secret") == std::string::npos && output->output.find("private-email") == std::string::npos,
+            "native token, unknown fields, errors and notifications never enter helper stdout");
+        const auto payload = addon::parse_json(output->output, {}, nullptr);
+        check(payload && payload->find("state") && *payload->find("state") == addon::Json_value("authenticated"),
+            "unsupported identity does not discard independent native authentication evidence");
+        check((payload->find("identity_key") != nullptr) == (std::string_view(scenario) == "success"),
+            "identity is present only after supported coherent native evidence");
+    }
+    for (const char* scenario : {"malformed", "native-failure"}) {
+        codex::Probe_exchange observer;
+        std::string exposed;
+        observer.on_output = [&exposed](std::string_view bytes) {
+            exposed.append(bytes);
+            return std::optional<std::string>("");
+        };
+        const auto output = codex::run_probe({utf8(helper), "--current-account", utf8(executable),
+            std::string("--fixture-identity=") + scenario}, {}, "", 5000, context, &observer);
+        check(!output, "malformed protocol and failed native exit retain failure semantics");
+        check(exposed.find("secret") == std::string::npos, "failure paths cannot forward malformed token-bearing output");
+    }
 }
 
 void quota_errors_remain_redacted()
@@ -565,7 +692,11 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
     account.adapter_account_key = codex::profile_account_key(profile);
     account.profile_path = profile;
     request.context.account_context = account;
-    for (const bool quota : {false, true}) {
+    for (const auto& [quota, observe_current_account] : {
+        std::pair{false, false}, std::pair{false, true}, std::pair{true, false}, std::pair{true, true}})
+    {
+        request.observe_current_account = observe_current_account;
+        const bool current_account = observe_current_account && !quota;
         Context context;
         context.input = {"probe", {quota ? "quota" : "auth-status", 2}, "prepare", addon::encode_probe_prepare_request(request, 2)};
         codex::handle_probes(context);
@@ -573,11 +704,13 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         const auto result = addon::decode_structured_prepare_result(context.output, &failure, 2);
         check(context.succeeded && result.has_value(), "probe preparation through actual dispatch and public codec");
         check(result->process.executable.kind == addon::Process_executable::Kind::PACKAGE_PATH &&
-            result->process.executable.path.starts_with(quota ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge"),
+            result->process.executable.path.starts_with(quota || current_account ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge"),
             "probe uses its package-owned native lifecycle helper");
-        check(std::filesystem::equivalent(logonomic::cli_addon::path_from_utf8(result->process.argv.front()), executable),
+        const std::size_t program_index = current_account ? 1 : 0;
+        check(!current_account || result->process.argv.front() == "--current-account", "AUTH private mode is explicit");
+        check(std::filesystem::equivalent(logonomic::cli_addon::path_from_utf8(result->process.argv[program_index]), executable),
             "recognized Codex executable preserved");
-        check(result->process.argv[1] == (quota ? "app-server" : "login"), "native probe operation preserved");
+        check(result->process.argv[program_index + 1] == (quota || current_account ? "app-server" : "login"), "native probe operation preserved");
         const auto contains = [&](std::string_view name, std::string_view value) {
             for (const auto& entry : result->process.environment) if (entry.first == name && entry.second == value) return true;
             return false;
@@ -597,6 +730,8 @@ int main(int argc, char** argv)
     if (argc != 3) return 2;
     try {
         auth_output_is_exact_and_never_echoes_credentials();
+        current_account_identity_uses_selected_principal_workspace_and_backend();
+        current_account_helper_keeps_native_output_private(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         quota_protocol_and_optional_windows();
         quota_errors_remain_redacted();
         quota_requires_a_settled_valid_exchange();

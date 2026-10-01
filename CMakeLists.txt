@@ -57,6 +57,7 @@ endfunction()
 
 add_library(codex_provider STATIC
     src/codex_accounts.cpp
+    src/codex_current_account.cpp
     src/codex_jsonl.cpp
     src/codex_jsonl_projector.cpp
     src/codex_launcher.cpp
@@ -83,7 +84,7 @@ add_executable(codex_helper src/codex_helper.cpp)
 codex_target(codex_helper)
 logonomic_cli_addon_add_launch_bridge(codex_launch_bridge)
 codex_target(codex_launch_bridge)
-add_executable(codex_quota_helper src/codex_quota_helper.cpp src/codex_quota_exchange.cpp)
+add_executable(codex_quota_helper src/codex_quota_helper.cpp src/codex_quota_exchange.cpp src/codex_current_account.cpp)
 codex_target(codex_quota_helper)
 if(MINGW)
     target_link_options(codex_quota_helper PRIVATE -municode)

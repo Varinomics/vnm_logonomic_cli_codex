@@ -1,8 +1,10 @@
 #include "codex_quota_exchange.h"
+#include "codex_current_account.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -12,6 +14,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -94,11 +97,12 @@ private:
     Stream m_value;
 };
 
+template<class Protocol>
 bool exchange(Stream input, Stream output, Stream forwarded_output)
 {
     Owned_stream child_input(input);
     Owned_stream child_output(output);
-    codex::Quota_exchange protocol;
+    Protocol protocol;
     bool healthy = write_stream(child_input.get(), protocol.take_input());
     if (!healthy) {
         child_input.reset();
@@ -107,9 +111,12 @@ bool exchange(Stream input, Stream output, Stream forwarded_output)
     int count = 0;
     while ((count = read_stream(child_output.get(), buffer, static_cast<int>(sizeof(buffer)))) > 0) {
         const std::string_view bytes(buffer, static_cast<std::size_t>(count));
-        // Preserve every record, including notifications after the quota reply.
-        // Host custody, cancellation and stream limits govern this descendant.
-        const bool forwarded = write_stream(forwarded_output, bytes);
+        // Quota keeps its established native transcript. The opted-in AUTH
+        // exchange contains a credential and must never forward native bytes.
+        bool forwarded = true;
+        if constexpr (std::is_same_v<Protocol, codex::Quota_exchange>) {
+            forwarded = write_stream(forwarded_output, bytes);
+        }
         const bool valid = protocol.consume(bytes);
         healthy = healthy && forwarded && valid;
         if (child_input.get() != k_closed) {
@@ -123,7 +130,21 @@ bool exchange(Stream input, Stream output, Stream forwarded_output)
             }
         }
     }
-    return healthy && count == 0 && protocol.finish();
+    if (!healthy || count != 0 || !protocol.finish()) {
+        return false;
+    }
+    if constexpr (std::is_same_v<Protocol, codex::Current_account_exchange>) {
+        return write_stream(forwarded_output,
+            logonomic::cli_addon::serialize_json(protocol.observation()));
+    }
+    return true;
+}
+
+bool exchange(Stream input, Stream output, Stream forwarded_output, bool current_account)
+{
+    return current_account
+        ? exchange<codex::Current_account_exchange>(input, output, forwarded_output)
+        : exchange<codex::Quota_exchange>(input, output, forwarded_output);
 }
 
 #ifdef _WIN32
@@ -150,7 +171,9 @@ std::wstring quote_argument(const std::wstring& argument)
 #ifdef _WIN32
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc < 2) {
+    const bool current_account = argc > 1 && std::wstring_view(argv[1]) == L"--current-account";
+    const int native_index = current_account ? 2 : 1;
+    if (argc <= native_index) {
         return 2;
     }
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
@@ -170,8 +193,19 @@ int wmain(int argc, wchar_t** argv)
     Owned_stream native_output(output_write);
     HANDLE errors = nullptr;
     if (!SetHandleInformation(input_write, HANDLE_FLAG_INHERIT, 0) ||
-        !SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0) ||
-        !DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(),
+        !SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0))
+    {
+        return 3;
+    }
+    if (current_account) {
+        errors = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (errors == INVALID_HANDLE_VALUE) {
+            return 3;
+        }
+    }
+    else
+    if (!DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(),
             &errors, 0, TRUE, DUPLICATE_SAME_ACCESS))
     {
         return 3;
@@ -186,7 +220,7 @@ int wmain(int argc, wchar_t** argv)
         return 3;
     }
     std::wstring command;
-    for (int i = 1; i < argc; ++i) {
+    for (int i = native_index; i < argc; ++i) {
         if (!command.empty()) {
             command += L' ';
         }
@@ -203,7 +237,7 @@ int wmain(int argc, wchar_t** argv)
     const DWORD console = GetConsoleCP() != 0 ? 0 : CREATE_NO_WINDOW;
     const bool started = UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         inherited, sizeof(inherited), nullptr, nullptr) &&
-        CreateProcessW(argv[1], command.data(), nullptr, nullptr, TRUE,
+        CreateProcessW(argv[native_index], command.data(), nullptr, nullptr, TRUE,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | console,
             nullptr, nullptr, &startup.StartupInfo, &process);
     DeleteProcThreadAttributeList(attributes);
@@ -217,7 +251,8 @@ int wmain(int argc, wchar_t** argv)
     native_errors.reset();
     // The native child inherits the host's Job and the frozen environment/cwd.
     // Keep the helper alive until the native stream and process both end.
-    const bool healthy = exchange(helper_input.release(), helper_output.release(), GetStdHandle(STD_OUTPUT_HANDLE));
+    const bool healthy = exchange(helper_input.release(), helper_output.release(),
+        GetStdHandle(STD_OUTPUT_HANDLE), current_account);
     DWORD exit_code = 3;
     if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0) {
         GetExitCodeProcess(process.hProcess, &exit_code);
@@ -231,7 +266,9 @@ int wmain(int argc, wchar_t** argv)
 #else
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
+    const bool current_account = argc > 1 && std::string_view(argv[1]) == "--current-account";
+    const int native_index = current_account ? 2 : 1;
+    if (argc <= native_index) {
         return 2;
     }
     int input[2];
@@ -254,6 +291,13 @@ int main(int argc, char** argv)
         if (dup2(input[0], STDIN_FILENO) < 0 || dup2(output[1], STDOUT_FILENO) < 0) {
             _exit(3);
         }
+        if (current_account) {
+            const int errors = open("/dev/null", O_WRONLY);
+            if (errors < 0 || dup2(errors, STDERR_FILENO) < 0) {
+                _exit(3);
+            }
+            if (errors != STDERR_FILENO) close(errors);
+        }
         if (input[0] != STDIN_FILENO) {
             close(input[0]);
         }
@@ -261,13 +305,13 @@ int main(int argc, char** argv)
         close(output[0]);
         close(output[1]);
         // No new process group: native Codex remains in the host's custody.
-        execv(argv[1], argv + 1);
+        execv(argv[native_index], argv + native_index);
         _exit(3);
     }
     signal(SIGPIPE, SIG_IGN);
     native_input.reset();
     native_output.reset();
-    const bool healthy = exchange(helper_input.release(), helper_output.release(), STDOUT_FILENO);
+    const bool healthy = exchange(helper_input.release(), helper_output.release(), STDOUT_FILENO, current_account);
     int status = 0;
     pid_t waited;
     do {
