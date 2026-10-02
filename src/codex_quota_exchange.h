@@ -1,12 +1,16 @@
 #pragma once
 
-#include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/quota.h>
 
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace codex {
+
+// Interpret one validated native response without assigning a host source scope.
+logonomic::cli_addon::Quota_inspect_result quota_response(
+    const logonomic::cli_addon::Json_value& response);
 
 // The helper drives this exchange; final inspection validates the same complete
 // transcript. A quota response ends requests, not the native output stream.

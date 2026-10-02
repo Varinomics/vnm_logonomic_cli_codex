@@ -1,5 +1,6 @@
 #include "codex_quota_exchange.h"
 #include "codex_current_account.h"
+#include "codex_account_refresh.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -118,6 +119,11 @@ bool exchange(Stream input, Stream output, Stream forwarded_output)
             forwarded = write_stream(forwarded_output, bytes);
         }
         const bool valid = protocol.consume(bytes);
+        if constexpr (std::is_same_v<Protocol, codex::Account_refresh_exchange>) {
+            // A validated quota stays publishable even if a later native record
+            // in the same read fails. Never forward the token-bearing transcript.
+            forwarded = write_stream(forwarded_output, protocol.take_output());
+        }
         healthy = healthy && forwarded && valid;
         if (child_input.get() != k_closed) {
             if (!healthy || protocol.close_input()) {
@@ -130,7 +136,11 @@ bool exchange(Stream input, Stream output, Stream forwarded_output)
             }
         }
     }
-    if (!healthy || count != 0 || !protocol.finish()) {
+    const bool finished = protocol.finish();
+    if constexpr (std::is_same_v<Protocol, codex::Account_refresh_exchange>) {
+        healthy = write_stream(forwarded_output, protocol.take_output()) && healthy;
+    }
+    if (!healthy || count != 0 || !finished) {
         return false;
     }
     if constexpr (std::is_same_v<Protocol, codex::Current_account_exchange>) {
@@ -140,8 +150,11 @@ bool exchange(Stream input, Stream output, Stream forwarded_output)
     return true;
 }
 
-bool exchange(Stream input, Stream output, Stream forwarded_output, bool current_account)
+bool exchange(Stream input, Stream output, Stream forwarded_output, bool current_account, bool account_refresh)
 {
+    if (account_refresh) {
+        return exchange<codex::Account_refresh_exchange>(input, output, forwarded_output);
+    }
     return current_account
         ? exchange<codex::Current_account_exchange>(input, output, forwarded_output)
         : exchange<codex::Quota_exchange>(input, output, forwarded_output);
@@ -187,21 +200,21 @@ std::wstring command_processor()
     return result + L"\\cmd.exe";
 }
 
-std::wstring batch_command(int argc, wchar_t** argv, const std::wstring& processor)
+std::wstring batch_command(int argc, wchar_t** argv, int native_index, const std::wstring& processor)
 {
     // Match Windows PowerShell's batch dispatch, including cmd's AutoRun and
     // expansion settings. CRT quoting would escape the command's inner quotes.
     std::wstring result = processor.find_first_of(L" \t") == std::wstring::npos
         ? processor : quote_argument(processor);
     result += L" /c \"\"";
-    result += argv[2];
+    result += argv[native_index];
     result += L'"';
     // Windows PowerShell uses .NET Char.IsWhiteSpace when binding native
     // arguments, including the Unicode separators that cmd does not split.
     constexpr std::wstring_view whitespace =
         L" \t\r\n\v\f\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004"
         L"\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000";
-    for (int index = 3; index < argc; ++index) {
+    for (int index = native_index + 1; index < argc; ++index) {
         const std::wstring_view argument(argv[index]);
         const bool quote = argument.find_first_of(whitespace) != std::wstring_view::npos;
         result += L' ';
@@ -222,9 +235,13 @@ std::wstring batch_command(int argc, wchar_t** argv, const std::wstring& process
 #ifdef _WIN32
 int wmain(int argc, wchar_t** argv)
 {
-    const bool current_account = argc > 1 && std::wstring_view(argv[1]) == L"--current-account";
-    const bool direct_batch = argc > 1 && std::wstring_view(argv[1]) == L"--batch";
-    const int native_index = current_account || direct_batch ? 2 : 1;
+    const bool account_refresh = argc > 1 && std::wstring_view(argv[1]) == L"--account-refresh-current";
+    const bool current_account = argc > 1 && (std::wstring_view(argv[1]) == L"--current-account" ||
+        std::wstring_view(argv[1]) == L"--account-refresh-current");
+    int native_index = account_refresh || current_account ? 2 : 1;
+    const bool direct_batch = (!current_account || account_refresh) &&
+        argc > native_index && std::wstring_view(argv[native_index]) == L"--batch";
+    if (direct_batch) ++native_index;
     if (argc <= native_index) {
         return 2;
     }
@@ -249,7 +266,7 @@ int wmain(int argc, wchar_t** argv)
     {
         return 3;
     }
-    if (current_account) {
+    if (current_account || account_refresh) {
         errors = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
             &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (errors == INVALID_HANDLE_VALUE) {
@@ -276,7 +293,7 @@ int wmain(int argc, wchar_t** argv)
         DeleteProcThreadAttributeList(attributes);
         return 3;
     }
-    std::wstring command = direct_batch ? batch_command(argc, argv, executable) : L"";
+    std::wstring command = direct_batch ? batch_command(argc, argv, native_index, executable) : L"";
     if (!direct_batch) {
         for (int i = native_index; i < argc; ++i) {
             if (!command.empty()) {
@@ -311,7 +328,7 @@ int wmain(int argc, wchar_t** argv)
     // The native child inherits the host's Job and the frozen environment/cwd.
     // Keep the helper alive until the native stream and process both end.
     const bool healthy = exchange(helper_input.release(), helper_output.release(),
-        GetStdHandle(STD_OUTPUT_HANDLE), current_account);
+        GetStdHandle(STD_OUTPUT_HANDLE), current_account, account_refresh);
     DWORD exit_code = 3;
     if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0) {
         GetExitCodeProcess(process.hProcess, &exit_code);
@@ -325,8 +342,10 @@ int wmain(int argc, wchar_t** argv)
 #else
 int main(int argc, char** argv)
 {
-    const bool current_account = argc > 1 && std::string_view(argv[1]) == "--current-account";
-    const int native_index = current_account ? 2 : 1;
+    const bool account_refresh = argc > 1 && std::string_view(argv[1]) == "--account-refresh-current";
+    const bool current_account = argc > 1 && (std::string_view(argv[1]) == "--current-account" ||
+        std::string_view(argv[1]) == "--account-refresh-current");
+    const int native_index = current_account || account_refresh ? 2 : 1;
     if (argc <= native_index) {
         return 2;
     }
@@ -350,7 +369,7 @@ int main(int argc, char** argv)
         if (dup2(input[0], STDIN_FILENO) < 0 || dup2(output[1], STDOUT_FILENO) < 0) {
             _exit(3);
         }
-        if (current_account) {
+        if (current_account || account_refresh) {
             const int errors = open("/dev/null", O_WRONLY);
             if (errors < 0 || dup2(errors, STDERR_FILENO) < 0) {
                 _exit(3);
@@ -370,7 +389,7 @@ int main(int argc, char** argv)
     signal(SIGPIPE, SIG_IGN);
     native_input.reset();
     native_output.reset();
-    const bool healthy = exchange(helper_input.release(), helper_output.release(), STDOUT_FILENO, current_account);
+    const bool healthy = exchange(helper_input.release(), helper_output.release(), STDOUT_FILENO, current_account, account_refresh);
     int status = 0;
     pid_t waited;
     do {

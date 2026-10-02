@@ -131,7 +131,9 @@ int main(int argc, char** argv)
     std::string endpoint;
     std::string quota_scenario;
     std::string identity_scenario;
+    std::string refresh_scenario;
     bool quota_received = false;
+    bool initialized = false;
     bool configured_exporter = false;
     // Model an intrinsic producer defect across the isolated native probe.
     // User -c arguments are intentionally omitted by that probe.
@@ -141,6 +143,10 @@ int main(int argc, char** argv)
         const std::string argument = argv[index];
         if (argument.starts_with("--fixture-quota=")) quota_scenario = argument.substr(16);
         if (argument.starts_with("--fixture-identity=")) identity_scenario = argument.substr(19);
+        if (argument.starts_with("--fixture-refresh=")) {
+            refresh_scenario = argument.substr(18);
+            identity_scenario = refresh_scenario;
+        }
 #ifndef _WIN32
         if (argument == "--fixture-custody") { std::cout << getpgrp() << ':' << getsid(0) << '\n'; return 0; }
 #endif
@@ -169,6 +175,8 @@ int main(int argc, char** argv)
         const auto method = text(*message, "method");
         Json result = Json::object();
         if (method == "initialize") {
+            if (initialized) return 22;
+            initialized = true;
             if (quota_scenario == "initialize-error") {
                 std::cout << "{\"id\":1,\"error\":{\"code\":-32600,\"message\":\"Initialization failed\"}}\n" << std::flush;
                 continue;
@@ -176,18 +184,34 @@ int main(int argc, char** argv)
             result = object({{"userAgent", Json("codex-fixture")}});
         }
         else if (method == "account/rateLimits/read") {
+            if (!initialized || quota_received) return 22;
             quota_received = true;
+            if (refresh_scenario == "quota-error") {
+                std::cout << addon::serialize_json(object({{"id", *id}, {"error", object({
+                    {"code", Json(-32000)}, {"message", Json("secret-token-canary expired 401")}})}})) << '\n' << std::flush;
+                continue;
+            }
             result = object({{"rateLimits", object({{"primary", object({{"usedPercent", Json(12.5)}})}})}});
         }
         else if (method == "account/read" && !identity_scenario.empty()) {
+            if (!refresh_scenario.empty() && !quota_received) return 22;
             if (identity_scenario == "unsupported") {
-                std::cout << "{\"id\":2,\"error\":{\"code\":-32601,\"message\":\"secret-error-canary\"}}\n" << std::flush;
+                std::cout << addon::serialize_json(object({{"id", *id}, {"error", object({
+                    {"code", Json(-32601)}, {"message", Json("secret-error-canary")}})}})) << '\n' << std::flush;
                 continue;
             }
-            result = (identity_scenario == "changed" || identity_scenario == "repeated") && *id != Json(2)
+            result = (identity_scenario == "changed" || identity_scenario == "repeated") && *id != Json(quota_received ? 3 : 2)
                 ? codex_fixture::account("changed-workspace") : codex_fixture::account();
         }
         else if (method == "getAuthStatus" && !identity_scenario.empty()) {
+            if (!refresh_scenario.empty() && !quota_received) return 22;
+            if (const char* gate = std::getenv("CODEX_FIXTURE_AUTH_GATE")) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                while (!std::filesystem::exists(addon::path_from_utf8(gate))) {
+                    if (std::chrono::steady_clock::now() >= deadline) return 23;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
             const auto* params = message->find("params");
             if (!params || !params->find("includeToken") ||
                 *params->find("includeToken") != Json(true) ||
@@ -195,7 +219,7 @@ int main(int argc, char** argv)
             {
                 return 21;
             }
-            result = (identity_scenario == "changed" || identity_scenario == "repeated") && *id != Json(3)
+            result = (identity_scenario == "changed" || identity_scenario == "repeated") && *id != Json(quota_received ? 4 : 3)
                 ? codex_fixture::authentication(codex_fixture::token("changed-user", "changed-workspace"))
                 : codex_fixture::authentication();
             std::cerr << "secret-stderr-canary\n" << std::flush;
@@ -216,7 +240,8 @@ int main(int argc, char** argv)
         std::cout << addon::serialize_json(object({{"id", *id}, {"result", result}})) << '\n' << std::flush;
         if (method == "account/read" &&
             (((identity_scenario == "readiness" || identity_scenario == "changed" || identity_scenario == "repeated") &&
-                *id == Json(2)) || (identity_scenario == "repeated" && *id == Json(4))))
+                *id == Json(quota_received ? 3 : 2)) ||
+                (identity_scenario == "repeated" && *id == Json(quota_received ? 5 : 4))))
         {
             std::cout << "{\"method\":\"account/updated\",\"params\":{}}\n" << std::flush;
         }

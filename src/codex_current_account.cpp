@@ -114,6 +114,14 @@ std::string current_identity(const addon::Json_value& account, const addon::Json
 
 } // namespace
 
+Current_account_exchange::Current_account_exchange(int first_request_id)
+    : m_initialized(true), m_account_request_id(first_request_id)
+{
+    // A fresh shared cycle has already initialized this native process for quota.
+    m_input.clear();
+    request_current_account();
+}
+
 void Current_account_exchange::request_current_account()
 {
     m_account_received = false;

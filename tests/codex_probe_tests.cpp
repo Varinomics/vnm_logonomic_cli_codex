@@ -1,10 +1,12 @@
 #include <logonomic_cli_addon/package_source.h>
 #include "codex_accounts.h"
+#include "codex_account_refresh.h"
 #include "codex_current_account.h"
 #include "codex_probes.h"
 #include "codex_current_account_fixture.h"
 
 #include <logonomic_cli_addon/accounts.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/presentation_record.h>
@@ -34,12 +36,18 @@ public:
     addon::Json_value output;
     bool succeeded = false;
     bool done = false;
+    std::optional<addon::Result_status> failure_status;
     const addon::Invoke_request& request() const override { return input; }
     bool cancel_requested() const override { return false; }
     bool wait_for_cancel(int timeout) override { std::this_thread::sleep_for(std::chrono::milliseconds(timeout)); return false; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
     void succeed(addon::Json_value value) override { succeeded = true; done = true; output = std::move(value); }
-    void fail(addon::Result_status, std::string reason, std::string) override { done = true; output = addon::Json_value(std::move(reason)); }
+    void fail(addon::Result_status status, std::string reason, std::string) override
+    {
+        done = true;
+        failure_status = status;
+        output = addon::Json_value(std::move(reason));
+    }
     bool finished() const override { return done; }
 };
 
@@ -380,6 +388,155 @@ void quota_helper_drains_native_completion(
         check(!codex::run_probe({utf8(helper), utf8(executable), std::string("--fixture-quota=") + scenario},
             {}, "", 5000, context), "quota helper preserves protocol and native failure");
     }
+}
+
+void account_refresh_reuses_native_protocol_and_publishes_quota_first()
+{
+    const auto response = [](int id, const addon::Json_value& result) {
+        auto value = addon::Json_value::object();
+        value.set("id", addon::Json_value(id));
+        value.set("result", result);
+        return addon::serialize_json(value) + '\n';
+    };
+    codex::Account_refresh_exchange exchange;
+    check(exchange.take_input().find("initialize") != std::string::npos, "shared cycle initializes one native process");
+    check(exchange.consume("{\"id\":1,\"result\":{}}\n"), "shared native initialization");
+    check(exchange.take_input().find("account/rateLimits/read") != std::string::npos, "shared cycle requests quota first");
+    const std::string quota = "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":12.5}},"
+        "\"rateLimitResetCredits\":{\"availableCount\":2}}}\n";
+    for (const char byte : quota) check(exchange.consume(std::string_view(&byte, 1)), "fragmented native quota response");
+    const auto progress = exchange.take_output();
+    check(progress.find("\"kind\":\"quota\"") != std::string::npos && progress.find("reset_credits") != std::string::npos,
+        "sanitized quota including reset credits publishes before AUTH");
+    check(!exchange.close_input(), "quota completion leaves the one native input open for AUTH");
+    const auto requests = exchange.take_input();
+    check(requests.find("initialize") == std::string::npos && requests.find("\"id\":3") != std::string::npos &&
+        requests.find("\"id\":4") != std::string::npos, "AUTH reuses native initialization with distinct IDs");
+    check(exchange.consume(response(3, codex_fixture::account()) +
+        "{\"method\":\"account/updated\",\"params\":{}}\n" + response(4, codex_fixture::authentication())),
+        "shared identity receives native routing notification");
+    check(!exchange.close_input() && exchange.take_input().find("\"id\":5") != std::string::npos,
+        "shared cycle retains native current-account resynchronization");
+    check(exchange.consume(response(6, codex_fixture::authentication()) + response(5, codex_fixture::account())) &&
+        exchange.close_input() && exchange.take_output().empty(), "AUTH waits for native stream completion");
+    check(exchange.finish(), "one shared native stream completes");
+    const auto auth = exchange.take_output();
+    check(auth.find("identity_key") != std::string::npos && auth.find("secret") == std::string::npos,
+        "shared stream exports only sanitized native identity");
+
+    addon::Probe_inspect_request request;
+    request.observe_current_account = true;
+    request.account_context = addon::Account_context{2, "selected-source"};
+    request.account_context->profile_path = "/fixture/.codex";
+    int quota_count = 0;
+    for (const char byte : progress + auth) {
+        request.inspection.stdout_bytes.assign(1, byte);
+        const auto update = codex::inspect_account_refresh(request);
+        check(update && !update->complete && !update->auth, "partial sanitized records cannot complete native AUTH");
+        if (update->quota) {
+            ++quota_count;
+            check(update->quota->observation->scope.source_account_key == "selected-source" &&
+                update->quota->observation->reset_credits == 2, "quota is scoped to its independent source");
+        }
+        request.inspection.protocol_state = update->protocol_state;
+    }
+    check(quota_count == 1, "fragmented quota progress publishes once");
+    request.inspection.stdout_bytes.clear();
+    request.inspection.final = true;
+    auto final = codex::inspect_account_refresh(request);
+    check(final && final->complete && !final->quota && final->auth->current_account &&
+        final->auth->current_account->scope.source_account_key == "selected-source", "successful native completion admits AUTH identity");
+    check(addon::decode_account_refresh_inspect_result(addon::encode_account_refresh_inspect_result(*final), true, nullptr).has_value(),
+        "shared final result satisfies the independently versioned public codec");
+    request.observe_current_account = false;
+    check(!codex::inspect_account_refresh(request)->auth->current_account, "optional identity support remains independently negotiated");
+    request.observe_current_account = true;
+    for (const bool timed_out : {false, true}) {
+        request.inspection.timed_out = timed_out;
+        request.inspection.exit_code = timed_out ? 0 : 19;
+        final = codex::inspect_account_refresh(request);
+        check(final && !final->quota && final->auth->observation->state == addon::Auth_status::UNKNOWN &&
+            !final->auth->current_account, "later native failure cannot authenticate or replace already published quota");
+    }
+    for (const std::string& bytes : {progress + progress, auth, progress + auth + auth,
+        progress + "{\"kind\":\"auth\",\"result\":{\"version\":1,\"state\":\"authenticated\",\"secret\":\"canary\"}}\n"})
+    {
+        addon::Probe_inspect_request invalid;
+        invalid.inspection.stdout_bytes = bytes;
+        check(!codex::inspect_account_refresh(invalid), "duplicate, out-of-order and private helper records are rejected");
+    }
+    addon::Probe_inspect_request missing;
+    missing.inspection.final = true;
+    final = codex::inspect_account_refresh(missing);
+    check(final && final->quota->observation->state == addon::Quota_status::FAILED &&
+        final->auth->observation->state == addon::Auth_status::UNKNOWN, "missing observations settle explicitly without a second native child");
+    missing.inspection.stdout_bytes = progress + "{";
+    check(!codex::inspect_account_refresh(missing), "truncated helper output is rejected at EOF");
+
+    codex::Account_refresh_exchange broken;
+    broken.take_input();
+    check(broken.consume("{\"id\":1,\"result\":{}}\n"), "native failure fixture initializes");
+    broken.take_input();
+    check(!broken.consume(quota + "secret-malformed-canary\n") && broken.close_input(),
+        "malformed later native output closes requests without a retry process");
+    const auto retained = broken.take_output();
+    check(retained.find("\"kind\":\"quota\"") != std::string::npos && retained.find("secret") == std::string::npos &&
+        !broken.finish() && broken.take_output().empty(), "valid quota survives a bad tail in the same native read");
+    codex::Account_refresh_exchange overflowing;
+    check(!overflowing.consume(std::string(addon::limits::k_max_structured_stream_bytes + 1, 'x')) &&
+        overflowing.close_input() && overflowing.take_output().empty(), "shared private native output retains the established stream bound");
+}
+
+void account_refresh_helper_preserves_early_quota_and_private_completion(
+    const std::filesystem::path& executable, const std::filesystem::path& helper)
+{
+    const auto gate = std::filesystem::temp_directory_path() /
+        ("codex-auth-gate-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Context context;
+    for (const char* scenario : {"success", "readiness", "changed", "repeated", "unsupported", "after-close",
+        "quota-error", "malformed", "native-failure"})
+    {
+        std::filesystem::remove(gate);
+        codex::Probe_exchange observer;
+        std::string exposed;
+        observer.on_output = [&](std::string_view bytes) {
+            exposed.assign(bytes);
+            if (exposed.find('\n') != std::string::npos) {
+                addon::Probe_inspect_request request;
+                request.inspection.stdout_bytes = exposed.substr(0, exposed.find('\n') + 1);
+                const auto first = codex::inspect_account_refresh(request);
+                check(first && first->quota && !first->auth && !first->complete,
+                    "actual helper quota progress precedes the blocked native AUTH response");
+                std::ofstream(gate) << "quota-observed";
+            }
+            return std::optional<std::string>("");
+        };
+        const auto output = codex::run_probe({addon::path_to_utf8(helper), "--account-refresh-current",
+            addon::path_to_utf8(executable), std::string("--fixture-refresh=") + scenario},
+            {{"CODEX_FIXTURE_AUTH_GATE", addon::path_to_utf8(gate)}}, "", 5000, context, &observer);
+        const bool success = std::string_view(scenario) != "malformed" && std::string_view(scenario) != "native-failure";
+        check(output.has_value() == success, "shared helper preserves malformed-native and native-exit failure");
+        check(!output || output->errors.empty(), "native shared-cycle stderr remains private");
+        for (const char* secret : {"secret", "private-email", "workspace-fixture", "user-fixture", "chatgpt.com"}) {
+            check(exposed.find(secret) == std::string::npos, "raw credentials, claims, errors and notifications stay private");
+        }
+        addon::Probe_inspect_request request;
+        request.observe_current_account = true;
+        request.account_context = addon::Account_context{2, "selected-source"};
+        request.account_context->profile_path = "/fixture/.codex";
+        request.inspection.stdout_bytes = exposed;
+        request.inspection.final = true;
+        request.inspection.exit_code = success ? 0 : 19;
+        const auto result = codex::inspect_account_refresh(request);
+        check(result && result->quota && result->quota->observation->state ==
+            (std::string_view(scenario) == "quota-error" ? addon::Quota_status::FAILED : addon::Quota_status::READY),
+            "validated quota survives later native AUTH failure");
+        const bool grouped = success && std::string_view(scenario) != "unsupported" && std::string_view(scenario) != "after-close";
+        check(result->auth->current_account.has_value() == grouped, "shared helper preserves coherent optional identity and EOF invalidation");
+        check(result->auth->observation->state == (success ? addon::Auth_status::AUTHENTICATED : addon::Auth_status::UNKNOWN),
+            "shared native authentication retains its separate final disposition");
+    }
+    std::filesystem::remove(gate);
 }
 
 void account_resolution_uses_frozen_origin()
@@ -801,6 +958,44 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
             result->process.stdin_behavior == addon::Stdin_behavior::CLOSED,
             "probe inspection waits for native completion; the quota helper owns its child's exchange");
     }
+    for (const bool identity : {false, true}) {
+        request.observe_current_account = identity;
+        Context context;
+        context.input = {"shared", {addon::k_account_refresh_capability_id, 1}, "prepare",
+            addon::encode_account_refresh_prepare_request(request)};
+        codex::handle_probes(context);
+        if (!identity) {
+            check(!context.succeeded && context.failure_status == addon::Result_status::UNAVAILABLE &&
+                context.output == addon::Json_value("account_refresh_requires_current_account"),
+                "absent optional identity declines shared refresh without a native process proposal");
+            for (const char* capability : {"auth-status", "quota"}) {
+                Context legacy;
+                legacy.input = {"legacy", {capability, 2}, "prepare", addon::encode_probe_prepare_request(request, 2)};
+                codex::handle_probes(legacy);
+                const auto separate = addon::decode_structured_prepare_result(legacy.output, nullptr, 2);
+                check(legacy.succeeded && separate && !separate->inspection.incremental,
+                    "declined shared admission leaves the separate native quota and AUTH routes usable");
+                check(std::string_view(capability) != "auth-status" || separate->process.argv[1] == "login",
+                    "ordinary AUTH retains native login-status semantics after shared admission declines");
+            }
+            continue;
+        }
+        const auto result = addon::decode_structured_prepare_result(context.output, nullptr, 2);
+        check(context.succeeded && result && result->inspection.incremental && result->inspection.protocol_state.empty() &&
+            !result->inspection.keep_stdin_open && result->process.stdin_behavior == addon::Stdin_behavior::CLOSED,
+            "shared progress uses the established process proposal while the helper owns native stdin");
+        check(result->process.argv.front() == "--account-refresh-current" &&
+            std::filesystem::equivalent(addon::path_from_utf8(result->process.argv[1]), executable) &&
+            result->process.argv[2] == "app-server", "shared refresh preserves the selected native executable");
+        check(result->account_context && result->account_context->profile_path == profile,
+            "shared refresh echoes the frozen source profile");
+        const auto has = [&](const std::string& name, const std::string& value) {
+            return std::find(result->process.environment.begin(), result->process.environment.end(), std::pair{name, value}) !=
+                result->process.environment.end();
+        };
+        check(has("OPENAI_API_KEY", "frozen-credential-canary") && has("CODEX_HOME", profile),
+            "shared refresh preserves the frozen native authority context");
+    }
 }
 
 #ifdef _WIN32
@@ -849,15 +1044,17 @@ void quota_batch_dispatch_matches_powershell(
         {
             codex::Launcher_command selected{addon::path_to_utf8(wrapper), prefix, {}};
             std::string baseline;
-            for (const bool direct_batch : {false, true}) {
+            for (const int mode : {0, 1, 2}) {
+                const bool direct_batch = mode != 0;
                 const auto resolved = codex::resolve_probe_launcher(
                     selected, {"app-server", "--stdio"}, frozen, addon::path_to_utf8(root), direct_batch);
                 check(resolved && (resolved->front() == "--batch") == direct_batch,
                     "quota selects native batch dispatch while AUTH retains PowerShell");
                 auto command = *resolved;
+                if (mode == 2) command.insert(command.begin(), "--account-refresh-current");
                 command.insert(command.begin(), addon::path_to_utf8(helper));
                 const auto output = codex::run_probe(command, environment, addon::path_to_utf8(root), 5000, context);
-                check(output && output->output.find("account/updated") != std::string::npos,
+                check(output && output->output.find(mode == 2 ? "\"kind\":\"quota\"" : "account/updated") != std::string::npos,
                     "selected batch preserves the complete quota response and native EOF tail");
                 std::ifstream input(receipt, std::ios::binary);
                 const std::string observed{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -893,6 +1090,9 @@ int main(int argc, char** argv)
         quota_errors_remain_redacted();
         quota_requires_a_settled_valid_exchange();
         quota_helper_drains_native_completion(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
+        account_refresh_reuses_native_protocol_and_publishes_quota_first();
+        account_refresh_helper_preserves_early_quota_and_private_completion(
+            std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         account_resolution_uses_frozen_origin();
         accounts_are_named_after_their_profile_folders();
         launcher_discovery_returns_authenticated_codex_profiles(

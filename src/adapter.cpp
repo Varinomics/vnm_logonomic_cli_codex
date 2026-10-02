@@ -98,7 +98,8 @@ void invoke(addon::Invocation_context& context)
             codex::handle_accounts(context);
         }
         else
-        if (request.capability.capability_id == "auth-status" || request.capability.capability_id == "quota") {
+        if (request.capability.capability_id == "auth-status" || request.capability.capability_id == "quota" ||
+            request.capability.capability_id == addon::k_account_refresh_capability_id) {
             codex::handle_probes(context);
         }
         else
@@ -170,6 +171,7 @@ int main()
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3},
         {"current-account", 1},
+        {addon::k_account_refresh_capability_id, addon::k_account_refresh_version},
         {addon::k_usage_cross_source_event_capability_id, addon::k_usage_cross_source_event_version},
         {"legacy-state-import", 1},
     };

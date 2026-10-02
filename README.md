@@ -100,6 +100,22 @@ opaque identity leave it. Authentication retains its own native exit, cancellati
 and deadline boundary, independently of quota. Without the opt-in, authentication
 continues to use native `login status`.
 
+With `account-refresh@1` negotiated, a full refresh uses one fresh native
+app-server for quota followed by authentication. Its host-selected launcher,
+profile, working directory and environment are chosen once; native configuration
+reloads, credential renewal and account-change resynchronization remain native
+decisions. Valid quota publishes before authentication and stays accepted if
+authentication or the later native exit fails. Authentication and optional
+`current-account@1` identity still require successful native completion. Codex
+admits this optimization only when current-account observation is requested:
+native app-server AUTH has different semantics from `login status` for custom
+providers. Otherwise preparation declines before native birth and the host keeps
+the separate quota and ordinary AUTH route. This is Codex's availability rule,
+not a dependency of the generic account-refresh capability. The helper emits only
+sanitized observations, and the host owns cancellation, each observation deadline
+and final retirement. Hosts without the shared capability also keep the separate
+quota and AUTH processes.
+
 A delegated implementation runs as `codex <launcher options> exec` and keeps the
 launcher's permission posture: its sandbox and approvals come from the
 launcher's own `--yolo`, `-c` settings or `-p` profile and from the user's

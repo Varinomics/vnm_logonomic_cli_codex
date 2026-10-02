@@ -4,11 +4,11 @@
 #include "codex_quota_exchange.h"
 
 #include <logonomic_cli_addon/current_account.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #include <chrono>
-#include <cmath>
 #include <cctype>
 #include <filesystem>
 
@@ -40,29 +40,20 @@ addon::Observation_scope scope(const addon::Probe_inspect_request& request)
     return result;
 }
 
-bool authentication_required(const addon::Json_value& error)
+bool auth_record_valid(const addon::Json_value& value)
 {
-    const auto& value = member(error, "message");
-    if (!value.is_string()) return false;
-    std::string message = value.as_string().substr(0, 4096);
-    for (auto& character : message) character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-    const auto contains = [&message](std::string_view needle) { return message.find(needle) != std::string::npos; };
-    bool status_401 = false;
-    for (auto offset = message.find("401"); offset != std::string::npos; offset = message.find("401", offset + 3)) {
-        const auto word = [](unsigned char value) { return std::isalnum(value) || value == '_'; };
-        if ((offset == 0 || !word(message[offset - 1])) &&
-            (offset + 3 == message.size() || !word(message[offset + 3]))) status_401 = true;
+    if (!value.is_object() || member(value, "version") != addon::Json_value(1)) return false;
+    for (const auto& entry : value.as_object()) {
+        if (entry.name != "version" && entry.name != "state" && entry.name != "identity_key") return false;
     }
-    return (contains("token") || contains("credential") || contains("authentication") ||
-        contains("authorization") || contains("login") || contains("log in") || contains("logged in")) &&
-        (status_401 || contains("unauthorized") || contains("revoked") || contains("expired") || contains("not logged in"));
-}
-
-bool whole_number(const addon::Json_value& value, double* number)
-{
-    if (!value.is_number()) return false;
-    *number = value.as_number();
-    return std::isfinite(*number) && *number >= 0 && *number <= 9007199254740991.0 && std::floor(*number) == *number;
+    const auto& state = member(value, "state");
+    if (state != addon::Json_value("authenticated") && state != addon::Json_value("not_logged_in") &&
+        state != addon::Json_value("unknown")) return false;
+    const auto* key = value.find("identity_key");
+    constexpr std::string_view prefix = "codex-current-";
+    return !key || (state == addon::Json_value("authenticated") && key->is_string() &&
+        key->as_string().starts_with(prefix) &&
+        addon::sha256_from_hex(std::string_view(key->as_string()).substr(prefix.size())).has_value());
 }
 
 void assign_environment(std::vector<std::pair<std::string, std::string>>* environment,
@@ -77,25 +68,6 @@ void assign_environment(std::vector<std::pair<std::string, std::string>>* enviro
     environment->emplace_back(std::move(name), std::move(value));
 }
 
-bool quota_window(const addon::Json_value& value, std::optional<addon::Quota_window>* output)
-{
-    if (value.is_null()) return true;
-    const auto& used = member(value, "usedPercent");
-    if (!value.is_object() || !used.is_number() || !std::isfinite(used.as_number())) return false;
-    addon::Quota_window window;
-    window.used_percent = used.as_number();
-    const auto& duration = member(value, "windowDurationMins");
-    double number = 0;
-    if (!duration.is_null()) {
-        if (!whole_number(duration, &number)) return false;
-        if (number > 0) window.window_minutes = static_cast<std::uint64_t>(number);
-    }
-    if (whole_number(member(value, "resetsAt"), &number) && number > 0 && number <= 9007199254740.0) {
-        window.resets_at_ms = static_cast<std::uint64_t>(number) * 1000;
-    }
-    *output = window;
-    return true;
-}
 
 } // namespace
 
@@ -161,35 +133,88 @@ addon::Quota_inspect_result inspect_quota(const addon::Probe_inspect_request& re
         result.protocol_state = request.inspection.protocol_state;
         return result;
     }
-    addon::Quota_observation observation;
-    observation.scope = scope(request);
-    observation.state = addon::Quota_status::FAILED;
     Quota_exchange exchange;
     if (!request.inspection.timed_out && request.inspection.exit_code == 0 &&
         exchange.consume(request.inspection.stdout_bytes) && exchange.finish())
     {
-        const auto& response = exchange.response();
-        const auto& error = member(*response, "error");
-        const auto& payload = member(*response, "result");
-        const auto& limits = member(payload, "rateLimits");
-        if (response->find("error")) {
-            if (authentication_required(error)) *failure_reason = "authentication_required";
+        result = quota_response(*exchange.response());
+        if (result.failure_reason) *failure_reason = *result.failure_reason;
+    }
+    else {
+        result.observation = addon::Quota_observation{};
+        result.observation->state = addon::Quota_status::FAILED;
+    }
+    result.observation->scope = scope(request);
+    return result;
+}
+
+std::optional<addon::Account_refresh_inspect_result> inspect_account_refresh(const addon::Probe_inspect_request& request)
+{
+    bool quota_received = false;
+    addon::Json_value auth;
+    std::string pending;
+    if (!request.inspection.protocol_state.empty()) {
+        const auto state = addon::parse_json(request.inspection.protocol_state, {}, nullptr);
+        if (!state || !state->is_object() || state->as_object().size() != 3 ||
+            !member(*state, "quota_received").is_boolean() || !member(*state, "pending").is_string() ||
+            !state->find("auth")) return {};
+        quota_received = member(*state, "quota_received").as_boolean();
+        pending = member(*state, "pending").as_string();
+        auth = member(*state, "auth");
+        if (!auth.is_null() && (!quota_received || !auth_record_valid(auth))) return {};
+    }
+    if (pending.size() > addon::limits::k_max_structured_stream_bytes ||
+        request.inspection.stdout_bytes.size() > addon::limits::k_max_structured_stream_bytes - pending.size()) return {};
+    pending += request.inspection.stdout_bytes;
+    addon::Account_refresh_inspect_result result;
+    result.complete = request.inspection.final;
+    std::size_t begin = 0;
+    for (auto end = pending.find('\n'); end != std::string::npos; end = pending.find('\n', begin)) {
+        const auto record = addon::parse_json(std::string_view(pending).substr(begin, end - begin), {}, nullptr);
+        if (!record || !record->is_object() || record->as_object().size() != 2 || !record->find("result")) return {};
+        const auto& kind = member(*record, "kind");
+        const auto& payload = member(*record, "result");
+        if (kind == addon::Json_value("quota") && !quota_received) {
+            auto quota = addon::decode_quota_inspect_result(payload, true, nullptr, 2);
+            if (!quota || !quota->complete || !quota->observation || !quota->protocol_state.empty() || quota->stdin_bytes) return {};
+            quota->observation->scope = scope(request);
+            result.quota = std::move(quota);
+            quota_received = true;
         }
         else
-        if (limits.is_object() && quota_window(member(limits, "primary"), &observation.primary) &&
-            quota_window(member(limits, "secondary"), &observation.secondary)) {
-            observation.state = addon::Quota_status::READY;
-            const auto& plan = member(limits, "planType");
-            if (plan.is_string() && !plan.as_string().empty()) observation.plan = plan.as_string();
-            const auto& balance = member(member(limits, "credits"), "balance");
-            if (balance.is_string()) observation.credits_balance = balance.as_string();
-            double count = 0;
-            if (whole_number(member(member(payload, "rateLimitResetCredits"), "availableCount"), &count)) {
-                observation.reset_credits = static_cast<std::int64_t>(count);
-            }
+        if (kind == addon::Json_value("auth") && quota_received && auth.is_null() && auth_record_valid(payload)) {
+            auth = payload;
         }
+        else {
+            return {};
+        }
+        begin = end + 1;
     }
-    result.observation = std::move(observation);
+    pending.erase(0, begin);
+    if (result.complete) {
+        if (!pending.empty()) return {};
+        if (!quota_received) {
+            addon::Quota_inspect_result quota;
+            quota.complete = true;
+            quota.observation = addon::Quota_observation{};
+            quota.observation->scope = scope(request);
+            quota.observation->state = addon::Quota_status::FAILED;
+            result.quota = std::move(quota);
+        }
+        auto auth_request = request;
+        auth_request.observe_current_account = true;
+        auth_request.inspection.stdout_bytes = auth.is_null() ? "" : addon::serialize_json(auth);
+        result.auth = inspect_auth(auth_request);
+        if (!request.observe_current_account) result.auth->current_account.reset();
+    }
+    else {
+        auto state = addon::Json_value::object();
+        state.set("quota_received", addon::Json_value(quota_received));
+        state.set("auth", std::move(auth));
+        state.set("pending", addon::Json_value(std::move(pending)));
+        result.protocol_state = addon::serialize_json(state);
+        if (result.protocol_state.size() > addon::limits::k_max_protocol_state_bytes) return {};
+    }
     return result;
 }
 
@@ -197,27 +222,41 @@ void handle_probes(addon::Invocation_context& context)
 {
     if (context.cancel_requested()) { context.fail(addon::Result_status::CANCELLED, "cancelled"); return; }
     const bool quota = context.request().capability.capability_id == "quota";
+    const bool account_refresh = context.request().capability.capability_id == addon::k_account_refresh_capability_id;
     addon::Contract_failure failure;
     if (context.request().operation == addon::k_prepare_operation) {
-        const auto request = addon::decode_probe_prepare_request(context.request().payload, &failure, 2);
+        const auto request = account_refresh
+            ? addon::decode_account_refresh_prepare_request(context.request().payload, &failure)
+            : addon::decode_probe_prepare_request(context.request().payload, &failure, 2);
         if (!request) { context.fail(addon::Result_status::FAILED, failure.reason_code); return; }
+        if (account_refresh && !request->observe_current_account) {
+            // Native app-server AUTH and `login status` have different meanings
+            // for custom providers. Only combine the existing app-server mode.
+            context.fail(addon::Result_status::UNAVAILABLE, "account_refresh_requires_current_account");
+            return;
+        }
         const auto selected = selected_profile(request->context, context);
         if (!selected) return;
         const auto command = recognize_launcher(request->context.launcher.script_body);
         if (!command) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_unrecognized"); return; }
         const auto& environment = *request->context.launch_environment;
         const bool current_account = !quota && request->observe_current_account;
-        const auto argv = resolve_probe_launcher(*command, quota || current_account ? std::vector<std::string>{"app-server", "--stdio"} :
+        const bool native_server = quota || current_account || account_refresh;
+        const auto argv = resolve_probe_launcher(*command, native_server ? std::vector<std::string>{"app-server", "--stdio"} :
             std::vector<std::string>{"login", "status"}, environment.effective_environment,
-            request->context.working_directory, quota);
+            request->context.working_directory, quota || account_refresh);
         if (!argv) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_program_unavailable"); return; }
         addon::Structured_prepare_result result;
 #if defined(_WIN32)
-        result.process.executable = quota || current_account ? "helpers/codex_quota_helper.exe" : "helpers/codex_launch_bridge.exe";
+        result.process.executable = native_server ? "helpers/codex_quota_helper.exe" : "helpers/codex_launch_bridge.exe";
 #else
-        result.process.executable = quota || current_account ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge";
+        result.process.executable = native_server ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge";
 #endif
         result.process.argv = *argv;
+        if (account_refresh) {
+            result.process.argv.insert(result.process.argv.begin(), "--account-refresh-current");
+        }
+        else
         if (current_account) {
             result.process.argv.insert(result.process.argv.begin(), "--current-account");
         }
@@ -231,13 +270,22 @@ void handle_probes(addon::Invocation_context& context)
         assign_environment(&result.process.environment, "CODEX_HOME", selected->profile_path, windows);
         result.profile_storage = request->context.profile_storage;
         result.account_context = request->context.account_context;
-        result.inspection.protocol_state = "await_exit";
+        result.inspection.incremental = account_refresh;
+        result.inspection.protocol_state = account_refresh ? "" : "await_exit";
         context.succeed(addon::encode_structured_prepare_result(result, 2));
         return;
     }
     if (context.request().operation != addon::k_inspect_operation) { context.reject_unknown_operation(); return; }
-    const auto request = addon::decode_probe_inspect_request(context.request().payload, &failure, 2);
+    const auto request = account_refresh
+        ? addon::decode_account_refresh_inspect_request(context.request().payload, &failure)
+        : addon::decode_probe_inspect_request(context.request().payload, &failure, 2);
     if (!request) { context.fail(addon::Result_status::FAILED, failure.reason_code); return; }
+    if (account_refresh) {
+        const auto result = inspect_account_refresh(*request);
+        if (!result) { context.fail(addon::Result_status::FAILED, "invalid_account_refresh_output"); return; }
+        context.succeed(addon::encode_account_refresh_inspect_result(*result));
+        return;
+    }
     if (!quota) { context.succeed(addon::encode_auth_inspect_result(inspect_auth(*request))); return; }
     std::string reason;
     auto result = inspect_quota(*request, &reason);

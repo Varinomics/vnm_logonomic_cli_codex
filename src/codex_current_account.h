@@ -13,6 +13,8 @@ namespace codex {
 class Current_account_exchange
 {
 public:
+    Current_account_exchange() = default;
+    explicit Current_account_exchange(int first_request_id);
     bool consume(std::string_view bytes);
     bool finish();
     std::string take_input();
