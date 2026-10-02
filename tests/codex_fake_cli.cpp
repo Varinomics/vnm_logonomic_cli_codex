@@ -130,7 +130,8 @@ int main(int argc, char** argv)
     }
     std::string endpoint;
     std::string quota_scenario;
-    std::string identity_scenario;
+    const char* configured_identity = std::getenv("CODEX_FIXTURE_IDENTITY");
+    std::string identity_scenario = configured_identity ? configured_identity : "";
     std::string refresh_scenario;
     bool quota_received = false;
     bool initialized = false;

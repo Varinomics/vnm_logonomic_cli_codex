@@ -242,8 +242,11 @@ void handle_probes(addon::Invocation_context& context)
         const auto& environment = *request->context.launch_environment;
         const bool current_account = !quota && request->observe_current_account;
         const bool native_server = quota || current_account || account_refresh;
-        const auto argv = resolve_probe_launcher(*command, native_server ? std::vector<std::string>{"app-server", "--stdio"} :
-            std::vector<std::string>{"login", "status"}, environment.effective_environment,
+        // Account observations need native authentication and routing, but do
+        // not use plugins or their background marketplace synchronization.
+        const auto argv = resolve_probe_launcher(*command, native_server
+            ? std::vector<std::string>{"-c", "features.plugins=false", "app-server", "--stdio"}
+            : std::vector<std::string>{"login", "status"}, environment.effective_environment,
             request->context.working_directory, quota || account_refresh);
         if (!argv) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_program_unavailable"); return; }
         addon::Structured_prepare_result result;

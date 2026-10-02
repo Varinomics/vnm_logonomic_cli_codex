@@ -272,8 +272,8 @@ int main(int argc, char** argv)
             "Oversized version output accepted");
         addon::Prepare_request prepare;
         prepare.launcher.runner_key  = addon::k_runner_direct;
-        prepare.launcher.script_body = "codex --yolo";
-        prepare.launcher_argv        = {argv[1], "--yolo"};
+        prepare.launcher.script_body = "codex --yolo -c features.plugins=true";
+        prepare.launcher_argv        = {argv[1], "--yolo", "-c", "features.plugins=true"};
         prepare.working_directory    = utf8(root);
         prepare.launch_environment   = environment;
         addon::Account_context account;
@@ -287,6 +287,9 @@ int main(int argc, char** argv)
         addon::Contract_failure failure;
         const auto patch = addon::decode_launch_patch(interactive.output, &failure, 3);
         require(interactive.succeeded && patch && patch->argv && patch->argv->at(1) == "-c", "Verified hook launch missing");
+        require(std::count(patch->argv->begin(), patch->argv->end(), "features.plugins=true") == 1 &&
+            std::count(patch->argv->begin(), patch->argv->end(), "features.plugins=false") == 0,
+            "Interactive launch keeps the user's plugin configuration");
         if (!addon::validate_launch_patch(*patch, {}, {}, &failure)) {
             throw std::runtime_error(failure.reason_code + ": " + failure.detail);
         }
@@ -375,6 +378,9 @@ int main(int argc, char** argv)
         // an ancestor unless --yolo is passed.
         require(std::count(task_process->process.argv.begin(), task_process->process.argv.end(), "--yolo") == 1,
             "The launcher's own --yolo is kept, once");
+        require(std::count(task_process->process.argv.begin(), task_process->process.argv.end(), "features.plugins=true") == 1 &&
+            std::count(task_process->process.argv.begin(), task_process->process.argv.end(), "features.plugins=false") == 0,
+            "Delegated launch keeps the user's plugin configuration");
         auto plain = delegated;
         plain.context.launcher.script_body = "codex";
         plain.context.launcher_argv        = {argv[1]};
@@ -457,6 +463,9 @@ int main(int argc, char** argv)
             std::pair<std::string, std::string>{"OTEL_EXPORTER_OTLP_LOGS_HEADERS", ("Authorization=Bearer%20" + std::string(64, 'd'))}) == 1,
             "Resume patch lost private observer authorization");
         require(proposal->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763", "Exact resume identity changed");
+        require(std::count(proposal->process.argv.begin(), proposal->process.argv.end(), "features.plugins=true") == 1 &&
+            std::count(proposal->process.argv.begin(), proposal->process.argv.end(), "features.plugins=false") == 0,
+            "Interactive resume keeps the user's plugin configuration");
         for (const auto& argument : proposal->process.argv) require(argument.find(std::string(64, 'd')) == std::string::npos, "Startup secret escaped into argv");
         resume.context.launcher.script_body = "codex -c fixture_exporter=true";
         resume.context.launcher_argv = {argv[1], "-c", "fixture_exporter=true"};

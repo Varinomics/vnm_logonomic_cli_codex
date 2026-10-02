@@ -906,7 +906,8 @@ void launcher_discovery_returns_authenticated_codex_profiles(
         "an installation without authenticated profiles retains generic discovery");
 }
 
-void probe_preparation_preserves_program_environment_and_custody(const std::filesystem::path& executable)
+void probe_preparation_preserves_program_environment_and_custody(
+    const std::filesystem::path& executable, const std::filesystem::path& helper)
 {
     const auto utf8 = [](const auto& path) { const auto bytes = path.u8string(); return std::string(bytes.begin(), bytes.end()); };
     addon::Probe_prepare_request request;
@@ -929,6 +930,58 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
     account.adapter_account_key = codex::profile_account_key(profile);
     account.profile_path = profile;
     request.context.account_context = account;
+    const auto receipt = std::filesystem::temp_directory_path() /
+        ("codex-observation-argv-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto observe = [&](const addon::Structured_prepare_result& prepared, bool quota, bool current_account, bool shared) {
+        std::filesystem::remove(receipt);
+        auto environment = prepared.process.environment;
+        environment.emplace_back("CODEX_FIXTURE_RECEIPT", utf8(receipt));
+        if (current_account) environment.emplace_back("CODEX_FIXTURE_IDENTITY", "success");
+        auto command = prepared.process.argv;
+        command.insert(command.begin(), utf8(helper));
+        Context execution;
+        const auto output = codex::run_probe(command, environment, request.context.working_directory, 5000, execution);
+        check(output.has_value(), "prepared observation completes through its actual native helper");
+        std::ifstream input(receipt, std::ios::binary);
+        const auto observed = addon::parse_json(
+            std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()), {}, nullptr);
+        input.close();
+        addon::Json_value expected = addon::Json_value::array();
+        for (std::size_t index = current_account ? 1 : 0; index < prepared.process.argv.size(); ++index) {
+            expected.push_back(addon::Json_value(prepared.process.argv[index]));
+        }
+        check(observed && observed->find("argv") && *observed->find("argv") == expected,
+            "native argv preserves the prepared generic plugin override exactly");
+        check(observed->find("cwd") && std::filesystem::equivalent(
+            addon::path_from_utf8(observed->find("cwd")->as_string()), addon::path_from_utf8(request.context.working_directory)) &&
+            observed->find("CODEX_HOME") && *observed->find("CODEX_HOME") == addon::Json_value(profile),
+            "actual native observation keeps selected working directory and profile");
+        addon::Probe_inspect_request inspection;
+        inspection.observe_current_account = current_account;
+        inspection.account_context = request.context.account_context;
+        inspection.inspection.final = true;
+        inspection.inspection.exit_code = 0;
+        inspection.inspection.stdout_bytes = output->output;
+        if (shared) {
+            const auto result = codex::inspect_account_refresh(inspection);
+            check(result && result->quota && result->quota->observation->state == addon::Quota_status::READY &&
+                result->auth && result->auth->observation->state == addon::Auth_status::AUTHENTICATED && result->auth->current_account,
+                "prepared shared observation retains quota and final native identity");
+        }
+        else
+        if (quota) {
+            std::string failure;
+            const auto result = codex::inspect_quota(inspection, &failure);
+            check(result.observation && result.observation->state == addon::Quota_status::READY,
+                "prepared quota observation retains native quota");
+        }
+        else {
+            const auto result = codex::inspect_auth(inspection);
+            check(result.observation && result.observation->state == addon::Auth_status::AUTHENTICATED && result.current_account,
+                "prepared current-account observation retains native identity");
+        }
+        std::filesystem::remove(receipt);
+    };
     for (const auto& [quota, observe_current_account] : {
         std::pair{false, false}, std::pair{false, true}, std::pair{true, false}, std::pair{true, true}})
     {
@@ -947,7 +1000,11 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         check(!current_account || result->process.argv.front() == "--current-account", "AUTH private mode is explicit");
         check(std::filesystem::equivalent(logonomic::cli_addon::path_from_utf8(result->process.argv[program_index]), executable),
             "recognized Codex executable preserved");
-        check(result->process.argv[program_index + 1] == (quota || current_account ? "app-server" : "login"), "native probe operation preserved");
+        const std::vector<std::string> operation = quota || current_account
+            ? std::vector<std::string>{"-c", "features.plugins=false", "app-server", "--stdio"}
+            : std::vector<std::string>{"login", "status"};
+        check(std::vector<std::string>(result->process.argv.begin() + program_index + 1, result->process.argv.end()) == operation,
+            "native observations scope plugin suppression to app-server while ordinary AUTH keeps login status");
         const auto contains = [&](std::string_view name, std::string_view value) {
             for (const auto& entry : result->process.environment) if (entry.first == name && entry.second == value) return true;
             return false;
@@ -957,6 +1014,7 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         check(!result->inspection.keep_stdin_open && !result->inspection.incremental &&
             result->process.stdin_behavior == addon::Stdin_behavior::CLOSED,
             "probe inspection waits for native completion; the quota helper owns its child's exchange");
+        if (quota || current_account) observe(*result, quota, current_account, false);
     }
     for (const bool identity : {false, true}) {
         request.observe_current_account = identity;
@@ -986,7 +1044,9 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
             "shared progress uses the established process proposal while the helper owns native stdin");
         check(result->process.argv.front() == "--account-refresh-current" &&
             std::filesystem::equivalent(addon::path_from_utf8(result->process.argv[1]), executable) &&
-            result->process.argv[2] == "app-server", "shared refresh preserves the selected native executable");
+            std::vector<std::string>(result->process.argv.begin() + 2, result->process.argv.end()) ==
+                std::vector<std::string>{"-c", "features.plugins=false", "app-server", "--stdio"},
+            "shared refresh preserves the selected native executable and observation-scoped plugin override");
         check(result->account_context && result->account_context->profile_path == profile,
             "shared refresh echoes the frozen source profile");
         const auto has = [&](const std::string& name, const std::string& value) {
@@ -995,6 +1055,7 @@ void probe_preparation_preserves_program_environment_and_custody(const std::file
         };
         check(has("OPENAI_API_KEY", "frozen-credential-canary") && has("CODEX_HOME", profile),
             "shared refresh preserves the frozen native authority context");
+        observe(*result, true, true, true);
     }
 }
 
@@ -1047,7 +1108,7 @@ void quota_batch_dispatch_matches_powershell(
             for (const int mode : {0, 1, 2}) {
                 const bool direct_batch = mode != 0;
                 const auto resolved = codex::resolve_probe_launcher(
-                    selected, {"app-server", "--stdio"}, frozen, addon::path_to_utf8(root), direct_batch);
+                    selected, {"-c", "features.plugins=false", "app-server", "--stdio"}, frozen, addon::path_to_utf8(root), direct_batch);
                 check(resolved && (resolved->front() == "--batch") == direct_batch,
                     "quota selects native batch dispatch while AUTH retains PowerShell");
                 auto command = *resolved;
@@ -1070,7 +1131,8 @@ void quota_batch_dispatch_matches_powershell(
         }
     }
     codex::Launcher_command quoted{addon::path_to_utf8(wrapper), {"embedded\"quote"}, {}};
-    const auto resolved = codex::resolve_probe_launcher(quoted, {"app-server", "--stdio"}, frozen, "", true);
+    const auto resolved = codex::resolve_probe_launcher(
+        quoted, {"-c", "features.plugins=false", "app-server", "--stdio"}, frozen, "", true);
     check(resolved && resolved->front() != "--batch", "embedded quotes retain the native PowerShell argument binder");
     fs::remove_all(root);
 }
@@ -1097,7 +1159,8 @@ int main(int argc, char** argv)
         accounts_are_named_after_their_profile_folders();
         launcher_discovery_returns_authenticated_codex_profiles(
             std::filesystem::absolute(argv[1]));
-        probe_preparation_preserves_program_environment_and_custody(std::filesystem::absolute(argv[1]));
+        probe_preparation_preserves_program_environment_and_custody(
+            std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
 #ifdef _WIN32
         quota_batch_dispatch_matches_powershell(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
 #endif
