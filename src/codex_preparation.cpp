@@ -215,6 +215,9 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
     patch.disposition     = addon::Launch_disposition{true, version_is_at_least(launch->version, 0, 146, 0), true};
+    if (request->codex_invocation) {
+        patch.codex_invocation = addon::Codex_invocation{launch->prefix_size};
+    }
     if (prompt) {
         // "--" ends option parsing, so the text is the positional PROMPT
         // whatever its first character. The replacement invocation runs the
@@ -305,6 +308,11 @@ void prepare_resume(addon::Invocation_context& context)
     result.patch.set.emplace_back("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "Authorization=" + encoded);
     result.patch.profile_storage = request->context.profile_storage;
     result.patch.account_context = request->context.account_context;
+    if (request->context.codex_invocation) {
+        // The terminal launches the bridge ahead of this verified invocation.
+        // Its prefix belongs with Codex's executable when inserting CLI options.
+        result.patch.codex_invocation = addon::Codex_invocation{1 + launch->prefix_size};
+    }
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(request->resume_record);
     result.startup_observer = request->startup_observer;
     context.succeed(addon::encode_resume_prepare_result(result, 2));

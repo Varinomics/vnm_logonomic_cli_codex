@@ -14,9 +14,11 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -209,6 +211,100 @@ void initial_prompt_launches(
     require_refusal(crowded, text, brief, "A launch the prompt pushes past the argument bounds was accepted");
 }
 
+void codex_invocation_launches(
+    const addon::Prepare_request&                           direct,
+    const std::vector<std::string>&                         prefix,
+    const std::vector<std::pair<std::string, std::string>>& probe_environment,
+    const fs::path&                                         root)
+{
+    // Oracle: the approved direct launch keeps its verified argv and obtains
+    // terminal adaptation only through the host's explicit capability offer.
+    Context baseline;
+    prepare_launch(baseline, direct);
+    addon::Contract_failure failure;
+    const auto original = addon::decode_launch_patch(baseline.output, &failure, 3);
+    require(baseline.succeeded && original && !original->codex_invocation,
+        "A host without the Codex invocation offer must keep the established launch result");
+
+    auto offered = direct;
+    offered.codex_invocation = addon::Codex_invocation_request{};
+    Context adapted;
+    prepare_launch(adapted, offered);
+    auto patch = addon::decode_launch_patch(adapted.output, &failure, 3);
+    require(adapted.succeeded && patch && patch->argv && patch->codex_invocation &&
+        patch->codex_invocation->argument_prefix_size == prefix.size() &&
+        patch->argv->size() >= prefix.size() &&
+        std::equal(prefix.begin(), prefix.end(), patch->argv->begin()),
+        "Terminal adaptation must identify the complete verified native or Node and JavaScript prefix");
+    patch->codex_invocation.reset();
+    require(addon::serialize_json(addon::encode_launch_patch(*patch, 3)) == addon::serialize_json(baseline.output),
+        "The capability offer must preserve every verified argument, hook and account field");
+    initial_prompt_launches(offered, probe_environment, root);
+}
+
+void codex_invocation_resume(
+    const addon::Resume_prepare_request& request,
+    const std::vector<std::string>&      prefix)
+{
+    Context baseline;
+    baseline.input = {"resume-baseline", {"interactive-resume", 2}, "prepare_resume",
+        addon::encode_resume_prepare_request(request, 2), 15000};
+    codex::handle_preparation(baseline);
+    addon::Contract_failure failure;
+    const auto original = addon::decode_resume_prepare_result(baseline.output, &failure, 2);
+    require(baseline.succeeded && original && !original->patch.codex_invocation,
+        "Resume without a host offer must keep its established result");
+
+    auto offered = request;
+    offered.context.codex_invocation = addon::Codex_invocation_request{};
+    Context adapted;
+    adapted.input = {"resume-adapted", {"interactive-resume", 2}, "prepare_resume",
+        addon::encode_resume_prepare_request(offered, 2), 15000};
+    codex::handle_preparation(adapted);
+    auto result = addon::decode_resume_prepare_result(adapted.output, &failure, 2);
+    require(adapted.succeeded && result && result->patch.codex_invocation &&
+        result->patch.codex_invocation->argument_prefix_size == 1 + prefix.size() &&
+        result->process.argv.size() >= prefix.size() &&
+        std::equal(prefix.begin(), prefix.end(), result->process.argv.begin()),
+        "Resume must count the launch bridge ahead of the complete verified Codex prefix");
+    result->patch.codex_invocation.reset();
+    require(addon::serialize_json(addon::encode_resume_prepare_result(*result, 2)) ==
+        addon::serialize_json(baseline.output),
+        "Resume adaptation must preserve the bridge, exact session, hooks, account and private observer");
+}
+
+#ifdef _WIN32
+addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const fs::path& root)
+{
+    const auto directory = root / "npm installation";
+    const auto package = directory / "node_modules" / "@openai" / "codex";
+    const auto platform = directory / "node_modules" / "@openai" / "codex-win32-x64";
+    const auto image = platform / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe";
+    fs::create_directories(package / "bin");
+    fs::create_directories(image.parent_path());
+    fs::copy_file(addon::path_from_utf8(native.launcher_argv.front()), directory / "node.exe");
+    fs::copy_file(addon::path_from_utf8(native.launcher_argv.front()), image);
+    // The copied native fixture accepts the verified JavaScript prefix before
+    // Codex arguments; the preparation still checks the real npm file layout.
+    const auto write = [](const fs::path& path, std::string_view content) {
+        std::ofstream stream(path, std::ios::binary);
+        stream << content;
+        require(stream.good(), "Could not write the stock npm launch fixture");
+    };
+    write(directory / "codex.cmd",
+        "@echo off\r\n\"%~dp0node.exe\" \"%~dp0node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n");
+    write(package / "bin" / "codex.js", "// Verified npm entry point fixture.\n");
+    write(package / "package.json",
+        "{\"name\":\"@openai/codex\",\"version\":\"0.150.1\",\"bin\":{\"codex\":\"bin/codex.js\"},"
+        "\"optionalDependencies\":{\"@openai/codex-win32-x64\":\"npm:@openai/codex@0.150.1-win32-x64\"}}");
+    write(platform / "package.json", "{\"name\":\"@openai/codex\",\"version\":\"0.150.1-win32-x64\"}");
+
+    auto request = native;
+    request.launcher_argv.front() = utf8(directory / "codex.cmd");
+    return request;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -307,7 +403,16 @@ int main(int argc, char** argv)
                 return argument.starts_with(prefix);
             }) == 1, "Native question hooks must be narrowly matched and configured exactly once");
         }
-        initial_prompt_launches(prepare, probe_environment, root);
+        const std::vector<std::string> native_prefix{utf8(fs::canonical(addon::path_from_utf8(argv[1])))};
+        codex_invocation_launches(prepare, native_prefix, probe_environment, root);
+#ifdef _WIN32
+        const auto npm = npm_launcher(prepare, root);
+        const std::vector<std::string> npm_prefix{
+            utf8(root / "npm installation" / "node.exe"),
+            utf8(root / "npm installation" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"),
+        };
+        codex_invocation_launches(npm, npm_prefix, probe_environment, root);
+#endif
         addon::Delegated_prepare_request delegated;
         delegated.context.launcher           = prepare.launcher;
         delegated.context.launcher_argv      = prepare.launcher_argv;
@@ -467,6 +572,13 @@ int main(int argc, char** argv)
             std::count(proposal->process.argv.begin(), proposal->process.argv.end(), "features.plugins=false") == 0,
             "Interactive resume keeps the user's plugin configuration");
         for (const auto& argument : proposal->process.argv) require(argument.find(std::string(64, 'd')) == std::string::npos, "Startup secret escaped into argv");
+        codex_invocation_resume(resume, native_prefix);
+#ifdef _WIN32
+        auto npm_resume = resume;
+        npm_resume.context.launcher      = npm.launcher;
+        npm_resume.context.launcher_argv = npm.launcher_argv;
+        codex_invocation_resume(npm_resume, npm_prefix);
+#endif
         resume.context.launcher.script_body = "codex -c fixture_exporter=true";
         resume.context.launcher_argv = {argv[1], "-c", "fixture_exporter=true"};
         Context conflict;
