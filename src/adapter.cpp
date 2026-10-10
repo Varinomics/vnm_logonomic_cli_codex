@@ -174,6 +174,7 @@ int main()
         {"current-account", 1},
         {addon::k_account_refresh_capability_id, addon::k_account_refresh_version},
         {addon::k_usage_cross_source_event_capability_id, addon::k_usage_cross_source_event_version},
+        {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
         {"legacy-state-import", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));

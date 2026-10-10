@@ -316,7 +316,7 @@ std::string string_member(const addon::Json_value& object, std::string_view name
 
 // Persist through the public codec so scanner caches cannot acquire a second
 // interpretation of category coverage or repository allocation records.
-std::string encode_record(const Rollout_usage_record& record, std::uint16_t version = 2)
+addon::Json_value record_accounting(const Rollout_usage_record& record, std::uint16_t version)
 {
     auto envelope = addon::Json_value::object();
     auto usage = record.usage;
@@ -325,6 +325,21 @@ std::string encode_record(const Rollout_usage_record& record, std::uint16_t vers
     }
     envelope.set("usage", addon::encode_usage_record(usage, version));
     envelope.set("recorded_cwd", addon::Json_value(record.recorded_cwd));
+    return envelope;
+}
+
+std::string encode_record(const Rollout_usage_record& record, std::uint16_t version = 2,
+    bool include_temporal = true)
+{
+    auto envelope = record_accounting(record, version);
+    if (version == 3 && include_temporal && (record.temporal.instant || record.temporal.opaque ||
+        record.temporal.reason != "missing-evidence"))
+    {
+        envelope.set("temporal_observation", encode_temporal_observation(record.temporal, envelope));
+        const auto encoded = addon::serialize_json(envelope);
+        if (encoded.size() <= k_line_limit) return encoded;
+        envelope.erase("temporal_observation");
+    }
     return addon::serialize_json(envelope);
 }
 
@@ -335,7 +350,21 @@ Rollout_usage_record decode_record(std::string_view line, std::uint16_t version 
     addon::Contract_failure failure;
     auto record = addon::decode_usage_record(member(*value, "usage"), &failure, version);
     require(record.has_value(), "usage_cache_invalid");
-    return {std::move(*record), string_member(*value, "recorded_cwd")};
+    Rollout_usage_record result{std::move(*record), string_member(*value, "recorded_cwd")};
+    if (version == 3) {
+        result.temporal = decode_temporal_observation(value->find("temporal_observation"),
+            record_accounting(result, version));
+        const auto& proof = result.usage.cross_source_event;
+        if (result.temporal.instant && (!proof ||
+            proof->authority_namespace != "openai.codex.completed-turn" ||
+            result.usage.record_id != "codex:" + proof->event_id))
+        {
+            result.temporal.instant.reset();
+            result.temporal.reason = "unsupported";
+            result.temporal.opaque = *value->find("temporal_observation");
+        }
+    }
+    return result;
 }
 
 struct Fingerprint
@@ -879,7 +908,7 @@ std::uint64_t decimal(std::string_view text)
 
 addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& identifier,
     std::uint64_t offset, const std::optional<addon::Account_context>& account, const std::function<bool()>& cancelled,
-    std::uint16_t version = 2)
+    std::uint16_t version = 2, const addon::Usage_scan_request* request = nullptr)
 {
     require(fs::is_directory(fs::symlink_status(snapshot)), "usage_snapshot_expired");
     const auto metadata = read_json(snapshot / "snapshot");
@@ -892,6 +921,14 @@ addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& iden
     addon::Usage_scan_page page;
     page.scope = *encoded_scope;
     page.snapshot_id = identifier;
+    if (version == 3 && request) {
+        page.account_context = request->context.account_context;
+        page.profile_storage = request->context.profile_storage;
+        // Sealing replaces only this fixed-width digest. Measure the actual
+        // candidate identity and context before admitting any page record.
+        page.cache_candidate = addon::Usage_cache_reference{
+            request->cache_selection->candidate_root, identifier, std::string(64, '0')};
+    }
     const auto& incomplete = member(*metadata, "incomplete");
     require(incomplete.is_boolean(), "usage_snapshot_invalid");
     page.incomplete_historical_coverage = incomplete.as_boolean();
@@ -908,15 +945,40 @@ addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& iden
     input.seekg(static_cast<std::streamoff>(offset));
     std::string line;
     std::size_t bytes = 0;
+    std::size_t encoded_records_bytes = 0;
     while (page.records.size() < addon::k_max_usage_page_records && read_line(input, &line)) {
         check_cancel(cancelled);
         if (!page.records.empty() && bytes + line.size() > k_line_limit / 2) break;
+        auto observation = decode_record(line, version);
+        if (version == 3) {
+            observation.usage.aggregate_evidence = "partial";
+            apply_temporal_observation(observation.usage, observation.temporal,
+                identifier, page.scope.source_account_key);
+            const auto next = offset + line.size() + 1;
+            page.complete = next == size;
+            page.next_cursor = page.complete ? std::nullopt : std::optional(std::to_string(next));
+            if (!addon::append_usage_page_record(page, observation.usage, encoded_records_bytes, version)) {
+                if (!page.records.empty()) break;
+                if (observation.usage.temporal) {
+                    observation.usage.temporal->portions.clear();
+                    observation.usage.temporal->unavailable_tokens = observation.usage.total_tokens;
+                    observation.usage.temporal->coverage_reason = "capacity";
+                    if (!valid_temporal_record(observation.usage)) observation.usage.temporal.reset();
+                }
+                if (!addon::append_usage_page_record(page, observation.usage, encoded_records_bytes, version)) {
+                    observation.usage.temporal.reset();
+                    require(addon::append_usage_page_record(page, observation.usage, encoded_records_bytes, version),
+                        "usage_record_frame_capacity");
+                }
+            }
+        }
+        else page.records.push_back(std::move(observation.usage));
         bytes += line.size();
-        page.records.push_back(decode_record(line, version).usage);
         offset += line.size() + 1;
     }
     page.complete = offset == size;
     if (!page.complete) page.next_cursor = std::to_string(offset);
+    else page.next_cursor.reset();
     return page;
 }
 
@@ -1033,7 +1095,7 @@ bool same_observation(Rollout_usage_record left, Rollout_usage_record right)
         record->usage.repository_path.reset();
         record->usage.repository_usage.reset();
     }
-    return encode_record(left, 3) == encode_record(right, 3);
+    return encode_record(left, 3, false) == encode_record(right, 3, false);
 }
 
 // Whether an observation of an accepted turn confirms the accepted record
@@ -1092,8 +1154,10 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
             }
             require(same_observation(observation, *chosen), "duplicate_usage_record");
             if (observation.usage.source_path.value_or("") < chosen->usage.source_path.value_or("")) {
+                reconcile_temporal_observations(observation.temporal, chosen->temporal);
                 chosen = std::move(observation);
             }
+            else reconcile_temporal_observations(chosen->temporal, observation.temporal);
         }
         return chosen;
     };
@@ -1125,9 +1189,11 @@ void merge_snapshot_records(const fs::path& work, const std::optional<fs::path>&
             if (!accepted_record || !confirms(*accepted_record, *chosen)) {
                 record = &*chosen;
             }
-            else
-            if (!accepted_record->usage.cross_source_event) {
-                accepted_record->usage.cross_source_event = chosen->usage.cross_source_event;
+            else {
+                if (!accepted_record->usage.cross_source_event) {
+                    accepted_record->usage.cross_source_event = chosen->usage.cross_source_event;
+                }
+                reconcile_temporal_observations(accepted_record->temporal, chosen->temporal);
             }
         }
         write_line(output, encode_record(*record, 3));
@@ -1264,7 +1330,7 @@ addon::Usage_scan_page scan_selected_cache(
         const auto state = read_json(work / "cache-state");
         require(state && string_member(*state, "request_sha256") == request_hash &&
             string_member(*state, "snapshot_id") == *request.snapshot_id, "usage_snapshot_mismatch");
-        auto page = page_at(work, *request.snapshot_id, decimal(*request.cursor), request.context.account_context, cancelled, 3);
+        auto page = page_at(work, *request.snapshot_id, decimal(*request.cursor), request.context.account_context, cancelled, 3, &request);
         page.account_context = request.context.account_context;
         page.profile_storage = request.context.profile_storage;
         page.cache_candidate = addon::Usage_cache_reference{
@@ -1386,7 +1452,7 @@ addon::Usage_scan_page scan_selected_cache(
     state.set("snapshot_id", addon::Json_value(identifier));
     state.set("native_seeds", std::move(seeds));
     write_json(work / "cache-state", state);
-    auto page = page_at(work, identifier, 0, request.context.account_context, working, 3);
+    auto page = page_at(work, identifier, 0, request.context.account_context, working, 3, &request);
     page.account_context = request.context.account_context;
     page.profile_storage = request.context.profile_storage;
     // A parsed rollout need not contain all historical contributing events.

@@ -165,6 +165,31 @@ std::optional<std::string> completion_date(const addon::Json_value& event, const
     return std::string(result.data());
 }
 
+std::optional<std::string> completion_instant(const addon::Json_value& event,
+    const addon::Json_value& payload)
+{
+    std::string instant;
+    const auto& native_seconds = member(payload, "completed_at");
+    if (const auto seconds = count(native_seconds)) {
+        if (!native_seconds.is_integer() || *seconds > 253402300799ULL) return std::nullopt;
+        const auto time = std::chrono::sys_seconds{std::chrono::seconds{static_cast<std::int64_t>(*seconds)}};
+        const auto day = std::chrono::floor<std::chrono::days>(time);
+        const std::chrono::year_month_day date{day};
+        const std::chrono::hh_mm_ss clock{time - day};
+        std::array<char, 21> encoded{};
+        if (std::snprintf(encoded.data(), encoded.size(), "%04d-%02u-%02uT%02lld:%02lld:%02lldZ",
+            static_cast<int>(date.year()), static_cast<unsigned>(date.month()),
+            static_cast<unsigned>(date.day()), static_cast<long long>(clock.hours().count()),
+            static_cast<long long>(clock.minutes().count()), static_cast<long long>(clock.seconds().count())) != 20)
+        {
+            return std::nullopt;
+        }
+        instant = encoded.data();
+    }
+    else instant = text(event, "timestamp");
+    return valid_usage_instant(instant) ? std::optional(std::move(instant)) : std::nullopt;
+}
+
 struct Cumulative_category
 {
     std::uint64_t latest = 0;
@@ -329,10 +354,14 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
         // the turn. An event ID the SDK codec rejects leaves the record
         // without one.
         if (complete_turn_event && saw_turn_sample) {
-            const addon::Usage_cross_source_event event{
+            const addon::Usage_cross_source_event proof{
                 "openai.codex.completed-turn", rollout + ":" + turn};
             record.usage.cross_source_event = addon::decode_usage_cross_source_event(
-                addon::encode_usage_cross_source_event(event), nullptr);
+                addon::encode_usage_cross_source_event(proof), nullptr);
+            if (record.usage.cross_source_event) {
+                record.temporal.instant = completion_instant(event, payload);
+                record.temporal.reason = record.temporal.instant ? "complete" : "unsupported";
+            }
         }
         record.recorded_cwd = cwd;
         refresh_repository(&record);

@@ -977,7 +977,10 @@ void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::
         check(page && page->complete && page->cache_candidate, error.empty() ? "imported scan succeeds" : error.c_str());
         return *page;
     };
-    const auto encoded = [](const addon::Usage_record& record) {
+    const auto encoded = [](addon::Usage_record record) {
+        record.temporal.reset();
+        record.capabilities.erase("usage-temporal");
+        if (!record.cross_source_event) record.capabilities.erase("usage-cross-source-event");
         return addon::serialize_json(addon::encode_usage_record(record, 3));
     };
 
@@ -1396,6 +1399,305 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
     }
 }
 
+void selected_cache_dates_only_certified_turns(const fs::path& fixture)
+{
+    const auto profile = fixture / "temporal-profile";
+    const auto storage = fixture / "temporal-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-temporal.jsonl";
+    const auto ended = [](std::string_view turn, std::string_view instant, std::string_view extra = {}) {
+        return "{\"type\":\"event_msg\",\"timestamp\":\"" + std::string(instant) +
+            "\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"" + std::string(turn) +
+            "\"" + std::string(extra) + "}}\n";
+    };
+    const std::string raw = "2026-01-02T23:59:59.123456789+02:00";
+    write(source, metadata("temporal") + start("first") + tokens(10) + complete("first") +
+        start("dated") + tokens(25) + ended("dated", raw) +
+        start("epoch") + tokens(29) + ended("epoch", "2026-03-01T00:00:00Z", ",\"completed_at\":1767398400") +
+        start("local") + tokens(32) + ended("local", "2026-01-03T12:00:00") +
+        start("zero") + tokens(32) + complete("zero") +
+        start("reset") + tokens(40) + tokens(2) + complete("reset") +
+        start("quiet") + complete("quiet"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "temporal-account"};
+    unsigned allocations = 0;
+    std::string error;
+    const auto scan = [&](const std::optional<addon::Usage_cache_reference>& accepted) {
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        const auto candidate = storage / ("candidate-" + std::to_string(allocations++));
+        check(fs::create_directory(candidate), "allocate temporal candidate");
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(candidate)};
+        const auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+        check(page && page->complete && page->cache_candidate, error.empty() ? "temporal scan succeeds" : error.c_str());
+        addon::Contract_failure failure;
+        check(addon::decode_usage_scan_result(addon::encode_usage_scan_result(*page, 3), &failure, 3).has_value(),
+            failure.detail.c_str());
+        return *page;
+    };
+    const auto find = [](const addon::Usage_scan_page& page, std::string_view turn) -> const addon::Usage_record& {
+        const auto found = std::find_if(page.records.begin(), page.records.end(), [&](const auto& record) {
+            return record.record_id == "codex:temporal:" + std::string(turn);
+        });
+        check(found != page.records.end(), "every admitted temporal turn remains present");
+        return *found;
+    };
+    const auto first = scan(std::nullopt);
+    check(first.records.size() == 7, "temporal extraction preserves every accounting turn");
+    const auto& dated = find(first, "dated");
+    check(dated.total_tokens == 15 && dated.temporal && dated.temporal->portions.size() == 1 &&
+        dated.temporal->portions.front().instant == raw && dated.temporal->portions.front().total_tokens == 15,
+        "certified turn keeps the raw native nanosecond offset instant and exact delta");
+    const auto& epoch = find(first, "epoch");
+    check(epoch.temporal && epoch.temporal->portions.front().instant == "2026-01-03T00:00:00Z",
+        "native integer completion seconds take their original priority over the row timestamp");
+    for (const auto* turn : {"first", "reset", "quiet", "local"}) {
+        const auto& record = find(first, turn);
+        check(record.temporal && record.temporal->portions.empty() &&
+            record.temporal->unavailable_tokens == record.total_tokens,
+            "first/reset/sample-free/nonstrict turns remain accounting with unavailable temporal tokens");
+    }
+    check(find(first, "zero").temporal && find(first, "zero").temporal->portions.empty() &&
+        find(first, "zero").temporal->unavailable_tokens == 0,
+        "certified zero never emits a positive portion");
+    for (const auto& record : first.records) {
+        check(record.temporal && record.temporal->parent.record_id == record.record_id &&
+            record.temporal->parent.total_tokens == record.total_tokens &&
+            record.temporal->parent.snapshot_id == first.snapshot_id &&
+            record.temporal->parent.source_account_key == first.scope.source_account_key,
+            "every optional envelope binds the actual accounting parent and page custody");
+    }
+    const auto copy = profile / "sessions" / "rollout-temporal-copy.jsonl";
+    write(copy, metadata("temporal") + start("first") + tokens(10) + complete("first") +
+        start("dated") + tokens(25) + ended("dated", "2026-01-02T23:59:59.123456790+02:00"));
+    const auto conflict = scan(std::nullopt);
+    check(find(conflict, "dated").total_tokens == 15 &&
+        find(conflict, "dated").temporal->portions.empty() &&
+        find(conflict, "dated").temporal->unavailable_tokens == 15,
+        "equal admitted accounting with conflicting native instants withdraws only temporal proof");
+    check(fs::remove(copy), "remove conflicting copy");
+    check(fs::remove(source), "delete original temporal source");
+    const auto replay = scan(first.cache_candidate);
+    check(find(replay, "dated").temporal->portions.front().instant == raw &&
+        find(replay, "dated").temporal->parent.snapshot_id == replay.snapshot_id &&
+        replay.snapshot_id != first.snapshot_id,
+        "deleted-original replay retains exact source proof and rebinds only current snapshot custody");
+
+    const auto changed_cache = [&](std::string_view mode) {
+        const auto root = storage / ("changed-" + std::string(mode));
+        check(fs::create_directory(root), "allocate changed optional cache");
+        for (const auto* name : {"rollouts", "snapshot", "cache-state"}) {
+            check(fs::copy_file(addon::path_from_utf8(first.cache_candidate->root) / name, root / name),
+                "copy unchanged accounting custody");
+        }
+        std::ifstream input(addon::path_from_utf8(first.cache_candidate->root) / "records", std::ios::binary);
+        std::string line;
+        std::string rows;
+        while (std::getline(input, line)) {
+            auto row = addon::parse_json(line, {}, nullptr);
+            check(row.has_value(), "parse accepted temporal fixture");
+            const auto* usage = row->find("usage");
+            if (usage->find("record_id")->as_string() == "codex:temporal:dated") {
+                auto* carrier = row->find("temporal_observation");
+                if (mode == "absent") row->erase("temporal_observation");
+                else if (mode == "unknown") carrier->set("version", addon::Json_value(2));
+                else if (mode == "digest") carrier->set("accounting_sha256_hex", addon::Json_value(std::string(64, '0')));
+                else if (mode == "oversize") carrier->set("instant", addon::Json_value(std::string(768 * 1024 + 1, 'x')));
+                else if (mode == "unproved") {
+                    row->find("usage")->find("capabilities")->erase("usage-cross-source-event");
+                    row->find("usage")->erase("capabilities");
+                    auto accounting = *row;
+                    accounting.erase("temporal_observation");
+                    carrier->set("accounting_sha256_hex", addon::Json_value(addon::to_hex(addon::Sha256::digest(
+                        addon::serialize_json_canonical(accounting)))));
+                }
+                else row->set("temporal_observation", addon::Json_value("damaged"));
+            }
+            rows += addon::serialize_json(*row) + '\n';
+        }
+        write(root / "records", rows);
+        addon::Contract_failure failure;
+        const auto reference = addon::seal_usage_cache_candidate(utf8(root), utf8(storage),
+            request.context.account_context, first.snapshot_id, "codex-rollout-cache@3", [] { return false; }, &failure);
+        check(reference.has_value(), failure.detail.c_str());
+        return reference;
+    };
+    for (const auto* mode : {"absent", "unknown", "digest", "oversize", "malformed", "unproved"}) {
+        const auto page = scan(changed_cache(mode));
+        const auto& record = find(page, "dated");
+        check(record.total_tokens == 15 && record.temporal && record.temporal->portions.empty() &&
+            record.temporal->unavailable_tokens == 15 && page.records.size() == first.records.size(),
+            "optional absence/future/digest/oversize/damage keeps all original accounting usable");
+    }
+
+    // Fill an ordinary, valid accounting capability to the unchanged SDK
+    // exchange boundary. Optional evidence must not make that row unusable.
+    const auto capacity_root = storage / "capacity-accepted";
+    const auto capacity_candidate = storage / "capacity-candidate";
+    check(fs::create_directory(capacity_root) && fs::create_directory(capacity_candidate),
+        "allocate optional capacity fixture");
+    for (const auto* name : {"rollouts", "snapshot", "cache-state"}) {
+        check(fs::copy_file(addon::path_from_utf8(first.cache_candidate->root) / name, capacity_root / name),
+            "copy unchanged capacity custody");
+    }
+    auto large = dated;
+    large.temporal.reset();
+    large.capabilities.erase("usage-temporal");
+    addon::Json_value padding = addon::Json_value::array();
+    for (unsigned index = 0; index < 4; ++index) padding.push_back(addon::Json_value(""));
+    large.capabilities.set("ordinary-retained", padding);
+    auto measured = first;
+    measured.snapshot_id = std::string(64, '0');
+    measured.records = {large};
+    measured.complete = true;
+    measured.next_cursor.reset();
+    measured.cache_candidate = addon::Usage_cache_reference{
+        utf8(capacity_candidate), measured.snapshot_id, std::string(64, '0')};
+    const auto empty_bytes = addon::serialize_json(addon::encode_usage_scan_result(measured, 3)).size();
+    auto remaining = addon::limits::k_max_exchange_payload_bytes - empty_bytes - 8;
+    for (unsigned index = 0; index < 4; ++index) {
+        const auto bytes = std::min<std::uint64_t>(remaining, addon::limits::k_max_json_string_bytes);
+        padding.as_array()[index] = addon::Json_value(std::string(static_cast<std::size_t>(bytes), 'x'));
+        remaining -= bytes;
+    }
+    check(remaining == 0, "capacity fixture remains within each original JSON string bound");
+    large.capabilities.set("ordinary-retained", std::move(padding));
+    auto accounting = addon::Json_value::object();
+    accounting.set("usage", addon::encode_usage_record(large, 3));
+    accounting.set("recorded_cwd", addon::Json_value(""));
+    auto carrier = addon::Json_value::object();
+    carrier.set("version", addon::Json_value(1));
+    carrier.set("accounting_sha256_hex", addon::Json_value(addon::to_hex(addon::Sha256::digest(
+        addon::serialize_json_canonical(accounting)))));
+    carrier.set("instant", addon::Json_value(raw));
+    carrier.set("reason", addon::Json_value("complete"));
+    accounting.set("temporal_observation", std::move(carrier));
+    write(capacity_root / "records", addon::serialize_json(accounting) + '\n');
+    addon::Contract_failure capacity_failure;
+    const auto capacity_reference = addon::seal_usage_cache_candidate(utf8(capacity_root), utf8(storage),
+        request.context.account_context, first.snapshot_id, "codex-rollout-cache@3", [] { return false; }, &capacity_failure);
+    check(capacity_reference.has_value(), capacity_failure.detail.c_str());
+    request.cache_selection = addon::Usage_cache_selection{capacity_reference, utf8(capacity_candidate)};
+    const auto capacity = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    check(capacity && capacity->complete && capacity->records.size() == 1 &&
+        capacity->records.front().total_tokens == 15 && !capacity->records.front().temporal &&
+        capacity->records.front().capabilities.find("ordinary-retained"),
+        "optional singleton overflow preserves the original valid accounting row and its unrelated capability");
+    check(addon::decode_usage_scan_result(addon::encode_usage_scan_result(*capacity, 3), &capacity_failure, 3).has_value(),
+        "capacity fallback remains a valid unchanged-budget exchange");
+}
+
+void adapter_optional_isolation(const fs::path& package, const fs::path& fixture, bool member_boundary)
+{
+    const auto profile = fixture / "profile";
+    const auto source = profile / "sessions" / "rollout-isolation.jsonl";
+    fs::create_directories(source.parent_path());
+    write(source, metadata(member_boundary ? "members" : "s\\tt") +
+        start("turn") + tokens(10) + complete("turn"));
+    addon::Simulator_options options;
+    options.package_directory = package;
+    options.profile_storage_root = fixture / "cache";
+    addon::Host_simulator host(options, nullptr);
+    addon::Contract_failure failure;
+    check(host.start(&failure), failure.detail.c_str());
+    const auto native_profile = utf8(profile);
+    const auto account = codex::profile_account_key(native_profile);
+    std::string error;
+    const auto allocated = addon::allocate_profile_storage_root(
+        host.profile_storage_root(), "logonomic.cli.codex", &error, account);
+    check(allocated.has_value(), error.c_str());
+    addon::Usage_scan_request request;
+    request.context.launcher = {"codex", addon::k_runner_direct, {}};
+    request.context.launcher_argv = {"codex"};
+    request.context.profile_storage = addon::Profile_storage_context{1, *allocated};
+    request.context.account_context = addon::Account_context{2, account, native_profile};
+    request.context.launch_environment = addon::Launch_environment{
+        addon::host_platform_id(), addon::Json_value::object(), std::nullopt};
+    addon::Simulator_invocation_options invocation;
+    invocation.profile_storage = request.context.profile_storage;
+    const auto acknowledgment = host.invoke({"profile-storage", 1}, "acknowledge",
+        addon::Json_value::object(), 5000, invocation);
+    const auto acknowledged = host.wait_outcome(acknowledgment, 6000);
+    check(acknowledged && acknowledged->status == addon::Host_status::SUCCESS,
+        "isolation adapter acknowledges its actual allocation");
+    const auto scan = [&](std::uint16_t version) {
+        const auto id = host.invoke({"usage-scan", version}, "scan",
+            addon::encode_usage_scan_request(request, version), 10000, invocation);
+        const auto outcome = host.wait_outcome(id, 11000);
+        if (!outcome || outcome->status != addon::Host_status::SUCCESS) {
+            std::cerr << "isolation usage" << version << ": " <<
+                (outcome ? outcome->reason_code : "timeout") << '\n';
+        }
+        check(outcome && outcome->status == addon::Host_status::SUCCESS,
+            member_boundary ? "1024 ordinary capability members remain usable through the actual adapter" :
+            "accounting control-character identity remains usable through the actual adapter");
+        const auto page = addon::decode_usage_scan_result(outcome->payload, &failure, version);
+        check(page && page->complete && page->records.size() == 1 && page->records[0].total_tokens == 10,
+            "isolation retains the exact original accounting parent and H");
+        return *page;
+    };
+    // The legacy scanner's native cache lives under its short owning root;
+    // the packaged selected-cache path uses its real account allocation below.
+    Temporary_directory ordinary_fixture;
+    const auto ordinary_storage = ordinary_fixture.path / "ordinary";
+    check(fs::create_directory(ordinary_storage), "allocate ordinary isolation storage");
+    auto legacy = request;
+    legacy.context.profile_storage = addon::Profile_storage_context{1, utf8(ordinary_storage)};
+    const auto ordinary_result = codex::scan_usage(legacy, profile, ordinary_storage,
+        [] { return false; }, quiet_progress, &error);
+    check(ordinary_result && ordinary_result->records.size() == 1 &&
+        addon::decode_usage_scan_result(addon::encode_usage_scan_result(*ordinary_result, 2), &failure, 2).has_value(),
+        "ordinary usage2 scanner and codec admit the original accounting");
+    const auto& ordinary = *ordinary_result;
+    const std::string identity = member_boundary ? "codex:members:turn" : "codex:s\tt:turn";
+    check(ordinary.records[0].record_id == identity && !ordinary.records[0].temporal,
+        "usage2 retains the exact admitted identity without optional proof");
+    const auto candidate = addon::path_from_utf8(*allocated) / "first";
+    check(fs::create_directory(candidate), "allocate isolation selected candidate");
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(candidate)};
+    const auto first = scan(3);
+    if (!member_boundary) {
+        check(first.records[0].record_id == identity && !first.records[0].temporal,
+            "invalid optional parent withdraws proof without changing the accounting identity");
+    }
+    else {
+        check(fs::remove(source), "remove source for retained structural boundary");
+        const auto accepted = addon::path_from_utf8(*allocated) / "accepted-members";
+        check(fs::create_directory(accepted), "allocate retained structural fixture");
+        for (const auto* name : {"rollouts", "snapshot", "cache-state"}) {
+            check(fs::copy_file(candidate / name, accepted / name), "copy structural accounting custody");
+        }
+        auto record = first.records[0];
+        record.temporal.reset();
+        record.cross_source_event.reset();
+        record.capabilities = addon::Json_value::object();
+        for (std::size_t index = 0; index < addon::limits::k_max_json_members; ++index) {
+            record.capabilities.set("ordinary-" + std::to_string(index), addon::Json_value(static_cast<int>(index)));
+        }
+        auto accounting = addon::Json_value::object();
+        accounting.set("usage", addon::encode_usage_record(record, 3));
+        accounting.set("recorded_cwd", addon::Json_value(""));
+        const auto original = addon::serialize_json(accounting);
+        check(addon::parse_json(original, {}, nullptr).has_value() &&
+            addon::decode_usage_record(addon::encode_usage_record(record, 2), &failure, 2).has_value(),
+            "the unchanged original accounting is within its JSON member limit");
+        write(accepted / "records", original + '\n');
+        const auto reference = addon::seal_usage_cache_candidate(utf8(accepted), *allocated,
+            request.context.account_context, first.snapshot_id, "codex-rollout-cache@3", [] { return false; }, &failure);
+        check(reference.has_value(), failure.detail.c_str());
+        const auto next = addon::path_from_utf8(*allocated) / "next";
+        check(fs::create_directory(next), "allocate structural successor");
+        request.cache_selection = addon::Usage_cache_selection{reference, utf8(next)};
+        const auto retained = scan(3);
+        check(retained.records[0].record_id == identity && !retained.records[0].temporal &&
+            retained.records[0].capabilities.as_object().size() == addon::limits::k_max_json_members,
+            "optional structural overflow preserves every original opaque capability");
+    }
+    check(host.shutdown(1000, nullptr), "isolation adapter exits without any model request");
+}
+
 void adapter_cache_selection_contract(const fs::path& package, const fs::path& fixture, bool long_allocation)
 {
     const auto profile = fixture / "adapter-profile";
@@ -1496,7 +1798,29 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
         }
         check(found, "native source-absent record survives packaged scan");
     };
+    const auto check_temporal = [](const auto& first_page, const auto& last_page) {
+        std::uint64_t instant_tokens = 0;
+        std::uint64_t unavailable_tokens = 0;
+        for (const auto* page : {&first_page, &last_page}) {
+            for (const auto& record : page->records) {
+                check(record.temporal && record.temporal->parent.record_id == record.record_id &&
+                    record.temporal->parent.total_tokens == record.total_tokens &&
+                    record.temporal->parent.snapshot_id == page->snapshot_id &&
+                    record.temporal->parent.source_account_key == page->scope.source_account_key,
+                    "packaged producer binds optional proof to every actual page/account/parent");
+                for (const auto& portion : record.temporal->portions) {
+                    check(portion.basis == "instant" && portion.instant == "2026-01-02T12:00:00Z",
+                        "packaged producer preserves the certified native completion instant");
+                    instant_tokens += portion.total_tokens;
+                }
+                unavailable_tokens += record.temporal->unavailable_tokens;
+            }
+        }
+        check(instant_tokens == 269 && unavailable_tokens == 20,
+            "packaged pages conserve certified deltas separately from first-turn/imported accounting");
+    };
     check_import(first, last);
+    check_temporal(first, last);
     check(addon::validate_usage_cache_candidate(*last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "actual adapter cache verifies after paging");
     check(fs::remove(source), "remove native history to exercise selected cache replay");
@@ -1515,6 +1839,7 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     check(replay_last.complete && replay_last.records.size() == 15 && replay_last.cache_candidate == replay.cache_candidate,
         "selected cache replay preserves all records across pages");
     check_import(replay, replay_last);
+    check_temporal(replay, replay_last);
     check(addon::validate_usage_cache_candidate(*replay_last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "replayed cache seals and reopens");
     imported.find("records")->as_array().front().set("counter_semantics", addon::Json_value("future_counter"));
@@ -1583,6 +1908,13 @@ int main(int argc, char** argv)
 {
     try {
         Temporary_directory fixture;
+        if (argc == 3) {
+            const std::string mode = argv[2];
+            check(mode == "optional-parent" || mode == "optional-members", "known isolation fixture selection");
+            adapter_optional_isolation(addon::path_from_utf8(argv[1]), fixture.path,
+                mode == "optional-members");
+            return 0;
+        }
         projector_does_not_retain_ignored_large_payloads();
         reducer_keeps_turn_deltas_resets_and_fork_baselines(fixture.path / "rollout-fixture.jsonl");
         reducer_proves_only_complete_turns(fixture.path / "rollout-fixture.jsonl");
@@ -1603,12 +1935,15 @@ int main(int argc, char** argv)
         selected_cache_retains_repository_attribution(fixture.path);
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
+        selected_cache_dates_only_certified_turns(fixture.path);
         selected_cache_spools_a_rollout_while_it_is_read(fixture.path);
         selected_cache_requires_the_rollout_of_each_accepted_record(fixture.path);
         progress_continues_at_a_paced_rate_while_working();
         scans_report_each_stage_while_they_work(fixture.path);
         waiting_for_another_scan_reports_nothing(fixture.path);
         check(argc == 2, "usage tests require the built package directory");
+        adapter_optional_isolation(addon::path_from_utf8(argv[1]), fixture.path / "optional-parent", false);
+        adapter_optional_isolation(addon::path_from_utf8(argv[1]), fixture.path / "optional-members", true);
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "short-allocation", false);
         adapter_cache_selection_contract(addon::path_from_utf8(argv[1]), fixture.path / "long-allocation", true);
         return 0;

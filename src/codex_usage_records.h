@@ -1,5 +1,7 @@
 #pragma once
 
+#include "codex_usage_temporal.h"
+
 #include <logonomic_cli_addon/usage_scan.h>
 
 #include <filesystem>
@@ -15,6 +17,7 @@ struct Rollout_usage_record
 {
     logonomic::cli_addon::Usage_record usage;
     std::string recorded_cwd;
+    Temporal_observation temporal{};
 };
 
 std::optional<std::string> repository_for_cwd(std::string_view cwd);
