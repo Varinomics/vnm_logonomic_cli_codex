@@ -5,6 +5,7 @@
 #include "codex_preparation.h"
 #include "codex_probes.h"
 #include "codex_startup_observation.h"
+#include "codex_session_wake.h"
 #include "codex_usage.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
@@ -94,6 +95,10 @@ void invoke(addon::Invocation_context& context)
             discovery(context);
         }
         else
+        if (request.capability.capability_id == addon::k_session_wake_capability_id) {
+            codex::handle_session_wake(context);
+        }
+        else
         if (request.capability.capability_id == "accounts") {
             codex::handle_accounts(context);
         }
@@ -168,6 +173,7 @@ int main()
         {"launch-preparation", 3}, {"structured-session", 2}, {"delegated-session", 2},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},
+        {addon::k_session_wake_capability_id, addon::k_session_wake_version},
         {"interactive-resume", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 2}, {"usage-scan", 3},

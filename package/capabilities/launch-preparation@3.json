@@ -3,6 +3,7 @@
   "payload": {
     "environment_names": [
       "CODEX_HOME",
+      "CODEX_SQLITE_HOME",
       "OPENAI_API_KEY",
       "OPENAI_BASE_URL",
       "SystemRoot",

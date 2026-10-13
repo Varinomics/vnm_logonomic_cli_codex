@@ -548,12 +548,15 @@ int main(int argc, char** argv)
         require(!malformed_observer.succeeded && malformed_observer.output.is_string() &&
             malformed_observer.output.as_string() == "frame_violation",
             "Malformed startup observer offer must remain rejected");
+        resume.context.session_wake = addon::Session_wake_offer{};
         Context exact;
         exact.input = {"resume", {"interactive-resume", 2}, "prepare_resume", addon::encode_resume_prepare_request(resume, 2), 15000};
         codex::handle_preparation(exact);
         const auto proposal = addon::decode_resume_prepare_result(exact.output, &failure, 2);
         if (!exact.succeeded) std::cerr << "Resume prepare refusal: " << addon::serialize_json(exact.output) << "; " << exact.failure_detail << '\n';
         require(exact.succeeded && proposal && proposal->startup_observer && proposal->startup_observer->authorization == ("Bearer " + std::string(64, 'd')), "Isolated startup proof or exact observer echo missing");
+        require(proposal->patch.session_wake && proposal->patch.session_wake->available,
+            "Exact resume must retain the native wake binding for its new process");
         if (!addon::validate_resume_process_proposal(proposal->process, &failure)) {
             throw std::runtime_error(failure.reason_code + ": " + failure.detail);
         }

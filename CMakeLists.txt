@@ -66,6 +66,7 @@ add_library(codex_provider STATIC
     src/codex_preparation.cpp
     src/codex_probes.cpp
     src/codex_quota_exchange.cpp
+    src/codex_session_wake.cpp
     src/codex_startup_observation.cpp
     src/codex_startup_probe.cpp
     src/codex_usage.cpp
@@ -152,6 +153,12 @@ codex_target(codex_preparation_tests)
 add_dependencies(codex_preparation_tests codex_fake_cli)
 add_test(NAME codex_preparation_tests COMMAND codex_preparation_tests "$<TARGET_FILE:codex_fake_cli>")
 set_tests_properties(codex_preparation_tests PROPERTIES TIMEOUT 45)
+add_executable(codex_session_wake_tests tests/codex_session_wake_tests.cpp)
+target_link_libraries(codex_session_wake_tests PRIVATE codex_provider)
+codex_target(codex_session_wake_tests)
+add_dependencies(codex_session_wake_tests codex_fake_cli)
+add_test(NAME codex_session_wake_tests COMMAND codex_session_wake_tests "$<TARGET_FILE:codex_fake_cli>")
+set_tests_properties(codex_session_wake_tests PROPERTIES TIMEOUT 90)
 foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup_observation_tests codex_probe_tests codex_usage_tests)
     add_executable(${test_name} "tests/${test_name}.cpp")
     target_link_libraries(${test_name} PRIVATE codex_provider)

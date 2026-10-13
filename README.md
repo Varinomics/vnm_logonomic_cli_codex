@@ -52,6 +52,38 @@ from the host's one-shot admission service and returned using Codex's
 content through the lifecycle ledger or fabricate instructions after admission
 fails.
 
+`session-wake@1` queues a host-authored mailbox notification for the exact live
+conversation UUID. Preparation captures the original CLI's external-queue
+watcher support (introduced in 0.149.0), verifies effective configuration, and
+pins `CODEX_HOME` and `sqlite_home` before the recipient starts. An unsupported
+wake offer leaves ordinary launching available. Changed executable-chain files,
+unresolved stores and nonlocal persistence make that live binding unavailable.
+The native App Server does not accept the TUI's `--profile` selector, so those
+launchers remain wake-unavailable; selected `CODEX_HOME` accounts are supported.
+
+The package uses native `thread/queue/list` and `thread/queue/add` over a
+short-lived App Server stdio connection to the bound store. It never loads,
+resumes, steers or starts that conversation in the control process. This avoids
+`codex queue`'s implicit daemon selection: an unrelated default daemon may use
+a different store, and the CLI refuses an embedded writer with configuration
+overrides while that daemon runs. The writer checks effective configuration in
+the same control process before enqueueing, refusing changed managed store
+requirements even when they override the pinned command-line setting.
+Codex's external queue watcher delivers to
+the original process after ordinary idle (with a polling delay); busy sessions
+wait, and native interruption remains paused. The host also suppresses wake
+while an approval or interruption is pending. Native acceptance is a queue
+receipt, never mailbox consumption or an agent acknowledgment. A lost or
+mismatched reply is uncertain and must not be automatically retried because
+`clientUserMessageId` is correlation, not native deduplication.
+
+The opt-in `tests/codex_native_wake_tests.py --codex <native executable>
+--driver <codex_session_wake_tests>` gate creates a disposable profile and a
+loopback model fixture. It exercises production preparation/inspection/notify,
+the original idle engine, busy completion, interruption and an unrelated store.
+It never uses a user's model account. This establishes native engine behavior;
+terminal presentation and the host's durable mailbox need their own gates.
+
 Exact interactive resume preserves the canonical provider session UUID and
 requires a private startup observer. Before opening the requested conversation,
 the package inspects effective configuration, refuses an existing telemetry log

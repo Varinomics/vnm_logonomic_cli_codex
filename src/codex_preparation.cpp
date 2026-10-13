@@ -3,6 +3,7 @@
 #include "codex_accounts.h"
 #include "codex_launcher.h"
 #include "codex_startup_probe.h"
+#include "codex_session_wake.h"
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launch_preparation.h>
@@ -207,6 +208,12 @@ void prepare_interactive(addon::Invocation_context& context)
         refuse_initial_prompt(context, "This Codex does not take an initial prompt for an interactive session.");
         return;
     }
+    std::optional<addon::Session_wake_preparation> wake;
+    if (request->session_wake) {
+        wake = prepare_session_wake(*launch,
+            launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),
+            request->working_directory, context);
+    }
     if (!add_hooks(*launch, context)) return;
     addon::Launch_patch patch;
     patch.set             = launch->environment;
@@ -214,6 +221,7 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.argv            = launch->argv;
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
+    patch.session_wake    = std::move(wake);
     patch.disposition     = addon::Launch_disposition{true, version_is_at_least(launch->version, 0, 146, 0), true};
     if (request->codex_invocation) {
         patch.codex_invocation = addon::Codex_invocation{launch->prefix_size};
@@ -269,6 +277,12 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
         return;
     }
+    std::optional<addon::Session_wake_preparation> wake;
+    if (request->context.session_wake) {
+        wake = prepare_session_wake(*launch,
+            launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
+            request->context.working_directory, context);
+    }
     if (!add_hooks(*launch, context)) return;
     std::vector<std::string> configuration;
     const std::vector<std::string> options{"-c", "--config", "-p", "--profile", "--enable", "--disable"};
@@ -308,6 +322,7 @@ void prepare_resume(addon::Invocation_context& context)
     result.patch.set.emplace_back("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "Authorization=" + encoded);
     result.patch.profile_storage = request->context.profile_storage;
     result.patch.account_context = request->context.account_context;
+    result.patch.session_wake = std::move(wake);
     if (request->context.codex_invocation) {
         // The terminal launches the bridge ahead of this verified invocation.
         // Its prefix belongs with Codex's executable when inserting CLI options.

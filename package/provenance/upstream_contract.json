@@ -6,6 +6,8 @@
   "native_integration_followups": ["aa8f9f051904749890f669f03a12b603f9602656"],
   "lifecycle_minimum": "0.146.0",
   "delegated_implementation_minimum": "0.150.1",
+  "session_wake_watcher_minimum": "0.149.0",
+  "session_wake_source": "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/ext/queue/tests/queue_service.rs",
   "forward_policy": "Newer versions are admitted after launcher verification; protocol records and startup observation are validated.",
   "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
   "icons_license": "notices/lobe_icons_mit.txt"

@@ -1,0 +1,18 @@
+{
+  "capability_id": "session-wake",
+  "version": 1,
+  "payload": {
+    "environment_names": [
+      "CODEX_HOME",
+      "CODEX_SQLITE_HOME",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP",
+      "NODE_OPTIONS",
+      "NODE_PATH"
+    ]
+  }
+}

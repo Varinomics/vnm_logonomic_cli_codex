@@ -136,6 +136,8 @@ int main(int argc, char** argv)
     bool quota_received = false;
     bool initialized = false;
     bool configured_exporter = false;
+    std::string sqlite_home;
+    if (const char* value = std::getenv("CODEX_FIXTURE_SQLITE_HOME")) sqlite_home = value;
     // Model an intrinsic producer defect across the isolated native probe.
     // User -c arguments are intentionally omitted by that probe.
     const char* fixture_defect = std::getenv("CODEX_FIXTURE_OBSERVER");
@@ -153,7 +155,11 @@ int main(int argc, char** argv)
 #endif
         if (argument == "--fixture-ignore-stdin") { std::this_thread::sleep_for(std::chrono::seconds(30)); return 0; }
         if (argument == "--fixture-overflow") { std::cout << std::string(65537, 'x') << std::flush; return 0; }
-        if (argument == "--version") { std::cout << "codex-cli 0.150.1\n"; return 0; }
+        if (argument == "--version") {
+            const char* version = std::getenv("CODEX_FIXTURE_VERSION");
+            std::cout << "codex-cli " << (version ? version : "0.150.1") << '\n';
+            return 0;
+        }
         if (argument == "--help") {
             // A build without the interactive positional PROMPT omits it from its usage.
             std::cout << (std::getenv("CODEX_FIXTURE_NO_PROMPT") ? "Usage: codex [OPTIONS] <COMMAND> [ARGS]\n"
@@ -161,6 +167,11 @@ int main(int argc, char** argv)
             return 0;
         }
         if (argument == "fixture_exporter=true") configured_exporter = true;
+        if (argument.starts_with("sqlite_home=")) {
+            const auto value = addon::parse_json(argument.substr(12), {}, nullptr);
+            if (!value || !value->is_string()) return 24;
+            sqlite_home = value->as_string();
+        }
         if (argument.starts_with("fixture_observer=")) defect = argument.substr(17);
         const auto begin = argument.find("endpoint=\"");
         if (begin != std::string::npos) {
@@ -174,8 +185,17 @@ int main(int argc, char** argv)
         const auto* id = message->find("id");
         if (!id) continue;
         const auto method = text(*message, "method");
+        const char* wake_scenario = std::getenv("CODEX_FIXTURE_WAKE");
+        if (const char* path = std::getenv("CODEX_FIXTURE_WAKE_LOG")) {
+            Json record = object({{"method", Json(method)}, {"request", *message}, {"sqlite_home", Json(sqlite_home)}});
+            if (const char* home = std::getenv("CODEX_HOME")) record.set("codex_home", Json(home));
+            std::ofstream log(addon::path_from_utf8(path), std::ios::app | std::ios::binary);
+            log << addon::serialize_json(record) << '\n';
+            if (method != "initialize" && method != "config/read" && method != "thread/queue/list" && method != "thread/queue/add") return 25;
+        }
         Json result = Json::object();
         if (method == "initialize") {
+            if (wake_scenario && std::string_view(wake_scenario) == "init-failure") return 26;
             if (initialized) return 22;
             initialized = true;
             if (quota_scenario == "initialize-error") {
@@ -231,6 +251,30 @@ int main(int argc, char** argv)
         }
         else if (method == "config/read") {
             result = object({{"config", object({{"fixture_observer", Json(defect)}, {"otel", object({{"exporter", Json(configured_exporter ? "existing" : "none")}})}})}});
+            if (!sqlite_home.empty()) result.find("config")->set("sqlite_home", Json(sqlite_home));
+            if (const char* managed = std::getenv("CODEX_FIXTURE_MANAGED_STORE")) result.find("config")->set("sqlite_home", Json(managed));
+        }
+        else if (method == "thread/queue/list" || method == "thread/queue/add") {
+            if (!initialized) return 27;
+            const auto* params = message->find("params");
+            if (!params || text(*params, "threadId") != "019933a1-6e43-7102-a520-b3c8294cc763") return 28;
+            if (wake_scenario && std::string_view(wake_scenario) == "unsupported") {
+                std::cout << addon::serialize_json(object({{"id", *id}, {"error", object({{"code", Json(-32601)}, {"message", Json("unsupported")}})}})) << '\n' << std::flush;
+                continue;
+            }
+            if (method == "thread/queue/list") result = object({{"data", Json::array()}, {"nextCursor", Json()}});
+            else {
+                if (wake_scenario && std::string_view(wake_scenario) == "lost-reply") return 29;
+                if (wake_scenario && std::string_view(wake_scenario) == "malformed") {
+                    std::cout << "unparseable\n" << std::flush;
+                    continue;
+                }
+                const auto* input = params->find("input");
+                if (!input || !input->is_array()) return 30;
+                result = object({{"queuedSubmission", object({{"id", Json("019933a1-6e43-7102-a520-b3c8294cc764")},
+                    {"input", *input}, {"clientUserMessageId", Json(wake_scenario && std::string_view(wake_scenario) == "wrong-echo"
+                        ? "other-notification" : text(*params, "clientUserMessageId"))}})}});
+            }
         }
         else if (method == "thread/start" || method == "thread/resume") {
             const char* home = std::getenv("CODEX_HOME");
