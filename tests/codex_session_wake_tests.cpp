@@ -179,7 +179,13 @@ int main(int argc, char** argv)
         target.launcher_argv = *patch.argv;
         target.launch_environment = *request.launch_environment;
         target.correlation.transition_nonce = std::string(32, 'a');
-        target.binding = binding;
+        // The real host carries opaque preparation through QJsonObject and
+        // QVariantMap, which sort object keys. Match that wire round trip:
+        // file evidence changes from path,size,modified to modified,path,size.
+        const auto transported_binding = addon::parse_json(addon::serialize_json_canonical(binding), {}, nullptr);
+        require(transported_binding && transported_binding->find("files")->as_array().front().as_object().front().name == "modified",
+            "The host-style regression must actually reorder nested file evidence");
+        target.binding = *transported_binding;
         const auto ready = inspect(target);
         if (!ready.available) {
             std::cerr << "Readiness: " << ready.reason << '\n';

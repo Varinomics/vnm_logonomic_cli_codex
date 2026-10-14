@@ -209,7 +209,10 @@ std::optional<Bound_queue> bound_queue(const addon::Session_wake_target& target)
         files.push_back(name);
     }
     const auto current = file_evidence(files);
-    if (!current || *current != *evidence) return std::nullopt;
+    // The host's JSON object/map bridge can reorder members without changing
+    // evidence. Compare every field and array entry with object order removed.
+    if (!current || addon::serialize_json_canonical(*current) != addon::serialize_json_canonical(*evidence))
+        return std::nullopt;
     const auto home = text(binding, "codex_home");
     const auto sqlite_home = text(binding, "sqlite_home");
     if (normalized_absolute(home).empty() || normalized_absolute(sqlite_home).empty()) return std::nullopt;
