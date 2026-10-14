@@ -7,9 +7,10 @@ Package identity is `logonomic.cli.codex`.
 Host-selected usage caches use `codex-rollout-cache@3`, whose records retain
 usage-scan@3 native counter provenance. A candidate keeps one metadata line per
 rollout in `rollouts` beside the sorted `records`, so it holds the same four
-files however many rollouts a home has. An incremental scan parses only the
-rollouts whose size or modification time changed and streams the selected
-cache's records for the others; repair and reset parse every rollout. Equal
+files however many rollouts a home has. An incremental scan parses rollouts whose
+size or modification time changed, or whose optional temporal evidence has not
+been examined, and streams the selected cache's records for the others; repair
+and reset parse every rollout. Equal
 size and modification time are taken to mean unchanged content, the check the
 pre-cutover scanner used, because rollouts are append-only and repair rereads
 every rollout. Turns reconcile by their stable record IDs: a rollout parsed

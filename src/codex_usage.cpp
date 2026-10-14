@@ -434,8 +434,14 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
         result.incomplete = true;
         return result;
     }
+    // Accounting freshness does not show whether optional temporal evidence
+    // was examined. A present marker, including an unknown version, stays intact.
+    const auto* temporal_parser = metadata ? metadata->find("temporal_parser") : nullptr;
     const bool current = metadata && member(*metadata, "revision") == addon::Json_value(k_parser_revision);
-    if (!force && current && fingerprint_matches(*metadata, *before)) return result;
+    const bool refresh_temporal = version == 3 && !temporal_parser;
+    if (!force && current && !refresh_temporal && fingerprint_matches(*metadata, *before)) {
+        return result;
+    }
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         result.incomplete = true;
@@ -452,7 +458,8 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
     require(static_cast<bool>(output), "usage_storage_write_failed");
     const auto after = fingerprint(path);
     if (!after || *after != *before || error == "rollout_read_failed" ||
-        (!parsed && metadata && !current && fingerprint_matches(*metadata, *before) && error != "cancelled"))
+        (!parsed && metadata && (!current || (!force && refresh_temporal)) &&
+            fingerprint_matches(*metadata, *before) && error != "cancelled"))
     {
         fs::remove(spool);
         result.incomplete = true;
@@ -465,6 +472,11 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
     next.set("source", addon::Json_value(source));
     next.set("size", addon::Json_value(std::to_string(before->size)));
     next.set("modified", addon::Json_value(std::to_string(before->modified.time_since_epoch().count())));
+    if (version == 3) {
+        auto marker = addon::Json_value::object();
+        marker.set("version", addon::Json_value(1));
+        next.set("temporal_parser", temporal_parser ? *temporal_parser : std::move(marker));
+    }
     result.metadata = std::move(next);
     return result;
 }

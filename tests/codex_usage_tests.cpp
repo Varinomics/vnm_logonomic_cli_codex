@@ -1399,6 +1399,142 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
     }
 }
 
+void selected_cache_refreshes_missing_temporal_history(const fs::path& fixture)
+{
+    const auto profile = fixture / "temporal-refresh-profile";
+    const auto storage = fixture / "temporal-refresh-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-refresh.jsonl";
+    const auto bytes = metadata("refresh") + start("first") + tokens(10) + complete("first") +
+        start("dated") + tokens(25) + complete("dated");
+    write(source, bytes);
+    const auto original_modified = fs::last_write_time(source);
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "temporal-refresh-account"};
+    unsigned allocations = 0;
+    const auto scan = [&](const std::optional<addon::Usage_cache_reference>& accepted) {
+        const auto candidate = storage / ("candidate-" + std::to_string(allocations++));
+        check(fs::create_directory(candidate), "allocate temporal refresh candidate");
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(candidate)};
+        std::string error;
+        const auto page = codex::scan_usage(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(page && page->complete && page->cache_candidate,
+            error.empty() ? "temporal refresh scan succeeds" : error.c_str());
+        check(page->records.size() == 2 && page->records[0].record_id == "codex:refresh:dated" &&
+            page->records[0].total_tokens == 15 && page->records[1].total_tokens == 10,
+            "temporal refresh preserves both accepted accounting turns and their exact deltas");
+        return *page;
+    };
+    const auto first = scan(std::nullopt);
+    const auto historical = [&](std::string_view mode) {
+        const auto root = storage / ("historical-" + std::string(mode));
+        check(fs::create_directory(root), "allocate accepted historical fixture");
+        const auto current = addon::path_from_utf8(first.cache_candidate->root);
+        for (const auto* name : {"snapshot", "cache-state"}) {
+            check(fs::copy_file(current / name, root / name), "copy unchanged accounting custody");
+        }
+        for (const auto* name : {"rollouts", "records"}) {
+            std::ifstream input(current / name, std::ios::binary);
+            std::string line;
+            std::string rows;
+            while (std::getline(input, line)) {
+                auto row = addon::parse_json(line, {}, nullptr);
+                check(row.has_value(), "parse historical cache fixture");
+                if (std::string_view(name) == "rollouts") {
+                    row->erase("temporal_parser");
+                }
+                else
+                if (mode == "absent") {
+                    row->erase("temporal_observation");
+                    if (auto* capabilities = row->find("usage")->find("capabilities")) {
+                        capabilities->erase("usage-cross-source-event");
+                    }
+                }
+                else
+                if (auto* carrier = row->find("temporal_observation")) {
+                    if (mode == "unknown") {
+                        carrier->set("version", addon::Json_value(2));
+                    }
+                    else {
+                        carrier->set("instant", addon::Json_value{});
+                        carrier->set("reason", addon::Json_value("unsupported"));
+                    }
+                }
+                rows += addon::serialize_json(*row) + '\n';
+            }
+            check(input.eof(), "read complete historical fixture");
+            write(root / name, rows);
+        }
+        addon::Contract_failure failure;
+        const auto reference = addon::seal_usage_cache_candidate(utf8(root), utf8(storage),
+            request.context.account_context, first.snapshot_id, "codex-rollout-cache@3",
+            [] { return false; }, &failure);
+        check(reference.has_value(), failure.detail.c_str());
+        return reference;
+    };
+    const auto absent = historical("absent");
+    const auto refreshed = scan(absent);
+    const auto& dated = refreshed.records.front();
+    check(dated.cross_source_event && dated.temporal && dated.temporal->portions.size() == 1 &&
+        dated.temporal->portions.front().instant == "2026-01-02T12:00:00Z" &&
+        dated.temporal->portions.front().total_tokens == 15,
+        "unchanged rollout refreshes absent accepted temporal evidence from its native completion");
+    check(refreshed.records.back().temporal && refreshed.records.back().temporal->portions.empty() &&
+        refreshed.records.back().temporal->unavailable_tokens == 10,
+        "refresh never dates an unproved cumulative first turn");
+    addon::Contract_failure failure;
+    check(addon::validate_usage_cache_candidate(*absent, utf8(storage), request.context.account_context,
+        [] { return false; }, &failure).has_value(), "refresh leaves the selected historical cache immutable");
+
+    for (const auto* mode : {"unknown", "unsupported"}) {
+        const auto replay = scan(historical(mode));
+        check(replay.records.front().temporal && replay.records.front().temporal->portions.empty() &&
+            replay.records.front().temporal->unavailable_tokens == 15 &&
+            replay.records.front().temporal->coverage_reason == "unsupported",
+            "refresh distinguishes absent temporal evidence from unknown or unsupported evidence");
+        if (std::string_view(mode) == "unknown") {
+            std::ifstream input(addon::path_from_utf8(replay.cache_candidate->root) / "records");
+            std::string line;
+            check(static_cast<bool>(std::getline(input, line)), "read retained unknown observation");
+            const auto row = addon::parse_json(line, {}, nullptr);
+            const auto* carrier = row ? row->find("temporal_observation") : nullptr;
+            check(carrier && carrier->find("version") && carrier->find("version")->is_integer() &&
+                carrier->find("version")->as_integer() == 2,
+                "refresh preserves the unknown optional observation in its candidate");
+        }
+    }
+
+    // An unchanged fingerprint with unreadable content reveals whether the
+    // second incremental scan actually reuses the completed temporal parse.
+    write(source, std::string(bytes.size() - 1, 'x') + '\n');
+    fs::last_write_time(source, original_modified);
+    const auto cached = scan(refreshed.cache_candidate);
+    check(!cached.incomplete_historical_coverage && cached.records.front().temporal &&
+        cached.records.front().temporal->portions.size() == 1,
+        "a completed temporal refresh keeps the unchanged-rollout fast path");
+    const auto malformed = scan(absent);
+    check(malformed.incomplete_historical_coverage && malformed.records.front().temporal &&
+        malformed.records.front().temporal->portions.empty(),
+        "failed optional refresh preserves accepted accounting with unavailable temporal evidence");
+    const auto repair_candidate = storage / "repair-candidate";
+    check(fs::create_directory(repair_candidate), "allocate strict repair candidate");
+    request.mode = "repair";
+    request.cache_selection = addon::Usage_cache_selection{absent, utf8(repair_candidate)};
+    std::string error;
+    const auto repaired = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(!repaired && error == "rollout_record_malformed",
+        "forced repair still rejects malformed unchanged source when only temporal evidence is absent");
+    request.mode = "incremental";
+    check(fs::remove(source), "remove historical original");
+    const auto missing = scan(absent);
+    check(missing.records.front().temporal && missing.records.front().temporal->portions.empty(),
+        "missing original preserves accepted accounting without inventing an instant");
+}
+
 void selected_cache_dates_only_certified_turns(const fs::path& fixture)
 {
     const auto profile = fixture / "temporal-profile";
@@ -1935,6 +2071,7 @@ int main(int argc, char** argv)
         selected_cache_retains_repository_attribution(fixture.path);
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
+        selected_cache_refreshes_missing_temporal_history(fixture.path);
         selected_cache_dates_only_certified_turns(fixture.path);
         selected_cache_spools_a_rollout_while_it_is_read(fixture.path);
         selected_cache_requires_the_rollout_of_each_accepted_record(fixture.path);
