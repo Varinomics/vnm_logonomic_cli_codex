@@ -72,7 +72,7 @@ std::optional<Json> file_evidence(const std::vector<std::string>& files)
         const auto modified = fs::last_write_time(path, error);
         if (error) return std::nullopt;
         result.push_back(object({{"path", Json(name)}, {"size", Json(std::to_string(size))},
-            {"modified", Json(std::to_string(modified.time_since_epoch().count()))}}));
+            {"modified", Json(addon::file_time_ticks_text(modified))}}));
     }
     return result;
 }

@@ -387,7 +387,7 @@ std::optional<Fingerprint> fingerprint(const fs::path& path)
 bool fingerprint_matches(const addon::Json_value& metadata, const Fingerprint& value)
 {
     if (member(metadata, "size") != addon::Json_value(std::to_string(value.size))) return false;
-    if (member(metadata, "modified") == addon::Json_value(std::to_string(value.modified.time_since_epoch().count()))) return true;
+    if (member(metadata, "modified") == addon::Json_value(addon::file_time_ticks_text(value.modified))) return true;
 #if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
     const auto modified = std::chrono::clock_cast<std::chrono::system_clock>(value.modified);
 #else
@@ -471,7 +471,7 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
     next.set("revision", addon::Json_value(k_parser_revision));
     next.set("source", addon::Json_value(source));
     next.set("size", addon::Json_value(std::to_string(before->size)));
-    next.set("modified", addon::Json_value(std::to_string(before->modified.time_since_epoch().count())));
+    next.set("modified", addon::Json_value(addon::file_time_ticks_text(before->modified)));
     if (version == 3) {
         auto marker = addon::Json_value::object();
         marker.set("version", addon::Json_value(1));

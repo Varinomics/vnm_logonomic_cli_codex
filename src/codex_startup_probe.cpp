@@ -123,6 +123,13 @@ public:
             SetHandleInformation(reinterpret_cast<HANDLE>(client), HANDLE_FLAG_INHERIT, 0);
 #else
             fcntl(client, F_SETFD, FD_CLOEXEC);
+#ifdef __APPLE__
+            const int no_sigpipe = 1;
+            if (setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+                close_socket(client);
+                continue;
+            }
+#endif
 #endif
             if (!nonblocking(client)) { close_socket(client); continue; }
             m_clients.push_back({client, {}, Clock::now()});
@@ -183,7 +190,7 @@ public:
                     }
                     else m_failed = true;
                     constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
                     send(iterator->socket, response.data(), static_cast<int>(response.size()), 0);
 #else
                     send(iterator->socket, response.data(), response.size(), MSG_NOSIGNAL);

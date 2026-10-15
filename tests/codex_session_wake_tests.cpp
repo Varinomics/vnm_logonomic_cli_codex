@@ -105,7 +105,7 @@ int native_probe(char** argv)
 #ifdef _WIN32
     request.launch_environment->platform_id = "windows-x86_64";
 #else
-    request.launch_environment->platform_id = "linux-x86_64";
+    request.launch_environment->platform_id = addon::host_platform_id();
 #endif
     for (const char* name : {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"}) {
         if (const char* value = std::getenv(name)) request.launch_environment->effective_environment.set(name, Json(value));
@@ -150,7 +150,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
         request.launch_environment->platform_id = "windows-x86_64";
 #else
-        request.launch_environment->platform_id = "linux-x86_64";
+        request.launch_environment->platform_id = addon::host_platform_id();
 #endif
         auto& environment = request.launch_environment->effective_environment;
         for (const char* name : {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME"}) {

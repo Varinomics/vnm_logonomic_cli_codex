@@ -327,7 +327,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
         environment.platform_id = "windows-x86_64";
 #else
-        environment.platform_id = "linux-x86_64";
+        environment.platform_id = addon::host_platform_id();
 #endif
         environment.effective_environment.set("CODEX_HOME", addon::Json_value(utf8(root)));
         environment.effective_environment.set("TEMP", addon::Json_value(utf8(root)));

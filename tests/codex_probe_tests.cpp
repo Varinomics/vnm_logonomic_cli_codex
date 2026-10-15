@@ -1,3 +1,4 @@
+#include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/package_source.h>
 #include "codex_accounts.h"
 #include "codex_account_refresh.h"
@@ -548,7 +549,7 @@ void account_resolution_uses_frozen_origin()
     const std::string fallback = "C:/codex-default-home";
     const std::string home_name = "USERPROFILE";
 #else
-    environment.platform_id = "linux-x86_64";
+    environment.platform_id = addon::host_platform_id();
     const std::string origin = "/codex-frozen-origin";
     const std::string fallback = "/codex-default-home";
     const std::string home_name = "HOME";
@@ -579,7 +580,7 @@ void accounts_are_named_after_their_profile_folders()
     const std::string home     = "C:/Users/Jane Doe";
     const std::string home_env = "USERPROFILE";
 #else
-    const std::string platform = "linux-x86_64";
+    const std::string platform = addon::host_platform_id();
     const std::string home     = "/home/jane";
     const std::string home_env = "HOME";
 #endif
@@ -616,7 +617,7 @@ void launcher_discovery_returns_authenticated_codex_profiles(
     const std::filesystem::path& executable)
 {
     namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() /
+    const fs::path root = fs::canonical(fs::temp_directory_path()) /
         ("codex discovery " + addon::random_nonce_hex());
     struct Cleanup
     {
@@ -684,7 +685,7 @@ void launcher_discovery_returns_authenticated_codex_profiles(
     request.platform_id = "windows-x86_64";
     request.ambient_environment.set("USERPROFILE", addon::Json_value(path_text(home)));
 #else
-    request.platform_id = "linux-x86_64";
+    request.platform_id = addon::host_platform_id();
     request.ambient_environment.set("HOME", addon::Json_value(path_text(home)));
 #endif
     request.ambient_environment.set("PATH", addon::Json_value(path_text(bin)));
@@ -766,6 +767,8 @@ void launcher_discovery_returns_authenticated_codex_profiles(
         normalized_tab_label == tab_candidate->display_name,
         "a tab in an authenticated profile folder yields a represented profile and valid control-free label");
 
+#ifndef __APPLE__
+    // APFS refuses non-UTF-8 directory names before discovery can inspect them.
     const std::string invalid_utf8_name = ".codex-invalid-\xFF";
     const fs::path invalid_utf8_profile = home / fs::path(invalid_utf8_name);
     fs::create_directories(invalid_utf8_profile);
@@ -786,6 +789,7 @@ void launcher_discovery_returns_authenticated_codex_profiles(
         std::ranges::none_of(without_invalid_utf8, [&invalid_utf8_profile, &path_text](const auto& candidate) {
             return candidate.environment_text.ends_with(path_text(invalid_utf8_profile));
         }), "an invalid-UTF-8 profile is discarded without losing valid profiles");
+#endif
 
     std::vector<fs::path> line_break_profiles;
     for (const std::string_view line_break : {"\r", "\n"}) {
@@ -919,7 +923,7 @@ void probe_preparation_preserves_program_environment_and_custody(
 #if defined(_WIN32)
     environment.platform_id = "windows-x86_64";
 #else
-    environment.platform_id = "linux-x86_64";
+    environment.platform_id = addon::host_platform_id();
 #endif
     environment.effective_environment.set("PATH", addon::Json_value(utf8(executable.parent_path())));
     environment.effective_environment.set("OPENAI_API_KEY", addon::Json_value("frozen-credential-canary"));

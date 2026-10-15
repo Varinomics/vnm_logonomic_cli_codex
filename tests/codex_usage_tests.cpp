@@ -45,7 +45,7 @@ std::vector<std::string> stage_notes(const std::vector<std::string>& notes)
 
 struct Temporary_directory
 {
-    fs::path path = fs::temp_directory_path() / ("codex-usage-test-" +
+    fs::path path = fs::canonical(fs::temp_directory_path()) / ("codex-usage-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Temporary_directory() { check(fs::create_directory(path), "create isolated fixture"); }
     ~Temporary_directory() { std::error_code error; fs::remove_all(path, error); }
