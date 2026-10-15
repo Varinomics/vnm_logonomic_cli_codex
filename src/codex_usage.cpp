@@ -1521,7 +1521,13 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
 {
     try {
         std::unique_lock lock(scan_mutex, std::defer_lock);
-        while (!lock.try_lock_for(std::chrono::milliseconds(50))) check_cancel(cancelled);
+        // Selected continuations only read sealed, host-owned candidates.
+        // Their lifetime spans the host's page loop; another account's scan
+        // cannot change or prune them. Keep writers and mutable-cache pages
+        // serialized without delaying delivery of an already completed scan.
+        if (!request.cache_selection || !request.snapshot_id) {
+            while (!lock.try_lock_for(std::chrono::milliseconds(50))) check_cancel(cancelled);
+        }
         check_cancel(cancelled);
         if (request.cache_selection) {
             return scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits);

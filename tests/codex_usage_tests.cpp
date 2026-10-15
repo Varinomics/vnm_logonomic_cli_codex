@@ -1399,6 +1399,89 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
     }
 }
 
+void selected_cache_pages_while_another_account_scans(const fs::path& fixture)
+{
+    const auto profile = fixture / "paging-profile";
+    const auto storage = fixture / "paging-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    std::string bytes = metadata("paging");
+    for (unsigned index = 0; index < 270; ++index) {
+        const auto turn = "turn-" + std::to_string(index);
+        bytes += start(turn) + tokens(index + 1) + complete(turn);
+    }
+    write(profile / "sessions" / "rollout-paging.jsonl", bytes);
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "paging-account"};
+    const auto candidate = storage / "candidate";
+    check(fs::create_directory(candidate), "allocate paging candidate");
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(candidate)};
+    std::string error;
+    const auto first = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(first && !first->complete && first->next_cursor && first->cache_candidate,
+        "seal the first account before a second account starts scanning");
+    request.snapshot_id = first->snapshot_id;
+    request.cursor      = first->next_cursor;
+
+    const auto other_profile = fixture / "paging-other-profile";
+    const auto other_storage = fixture / "paging-other-storage";
+    fs::create_directory(other_profile);
+    fs::create_directory(other_storage);
+    const auto other_candidate = other_storage / "candidate";
+    fs::create_directory(other_candidate);
+    addon::Usage_scan_request other;
+    other.context.profile_storage = addon::Profile_storage_context{1, utf8(other_storage)};
+    other.context.account_context = addon::Account_context{1, "paging-other-account"};
+    other.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(other_candidate)};
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool scanning = false;
+    bool release  = false;
+    bool paged    = false;
+    codex::Usage_scan_progress paused_progress([&](std::uint64_t, const std::string&) {
+        std::unique_lock lock(mutex);
+        scanning = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release; });
+    }, std::chrono::minutes(15));
+    std::string other_error;
+    std::optional<addon::Usage_scan_page> other_page;
+    std::jthread scanner([&] {
+        other_page = codex::scan_usage(other, other_profile, other_storage,
+            [] { return false; }, paused_progress, &other_error);
+    });
+    bool started = false;
+    {
+        std::unique_lock lock(mutex);
+        started = changed.wait_for(lock, std::chrono::seconds(5), [&] { return scanning; });
+    }
+    std::optional<addon::Usage_scan_page> last;
+    std::jthread reader([&] {
+        last = codex::scan_usage(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        std::lock_guard lock(mutex);
+        paged = true;
+        changed.notify_all();
+    });
+    bool independent = false;
+    {
+        std::unique_lock lock(mutex);
+        independent = changed.wait_for(lock, std::chrono::seconds(2), [&] { return paged; });
+        release = true;
+    }
+    changed.notify_all();
+    scanner.join();
+    reader.join();
+    check(started && other_page.has_value(), "second account finishes its bounded scan");
+    check(independent, "sealed selected-cache pages must not wait for another account's active scan");
+    check(last && last->complete && last->records.size() == 14 &&
+        last->cache_candidate == first->cache_candidate,
+        "concurrent paging retains the sealed snapshot, cursor and candidate identity");
+}
+
 void selected_cache_refreshes_missing_temporal_history(const fs::path& fixture)
 {
     const auto profile = fixture / "temporal-refresh-profile";
@@ -2046,6 +2129,10 @@ int main(int argc, char** argv)
         Temporary_directory fixture;
         if (argc == 3) {
             const std::string mode = argv[2];
+            if (mode == "selected-page") {
+                selected_cache_pages_while_another_account_scans(fixture.path);
+                return 0;
+            }
             check(mode == "optional-parent" || mode == "optional-members", "known isolation fixture selection");
             adapter_optional_isolation(addon::path_from_utf8(argv[1]), fixture.path,
                 mode == "optional-members");
@@ -2071,6 +2158,7 @@ int main(int argc, char** argv)
         selected_cache_retains_repository_attribution(fixture.path);
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
+        selected_cache_pages_while_another_account_scans(fixture.path);
         selected_cache_refreshes_missing_temporal_history(fixture.path);
         selected_cache_dates_only_certified_turns(fixture.path);
         selected_cache_spools_a_rollout_while_it_is_read(fixture.path);
