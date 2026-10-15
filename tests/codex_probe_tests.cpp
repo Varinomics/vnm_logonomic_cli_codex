@@ -233,7 +233,7 @@ void current_account_helper_keeps_native_output_private(
         }
     }
     for (const char* scenario : {"malformed", "native-failure"}) {
-        codex::Probe_exchange observer;
+        addon::Probe_exchange observer;
         std::string exposed;
         observer.on_output = [&exposed](std::string_view bytes) {
             exposed.append(bytes);
@@ -498,7 +498,7 @@ void account_refresh_helper_preserves_early_quota_and_private_completion(
         "quota-error", "malformed", "native-failure"})
     {
         std::filesystem::remove(gate);
-        codex::Probe_exchange observer;
+        addon::Probe_exchange observer;
         std::string exposed;
         observer.on_output = [&](std::string_view bytes) {
             exposed.assign(bytes);

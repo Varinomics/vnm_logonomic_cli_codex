@@ -355,7 +355,7 @@ int main(int argc, char** argv)
             Context blocked;
             const auto started = std::chrono::steady_clock::now();
             if (cancel) blocked.cancel_at = started + std::chrono::milliseconds(50);
-            codex::Probe_exchange exchange;
+            addon::Probe_exchange exchange;
             exchange.initial_input = std::string(2 * 1024 * 1024, 'x');
             exchange.on_output = [](std::string_view) { return std::optional<std::string>(""); };
             const auto observed = codex::run_probe({argv[1], "--fixture-ignore-stdin"}, probe_environment,

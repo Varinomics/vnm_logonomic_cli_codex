@@ -94,7 +94,7 @@ Rpc_response call(
 {
     argv.push_back("app-server");
     Rpc_response response;
-    Probe_exchange exchange;
+    addon::Probe_exchange exchange;
     exchange.initial_input = addon::serialize_json(object({{"id", Json(1)}, {"method", Json("initialize")},
         {"params", object({{"clientInfo", object({{"name", Json("logonomic-session-wake")}, {"version", Json("1")}})},
             {"capabilities", object({{"experimentalApi", Json(true)}})}})}})) + '\n';

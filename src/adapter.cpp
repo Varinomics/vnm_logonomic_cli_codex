@@ -117,16 +117,7 @@ void invoke(addon::Invocation_context& context)
         }
         else
         if (request.capability.capability_id == "profile-storage" && request.operation == "acknowledge") {
-            const auto* storage = request.payload.find("profile_storage");
-            const auto decoded = storage ? addon::decode_profile_storage_context(*storage, nullptr) : std::nullopt;
-            if (!request.payload.is_object() || request.payload.as_object().size() != 1 || !decoded) {
-                context.fail(addon::Result_status::FAILED, "profile_storage_mismatch");
-            }
-            else {
-                auto response = addon::Json_value::object();
-                response.set("profile_storage", addon::profile_storage_member(*decoded));
-                context.succeed(std::move(response));
-            }
+            addon::acknowledge_profile_storage(context);
         }
         else
         if (request.capability.capability_id == "lifecycle-events" ||
