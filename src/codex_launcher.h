@@ -1,11 +1,10 @@
 #pragma once
 
-#include <logonomic_cli_addon/adapter_runtime.h>
+#include <logonomic_cli_addon/probe_exchange.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
 
 #include <cstddef>
 #include <optional>
-#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -37,25 +36,11 @@ struct Verified_launch
     std::size_t                                     prefix_size = 0;
 };
 
-struct Probe_output
-{
-    std::string output;
-    std::string errors;
-};
-
-struct Probe_exchange
-{
-    std::string initial_input;
-    std::function<std::optional<std::string>(std::string_view)> on_output;
-    std::function<void()> tick;
-    bool complete = false;
-};
-
-std::optional<Probe_output> run_probe(
+std::optional<logonomic::cli_addon::Probe_output> run_probe(
     const std::vector<std::string>& argv,
     const std::vector<std::pair<std::string, std::string>>& environment,
     std::string_view working_directory, int timeout_ms,
-    logonomic::cli_addon::Invocation_context& context, Probe_exchange* exchange = nullptr);
+    logonomic::cli_addon::Invocation_context& context, logonomic::cli_addon::Probe_exchange* exchange = nullptr);
 
 bool supported_session_arguments(const std::vector<std::string>& argv, bool resume);
 

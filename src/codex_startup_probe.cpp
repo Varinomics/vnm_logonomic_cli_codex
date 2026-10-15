@@ -224,7 +224,7 @@ std::optional<Json> app_server_call(
     std::vector<std::string> argv(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
     argv.insert(argv.end(), configuration.begin(), configuration.end());
     argv.push_back("app-server");
-    Probe_exchange exchange;
+    addon::Probe_exchange exchange;
     exchange.initial_input = addon::serialize_json(object({{"id", Json(1)}, {"method", Json("initialize")},
         {"params", object({{"clientInfo", object({{"name", Json("logonomic-startup-probe")}, {"version", Json("1")}})}})}})) + '\n';
     std::size_t consumed = 0;
