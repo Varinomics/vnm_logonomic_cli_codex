@@ -98,6 +98,7 @@ logonomic_cli_addon_package_platform(CODEX_PLATFORM)
 set(CODEX_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 logonomic_cli_addon_package_directory(logonomic.cli.codex CODEX_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
+logonomic_cli_addon_package_indexer(package_index_command package_index_dependencies)
 file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
@@ -123,13 +124,14 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_helper>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_helper${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_launch_bridge>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_launch_bridge${CODEX_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:codex_quota_helper>" "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_quota_helper${CODEX_EXECUTABLE_SUFFIX}"
-    COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${CODEX_PACKAGE_DIRECTORY}"
+    COMMAND ${package_index_command} "${CODEX_PACKAGE_DIRECTORY}"
         --third-party "assets/openai.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
         --third-party "assets/openai-white.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
     DEPENDS codex_adapter codex_helper codex_launch_bridge codex_quota_helper logonomic_cli_addon_index
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
+        ${package_files} ${package_index_dependencies}
     VERBATIM)
 add_custom_target(codex_package ALL DEPENDS "${CODEX_PACKAGE_DIRECTORY}/package.files.json")
 logonomic_cli_addon_install_package("${CODEX_PACKAGE_DIRECTORY}" logonomic.cli.codex TARGET codex_package)
