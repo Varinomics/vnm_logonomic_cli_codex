@@ -112,6 +112,10 @@ void invoke(addon::Invocation_context& context)
             codex::handle_usage(context);
         }
         else
+        if (request.capability.capability_id == addon::k_usage_session_capability_id) {
+            codex::handle_usage_session(context);
+        }
+        else
         if (request.capability.capability_id == "legacy-state-import" && request.operation == addon::k_import_record_operation) {
             history(context);
         }
@@ -172,6 +176,7 @@ int main()
         {addon::k_account_refresh_capability_id, addon::k_account_refresh_version},
         {addon::k_usage_cross_source_event_capability_id, addon::k_usage_cross_source_event_version},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
+        {addon::k_usage_session_capability_id, addon::k_usage_session_version},
         {"legacy-state-import", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));

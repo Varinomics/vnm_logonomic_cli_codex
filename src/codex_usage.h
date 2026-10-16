@@ -2,6 +2,7 @@
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/usage_scan.h>
+#include <logonomic_cli_addon/usage_session.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 
 #include <chrono>
@@ -66,6 +67,9 @@ std::optional<logonomic::cli_addon::Usage_scan_page> scan_usage(
     Usage_scan_progress& progress,
     std::string* error, const Usage_scan_limits& limits = {});
 void handle_usage(logonomic::cli_addon::Invocation_context& context);
+void handle_usage_session(logonomic::cli_addon::Invocation_context& context);
+std::optional<logonomic::cli_addon::Usage_session_fact> describe_usage_session(
+    const logonomic::cli_addon::Usage_session_identity& identity);
 logonomic::cli_addon::Legacy_import_result import_usage(
     const logonomic::cli_addon::Import_record_request& request);
 

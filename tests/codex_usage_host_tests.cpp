@@ -16,6 +16,7 @@
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/usage_session.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/sha256.h>
 #include <logonomic_cli_addon/usage_scan.h>
@@ -261,6 +262,28 @@ public:
             check(page.has_value(), "usage page decodes: " + failure.detail);
             check(page->cache_candidate && page->cache_candidate->root == m_request.cache_selection->candidate_root,
                 "every page names the host's candidate allocation");
+            if (!page->records.empty()) {
+                std::vector<addon::Usage_session_identity> identities;
+                for (const auto& record : page->records) {
+                    check(!record.capabilities.find(addon::k_usage_session_capability_id),
+                        "ordinary scan records remain unchanged for hosts without session-fact support");
+                    identities.push_back({record.record_id, record.session_key});
+                }
+                const auto id = m_host.invoke({addon::k_usage_session_capability_id, addon::k_usage_session_version},
+                    addon::k_usage_session_describe_operation, addon::encode_usage_session_request(identities), 5000);
+                const auto described = m_host.wait_outcome(id, 6000);
+                check(described && described->status == addon::Host_status::SUCCESS,
+                    "packaged Codex adapter describes fresh and retained usage sessions");
+                const auto descriptions = addon::decode_usage_session_result(described->payload, &failure);
+                check(descriptions && descriptions->size() == identities.size(), "session facts preserve page cardinality");
+                for (std::size_t index = 0; index < identities.size(); ++index) {
+                    const auto& description = descriptions->at(index);
+                    check(description.identity == identities[index] && description.session &&
+                        description.session->provider_session_id == identities[index].session_key &&
+                        description.session->excludes_turn_in_flight,
+                        "completed-turn records identify their original rollout and exclude its unfinished turn");
+                }
+            }
             if (!snapshot) {
                 snapshot = *page;
             }
