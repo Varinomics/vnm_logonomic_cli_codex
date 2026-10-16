@@ -587,8 +587,7 @@ std::optional<addon::Probe_output> run_probe(
     const std::vector<std::string>& argv, const Environment& environment,
     std::string_view working_directory, int timeout_ms, addon::Invocation_context& context, addon::Probe_exchange* exchange)
 {
-    return addon::probe_exchange(argv, environment, working_directory, timeout_ms, context,
-        exchange, "\\\\.\\pipe\\logonomic-codex-probe-");
+    return addon::probe(argv, environment, working_directory, timeout_ms, context, exchange);
 }
 
 std::optional<std::vector<std::string>> resolve_probe_launcher(
