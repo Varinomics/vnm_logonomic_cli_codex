@@ -180,12 +180,12 @@ scan waiting for another scan of this package, report nothing.
 `codex_package` target produces an indexed package under
 `package/logonomic.cli.codex` in a single-configuration build directory, or
 `package/<config>/logonomic.cli.codex` with a multi-configuration generator.
-Windows and Linux x86-64
+Windows and Linux x86-64 and macOS ARM64
 artifacts have separate manifests. Follow the workstation build queue and
 toolchain policy for every configure and build command.
 
-The package recipe proves the Windows/Linux x86-64 compiler target during
-configuration. `cmake --install` exports a fresh artifact beneath its install-time
+The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
+during configuration. `cmake --install` exports a fresh artifact beneath its install-time
 prefix and preserves executable permissions. An existing per-package destination,
 including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
 nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
