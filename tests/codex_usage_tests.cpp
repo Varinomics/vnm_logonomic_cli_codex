@@ -803,6 +803,182 @@ void selected_cache_stays_compact_across_incremental_scans(const fs::path& fixtu
     check(files(next) <= 4, "an incremental candidate stays compact");
 }
 
+void incremental_scan_preserves_the_accepted_generation(const fs::path& fixture)
+{
+    const auto profile = fixture / "incremental-profile";
+    const auto storage = fixture / "incremental-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-incremental.jsonl";
+    const auto original = metadata() + start("first") + tokens(19) + complete("first");
+    write(source, original);
+    addon::Usage_scan_request request;
+    request.mode                    = "incremental";
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "incremental-account"};
+    const auto allocate = [&](const char* name, std::optional<addon::Usage_cache_reference> accepted) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate incremental candidate");
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
+    };
+    const auto cancelled = [] { return false; };
+    std::string error;
+    allocate("accepted", std::nullopt);
+    const auto first = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
+    check(first && first->cache_candidate && first->records.size() == 1, "establish accepted accounting");
+    const auto baseline = *first->cache_candidate;
+    const auto records_path = storage / "accepted" / "records";
+    const auto records_time = fs::last_write_time(records_path);
+
+    std::vector<std::string> notes;
+    codex::Usage_scan_progress progress([&](std::uint64_t, const std::string& note) {
+        notes.push_back(note);
+    }, std::chrono::minutes(15));
+    allocate("unchanged", baseline);
+    auto result = codex::scan_usage_incremental(request, profile, storage, cancelled, progress, &error);
+    check(result && !result->changes && result->baseline.root == baseline.root &&
+        result->baseline.snapshot_id == baseline.snapshot_id &&
+        result->baseline.manifest_sha256_hex == baseline.manifest_sha256_hex,
+        "unchanged accounting returns the exact accepted baseline");
+    check(fs::is_empty(storage / "unchanged") && fs::last_write_time(records_path) == records_time,
+        "unchanged scan leaves accepted records intact and publishes no replacement cache");
+    check(stage_notes(notes) == std::vector<std::string>{"Preparing the usage cache", "Reading Codex sessions"},
+        "unchanged scan stops before sorting, merging, and saving accounting history");
+
+    write(source, original + "{\"type\":\"response_item\",\"payload\":{\"content\":[]}}\n");
+    allocate("metadata-change", baseline);
+    result = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(result.has_value(), error.empty() ? "metadata-only incremental scan failed" : error.c_str());
+    check(result->changes && result->changes->cache_candidate,
+        "source metadata changes publish a candidate even when the total is unchanged");
+    check(result->changes->records.empty(), "metadata-only source changes retain identical accounting observations");
+    const auto metadata_baseline = result->changes->cache_candidate;
+    allocate("metadata-accepted", metadata_baseline);
+    result = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(result && !result->changes, "accepted metadata prevents repeating the same parse");
+
+    write(source, original + start("second") + tokens(26) + complete("second"));
+    allocate("appended", metadata_baseline);
+    result = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(result && result->changes && result->changes->records.size() == 1 &&
+        result->changes->records.back().total_tokens == 7,
+        "an appended turn preserves the retained turn and adds its exact delta");
+    const auto appended_baseline = result->changes->cache_candidate;
+    check(fs::remove(source), "remove source after accounting acceptance");
+    allocate("deleted", appended_baseline);
+    result = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(result && !result->changes, "source deletion retains accepted accounting without replaying it");
+
+    write(source, metadata() + start("first") + tokens(13) + complete("first"));
+    allocate("old-edit", appended_baseline);
+    result = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(result && result->changes && result->changes->records.size() == 1 &&
+        result->changes->records.front().total_tokens == 13,
+        "an edited old rollout offers its correction while retaining omitted accepted turns");
+
+    const auto corrected_baseline = result->changes->cache_candidate;
+    allocate("complete-replay", corrected_baseline);
+    const auto complete_replay = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
+    check(complete_replay && complete_replay->complete && complete_replay->records.size() == 2 &&
+        complete_replay->records.front().total_tokens == 13 && complete_replay->records.back().total_tokens == 7,
+        "usage-scan@3 flattens a piece cache into a complete snapshot including omitted accepted turns");
+
+    allocate("cancelled", appended_baseline);
+    check(!codex::scan_usage_incremental(request, profile, storage, [] { return true; }, quiet_progress, &error) &&
+        error == "cancelled", "incremental cancellation cannot publish a result");
+    write(storage / "accepted" / "rollouts", "damaged\n");
+    allocate("invalid-metadata", baseline);
+    check(!codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error),
+        "incremental metadata must match the accepted manifest before it can skip accounting work");
+}
+
+void incremental_scan_reuses_unaffected_pieces(const fs::path& fixture)
+{
+    const auto profile = fixture / "piece-profile";
+    const auto storage = fixture / "piece-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = [&](int index) {
+        return profile / "sessions" / ("rollout-piece-" + std::to_string(index) + ".jsonl");
+    };
+    for (int index = 0; index < 12; ++index) {
+        write(source(index), metadata("piece-" + std::to_string(index)) + start("first") +
+            tokens(10) + complete("first"));
+    }
+    addon::Usage_scan_request request;
+    request.mode                    = "incremental";
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "piece-account"};
+    const auto allocate = [&](const char* name, std::optional<addon::Usage_cache_reference> accepted) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate piece candidate");
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
+    };
+    const auto cancelled = [] { return false; };
+    std::string error;
+    allocate("saved", std::nullopt);
+    const auto saved = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
+    check(saved && saved->cache_candidate && saved->records.size() == 12, "establish saved accounting");
+    const auto original = metadata("piece-0") + start("first") + tokens(10) + complete("first");
+    write(source(0), original + "{\"type\":\"response_item\",\"payload\":{\"content\":[]}}\n");
+    allocate("adopted", saved->cache_candidate);
+    const auto adopted = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(adopted && adopted->changes && adopted->changes->records.empty() && adopted->changes->cache_candidate,
+        "saved accounting adopts pieces without replaying unchanged observations");
+    check(!fs::exists(storage / "adopted" / "records"), "incremental candidate owns pieces without a full-history mirror");
+    addon::Contract_failure failure;
+    const auto manifest = addon::validate_usage_cache_candidate(*adopted->changes->cache_candidate,
+        utf8(storage), request.context.account_context, cancelled, &failure);
+    check(manifest.has_value(), "adopted piece generation independently verifies");
+
+    const auto appended = original + start("second") + tokens(13) + complete("second");
+    write(source(0), appended);
+    allocate("appended", adopted->changes->cache_candidate);
+    const auto updated = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(updated && updated->changes && updated->changes->records.size() == 1 &&
+        updated->changes->records.front().record_id == "codex:piece-0:second" &&
+        updated->changes->records.front().total_tokens == 3,
+        "one appended turn exports only its changed absolute observation");
+    const auto& dated = updated->changes->records.front();
+    check(dated.temporal && dated.temporal->parent.snapshot_id == updated->changes->snapshot_id &&
+        dated.temporal->portions.size() == 1 && dated.temporal->portions.front().total_tokens == 3,
+        "changed temporal evidence is rebound to its actual delta page");
+    std::size_t inherited = 0;
+    for (const auto& file : manifest->files) {
+        if (!file.path.starts_with("records-")) continue;
+        if (fs::equivalent(storage / "adopted" / file.path, storage / "appended" / file.path)) ++inherited;
+    }
+    check(inherited > 0, "unaffected accounting pieces are reused as the same immutable files");
+
+    const auto moved = profile / "sessions" / "rollout-moved.jsonl";
+    check(fs::remove(source(0)), "remove original rollout after acceptance");
+    write(moved, appended);
+    allocate("moved", updated->changes->cache_candidate);
+    const auto relocated = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(relocated && relocated->changes && relocated->changes->records.empty(),
+        "a moved rollout retains its accepted identity and contributes no duplicate observation");
+    check(fs::remove_all(storage / "adopted") > 0 && fs::remove_all(storage / "appended") > 0,
+        "retire earlier fixture cache generations");
+
+    auto conflicting = appended;
+    const auto completion = conflicting.rfind("2026-01-02T12:00:00Z");
+    check(completion != std::string::npos, "fixture has native completion evidence");
+    conflicting.replace(completion, 20, "2026-01-03T12:00:00Z");
+    const auto previous_modified = fs::last_write_time(moved);
+    write(moved, conflicting);
+    fs::last_write_time(moved, previous_modified + std::chrono::seconds(1));
+    allocate("temporal-conflict", relocated->changes->cache_candidate);
+    const auto conflict = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(conflict && conflict->changes && conflict->changes->records.size() == 1 &&
+        conflict->changes->records.front().total_tokens == 3 && conflict->changes->records.front().temporal &&
+        conflict->changes->records.front().temporal->portions.empty(),
+        "changed temporal evidence is exported even when its accepted accounting total stays equal");
+}
+
 void selected_cache_reconciles_turns_by_identity(const fs::path& fixture)
 {
     // Turns reconcile by their stable record IDs: a rollout parsed again keeps
@@ -1340,6 +1516,78 @@ std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usa
     }
     return addon::seal_usage_cache_candidate(addon::path_to_utf8(fixture_root), profile_root, account,
         current.snapshot_id, "codex-rollout-cache@" + std::to_string(format), [] { return false; }, &failure);
+}
+
+void incremental_adoption_keeps_unexamined_temporal_evidence(const fs::path& fixture)
+{
+    const auto profile = fixture / "adoption-profile";
+    const auto storage = fixture / "adoption-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-saved.jsonl";
+    write(source, metadata("saved") + start("first") + tokens(10) + complete("first") +
+        start("second") + tokens(25) + complete("second"));
+    addon::Usage_scan_request request;
+    request.mode                    = "incremental";
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "adoption-account"};
+    const auto allocate = [&](const std::string& name, std::optional<addon::Usage_cache_reference> accepted) {
+        const auto path = storage / name;
+        check(fs::create_directory(path), "allocate adoption candidate");
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(path)};
+    };
+    const auto cancelled = [] { return false; };
+    std::string error;
+    allocate("saved", std::nullopt);
+    const auto first = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
+    check(first && first->cache_candidate, "establish saved adoption accounting");
+    for (const auto* name : {"rollouts", "records"}) {
+        const auto path = storage / "saved" / name;
+        std::ifstream input(path, std::ios::binary);
+        std::string line;
+        std::string replacement;
+        while (std::getline(input, line)) {
+            auto row = addon::parse_json(line, {}, nullptr);
+            check(row.has_value(), "read saved adoption evidence");
+            row->erase(std::string_view(name) == "rollouts" ? "temporal_parser" : "temporal_observation");
+            replacement += addon::serialize_json(*row) + '\n';
+        }
+        input.close();
+        write(path, replacement);
+    }
+    check(fs::remove(storage / "saved" / "cache-manifest.json"), "replace fixture temporal inventory");
+    addon::Contract_failure failure;
+    const auto saved = addon::seal_usage_cache_candidate(utf8(storage / "saved"), utf8(storage),
+        request.context.account_context, first->snapshot_id, "codex-rollout-cache@3", cancelled, &failure);
+    check(saved.has_value(), "seal saved accounting without temporal backfill");
+    const auto unchanged_size = fs::file_size(source);
+    const auto unchanged_time = fs::last_write_time(source);
+    write(source, std::string(unchanged_size - 1, 'x') + '\n');
+    fs::last_write_time(source, unchanged_time);
+    write(profile / "sessions" / "rollout-fresh.jsonl",
+        metadata("fresh") + start("first") + tokens(7) + complete("first"));
+    for (const int format : {1, 2, 3}) {
+        const auto baseline = format == 3 ? saved : per_rollout_fixture(*saved,
+            storage / ("format-" + std::to_string(format)), utf8(storage), request.context.account_context, format);
+        check(baseline.has_value(), "prepare saved cache format");
+        allocate("adopted-" + std::to_string(format), baseline);
+        const auto adopted = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+        check(adopted && adopted->changes && !adopted->changes->incomplete_historical_coverage &&
+            adopted->changes->records.size() == 1 && adopted->changes->records.front().record_id == "codex:fresh:first",
+            "adoption processes the new source without rereading unchanged raw history for optional evidence");
+        const auto candidate = addon::path_from_utf8(adopted->changes->cache_candidate->root);
+        std::ifstream rollouts(candidate / "rollouts", std::ios::binary);
+        std::string line;
+        bool retained_absence = false;
+        while (std::getline(rollouts, line)) {
+            const auto row = addon::parse_json(line, {}, nullptr);
+            check(row.has_value(), "read adopted rollout metadata");
+            if (row->find("source")->as_string() == utf8(source)) {
+                retained_absence = !row->find("temporal_parser");
+            }
+        }
+        check(retained_absence, "adoption does not claim that missing temporal evidence was examined");
+    }
 }
 
 void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixture)
@@ -2042,6 +2290,61 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     check_temporal(first, last);
     check(addon::validate_usage_cache_candidate(*last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "actual adapter cache verifies after paging");
+    const auto unchanged_candidate = allocation_parent / "scan-unchanged";
+    check(fs::create_directory(addon::usage_cache_io_path(unchanged_candidate)), "allocate incremental adapter candidate");
+    auto incremental = request;
+    incremental.mode = "incremental";
+    incremental.snapshot_id.reset();
+    incremental.cursor.reset();
+    incremental.native_file_cache.reset();
+    incremental.cache_selection = addon::Usage_cache_selection{
+        first.cache_candidate, addon::path_to_utf8(unchanged_candidate)};
+    const auto unchanged_id = host.invoke({addon::k_usage_incremental_capability_id, 1}, "scan",
+        addon::encode_usage_incremental_request(incremental), 15000, invocation);
+    const auto unchanged = host.wait_outcome(unchanged_id, 16000);
+    check(unchanged && unchanged->status == addon::Host_status::SUCCESS,
+        unchanged ? unchanged->reason_code.c_str() : "actual packaged incremental scan timed out");
+    check(!addon::account_context_acknowledgment_failure(*incremental.context.account_context, unchanged->payload) &&
+        !addon::profile_storage_acknowledgment_failure(*incremental.context.profile_storage, unchanged->payload),
+        "incremental responses acknowledge their account and profile storage at the invocation boundary");
+    const auto unchanged_result = addon::decode_usage_incremental_result(unchanged->payload, &failure);
+    check(unchanged_result && !unchanged_result->changes &&
+        unchanged_result->baseline == *first.cache_candidate &&
+        fs::is_empty(addon::usage_cache_io_path(unchanged_candidate)),
+        "actual adapter retains its accepted baseline without exporting a replacement snapshot");
+    std::string added_bytes = metadata("late");
+    for (int index = 0; index < 300; ++index) {
+        const auto turn = "turn-" + std::to_string(index);
+        added_bytes += start(turn) + tokens(index + 1) + complete(turn);
+    }
+    const auto added_source = profile / "sessions" / "rollout-late.jsonl";
+    write(added_source, added_bytes);
+    const auto changed_candidate = allocation_parent / "scan-changed";
+    check(fs::create_directory(addon::usage_cache_io_path(changed_candidate)), "allocate changed adapter candidate");
+    incremental.cache_selection->candidate_root = addon::path_to_utf8(changed_candidate);
+    const auto changed_page = [&] {
+        const auto id = host.invoke({addon::k_usage_incremental_capability_id, 1}, "scan",
+            addon::encode_usage_incremental_request(incremental), 15000, invocation);
+        const auto outcome = host.wait_outcome(id, 16000);
+        check(outcome && outcome->status == addon::Host_status::SUCCESS,
+            outcome ? outcome->reason_code.c_str() : "actual packaged changed scan timed out");
+        const auto result = addon::decode_usage_incremental_result(outcome->payload, &failure);
+        check(result && result->changes && result->baseline == *first.cache_candidate,
+            "actual adapter returns changes bound to the selected baseline");
+        for (const auto& record : result->changes->records) {
+            check(record.record_id.starts_with("codex:late:"), "changed pages omit retained accounting");
+        }
+        return *result->changes;
+    };
+    const auto changed_first = changed_page();
+    check(!changed_first.complete && changed_first.records.size() == 256, "changed observations respect page bounds");
+    incremental.snapshot_id = changed_first.snapshot_id;
+    incremental.cursor      = changed_first.next_cursor;
+    const auto changed_last = changed_page();
+    check(changed_last.complete && changed_last.records.size() == 44 &&
+        changed_last.cache_candidate == changed_first.cache_candidate,
+        "changed continuation exports the remaining observations from the same sealed candidate");
+    check(fs::remove(added_source), "remove late fixture after isolated changed scan");
     check(fs::remove(source), "remove native history to exercise selected cache replay");
     const auto replay_candidate = allocation_parent / "scan-replay";
     check(fs::create_directory(addon::usage_cache_io_path(replay_candidate)), "allocate replay candidate");
@@ -2154,6 +2457,9 @@ int main(int argc, char** argv)
         native_turn_identity_remains_validated(fixture.path / "rollout-native.jsonl");
         selected_cache_preserves_host_authority(fixture.path);
         selected_cache_stays_compact_across_incremental_scans(fixture.path);
+        incremental_scan_preserves_the_accepted_generation(fixture.path);
+        incremental_scan_reuses_unaffected_pieces(fixture.path);
+        incremental_adoption_keeps_unexamined_temporal_evidence(fixture.path);
         selected_cache_reconciles_turns_by_identity(fixture.path);
         selected_cache_retains_repository_attribution(fixture.path);
         selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);

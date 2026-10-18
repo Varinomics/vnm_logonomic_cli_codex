@@ -41,6 +41,23 @@ unknown present source semantics fail the import. Aggregate evidence remains
 partial. The usage-scan@1/2 mutable cache namespaces and record grammar are
 unchanged.
 
+The optional `usage-incremental@1` operation binds each update to the exact
+host-accepted cache. When rollout metadata, parser evidence and historical
+coverage are unchanged, it retains that generation without reading, rewriting
+or exporting its accounting records. It verifies the selected manifest and the
+metadata files it consumes. A metadata change still publishes a candidate even
+when it does not change the token total. Changed updates export only changed
+absolute observations; omissions retain accepted accounting. Their
+`codex-rollout-cache@4` candidates partition records by stable session identity,
+reconcile the affected pieces, and reuse immutable unaffected pieces in a
+self-contained generation. Reused files retain their sealed identity; changed
+files receive fresh digests. Adoption partitions saved cache records without
+forcing a native transcript recount. A `usage-scan@3` request still produces a
+complete snapshot, including when its selected input uses record pieces.
+Unchanged sources with missing optional temporal evidence retain that honest
+absence during incremental updates; changed sources and explicit full scans
+can supply the evidence.
+
 ## Publication and progress
 
 Usage scans publish one durable generation containing per-file evidence, sorted
