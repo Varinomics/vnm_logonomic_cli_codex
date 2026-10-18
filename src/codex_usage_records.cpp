@@ -260,12 +260,13 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
     const std::function<bool(const Rollout_usage_record&)>& emit,
     const std::function<bool()>& cancelled, std::string* error)
 {
-    std::string rollout, cwd, turn, model;
+    std::string rollout, session_cwd, cwd, turn, model;
     std::int64_t started_ms = 0;
     std::uint64_t latest = 0, pending = 0;
     Cumulative_category input_tokens, output_tokens, cache_tokens;
     bool have_identity = false, have_total = false, forked = false, local_activity = false;
     bool complete_turn_event = false, saw_turn_sample = false;
+    bool turn_cwd_witnessed = false;
     const auto fail = [error](const char* reason) { *error = reason; return false; };
     Codex_jsonl_projector projector([&](const addon::Json_value& event) {
         const auto& payload = member(event, "payload");
@@ -277,13 +278,20 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             if (rollout.empty() || !instant) return fail("rollout_identity_invalid");
             started_ms = *instant;
             forked = !text(payload, "forked_from_id").empty();
-            cwd = text(payload, "cwd");
+            session_cwd = text(payload, "cwd");
             have_identity = true;
             return true;
         }
         if (event_type == "turn_context") {
             const auto event_model = text(payload, "model");
             if (!event_model.empty()) model = event_model;
+            const auto& context_turn = member(payload, "turn_id");
+            const bool matches_turn = context_turn.is_null() ||
+                (context_turn.is_string() && context_turn.as_string() == turn);
+            if (!turn.empty() && matches_turn && payload.find("cwd")) {
+                cwd = text(payload, "cwd");
+                turn_cwd_witnessed = member(payload, "cwd").is_string();
+            }
             return true;
         }
         if (event_type != "event_msg") return true;
@@ -298,6 +306,8 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             }
             local_activity = true;
             turn = next_turn;
+            cwd = session_cwd;
+            turn_cwd_witnessed = false;
             // A completed turn's total is one complete event, comparable across
             // profiles, only from a known cumulative baseline: an earlier sample,
             // and no tokens pending from a turn that never completed.
@@ -364,6 +374,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             }
         }
         record.recorded_cwd = cwd;
+        record.turn_cwd_witnessed = turn_cwd_witnessed;
         refresh_repository(&record);
         if (!emit(record)) return false;
         pending = 0;

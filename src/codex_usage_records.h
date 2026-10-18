@@ -18,6 +18,7 @@ struct Rollout_usage_record
     logonomic::cli_addon::Usage_record usage;
     std::string recorded_cwd;
     Temporal_observation temporal{};
+    bool turn_cwd_witnessed = false;
 };
 
 std::optional<std::string> repository_for_cwd(std::string_view cwd);

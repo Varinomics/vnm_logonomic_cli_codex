@@ -26,6 +26,12 @@ struct Usage_scan_limits
     std::uint64_t sort_run_bytes = 64ull * 1024 * 1024;
 };
 
+enum class Usage_scan_authority
+{
+    STANDARD,
+    REPOSITORY_ATTRIBUTION
+};
+
 // Reports each stage immediately and coalesces working-item updates to one
 // frame per second, or a quarter of the host's tolerated silence when shorter.
 // Progress continues for as long as the scan works.
@@ -66,7 +72,8 @@ std::optional<logonomic::cli_addon::Usage_scan_page> scan_usage(
     const std::filesystem::path& storage,
     const std::function<bool()>& cancelled,
     Usage_scan_progress& progress,
-    std::string* error, const Usage_scan_limits& limits = {});
+    std::string* error, const Usage_scan_limits& limits = {},
+    Usage_scan_authority authority = Usage_scan_authority::STANDARD);
 void handle_usage(logonomic::cli_addon::Invocation_context& context);
 std::optional<logonomic::cli_addon::Usage_incremental_result> scan_usage_incremental(
     const logonomic::cli_addon::Usage_scan_request& request,
@@ -74,8 +81,10 @@ std::optional<logonomic::cli_addon::Usage_incremental_result> scan_usage_increme
     const std::filesystem::path& storage,
     const std::function<bool()>& cancelled,
     Usage_scan_progress& progress,
-    std::string* error, const Usage_scan_limits& limits = {});
+    std::string* error, const Usage_scan_limits& limits = {},
+    Usage_scan_authority authority = Usage_scan_authority::STANDARD);
 void handle_usage_incremental(logonomic::cli_addon::Invocation_context& context);
+void handle_usage_repository_attribution(logonomic::cli_addon::Invocation_context& context);
 void handle_usage_session(logonomic::cli_addon::Invocation_context& context);
 std::optional<logonomic::cli_addon::Usage_session_fact> describe_usage_session(
     const logonomic::cli_addon::Usage_session_identity& identity);

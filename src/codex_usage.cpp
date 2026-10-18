@@ -6,6 +6,7 @@
 
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
+#include <logonomic_cli_addon/usage_repository_attribution.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -359,13 +360,19 @@ addon::Json_value record_accounting(const Rollout_usage_record& record, std::uin
 }
 
 std::string encode_record(const Rollout_usage_record& record, std::uint16_t version = 2,
-    bool include_temporal = true)
+    bool include_temporal = true, bool include_turn_context = false)
 {
     auto envelope = record_accounting(record, version);
+    // This flag travels only through a fresh parse's temporary spool. Accepted
+    // caches never supply a witness for a later correction.
+    if (version == 3 && include_turn_context && record.turn_cwd_witnessed) {
+        envelope.set("turn_cwd_witnessed", addon::Json_value(true));
+    }
     if (version == 3 && include_temporal && (record.temporal.instant || record.temporal.opaque ||
         record.temporal.reason != "missing-evidence"))
     {
-        envelope.set("temporal_observation", encode_temporal_observation(record.temporal, envelope));
+        envelope.set("temporal_observation", encode_temporal_observation(record.temporal,
+            record_accounting(record, version)));
         const auto encoded = addon::serialize_json(envelope);
         if (encoded.size() <= k_line_limit) return encoded;
         envelope.erase("temporal_observation");
@@ -382,6 +389,7 @@ Rollout_usage_record decode_record(std::string_view line, std::uint16_t version 
     require(record.has_value(), "usage_cache_invalid");
     Rollout_usage_record result{std::move(*record), string_member(*value, "recorded_cwd")};
     if (version == 3) {
+        result.turn_cwd_witnessed = member(*value, "turn_cwd_witnessed") == addon::Json_value(true);
         result.temporal = decode_temporal_observation(value->find("temporal_observation"),
             record_accounting(result, version));
         const auto& proof = result.usage.cross_source_event;
@@ -485,7 +493,7 @@ Rollout_refresh refresh_rollout(const fs::path& path, const std::string& source,
     std::optional<std::string> session;
     const bool parsed = read_rollout_usage(input, addon::path_from_utf8(source), [&](const Rollout_usage_record& record) {
         session = record.usage.session_key;
-        write_line(output, encode_record(record, version));
+        write_line(output, encode_record(record, version, true, true));
         return true;
     }, cancelled, &error);
     output.close();
@@ -732,9 +740,8 @@ bool id_less(std::string_view left, std::string_view right)
         [](unsigned char a, unsigned char b) { return a < b; });
 }
 
-// A rollout's records share its working directory, so each run of records
-// from one directory resolves its repository once, and the memo holds one
-// directory however many a history has.
+// Consecutive turns in one directory resolve its repository once. The memo
+// holds one directory however many a history has.
 class Repository_memo final
 {
 public:
@@ -923,6 +930,8 @@ private:
 };
 
 bool same_observation(Rollout_usage_record left, Rollout_usage_record right);
+void defer_repository_growth(const Rollout_usage_record& accepted, Rollout_usage_record& observed);
+void reduce_legacy_repository(const Rollout_usage_record& accepted, Rollout_usage_record& observed);
 
 enum class Snapshot_evidence : char
 {
@@ -963,8 +972,22 @@ void write_unique_snapshot_records(const fs::path& sorted, const std::optional<f
             }
             if (retained && retained->usage.record_id == record.usage.record_id) {
                 if (evidence == Snapshot_evidence::RETAINED) {
+                    const bool deferred_attribution = record.recorded_cwd != retained->recorded_cwd;
                     record = *retained;
-                    repositories.refresh(&record);
+                    if (!deferred_attribution) repositories.refresh(&record);
+                }
+                else
+                if (evidence == Snapshot_evidence::LIVE && record.recorded_cwd != retained->recorded_cwd) {
+                    if (record.usage.total_tokens == retained->usage.total_tokens) {
+                        record.usage.repository_path = retained->usage.repository_path;
+                        record.usage.repository_usage = retained->usage.repository_usage;
+                        record.recorded_cwd = retained->recorded_cwd;
+                    }
+                    else
+                    if (record.usage.total_tokens < retained->usage.total_tokens) {
+                        reduce_legacy_repository(*retained, record);
+                    }
+                    else defer_repository_growth(*retained, record);
                 }
                 record.usage.source_path = retained->usage.source_path;
             }
@@ -1273,12 +1296,70 @@ bool confirms(const Rollout_usage_record& accepted, const Rollout_usage_record& 
         : observed.usage.total_tokens >= accepted.usage.total_tokens;
 }
 
+void clear_repository_correction(addon::Usage_record& record)
+{
+    const auto* tag = record.capabilities.find(addon::k_usage_repository_attribution_capability_id);
+    if (tag && addon::decode_usage_repository_attribution_tag(*tag, nullptr) ==
+        addon::Usage_repository_attribution_tag_status::AVAILABLE)
+    {
+        record.capabilities.erase(addon::k_usage_repository_attribution_capability_id);
+    }
+}
+
+void correct_repository(Rollout_usage_record& accepted, const Rollout_usage_record& observed,
+    Usage_scan_authority authority)
+{
+    if (authority != Usage_scan_authority::REPOSITORY_ATTRIBUTION || !observed.turn_cwd_witnessed ||
+        observed.recorded_cwd == accepted.recorded_cwd || !observed.usage.repository_usage ||
+        observed.usage.repository_usage->allocations.size() != 1 ||
+        accepted.usage.capabilities.find(addon::k_usage_repository_attribution_capability_id)) return;
+    accepted.recorded_cwd = observed.recorded_cwd;
+    refresh_repository(&accepted, observed.usage.repository_usage->allocations.front().repository_path);
+    accepted.usage.capabilities.set(addon::k_usage_repository_attribution_capability_id,
+        addon::encode_usage_repository_attribution_tag());
+}
+
+void defer_repository_growth(const Rollout_usage_record& accepted, Rollout_usage_record& observed)
+{
+    if (observed.recorded_cwd == accepted.recorded_cwd ||
+        observed.usage.total_tokens <= accepted.usage.total_tokens) return;
+    // Numeric growth and reattribution have separate authority. Preserve known
+    // allocations until a later parse confirms the newly accepted total.
+    auto allocation = accepted.usage.repository_usage.value_or(
+        addon::Usage_repository{{}, accepted.usage.total_tokens});
+    allocation.unattributed_tokens += observed.usage.total_tokens - accepted.usage.total_tokens;
+    observed.usage.repository_path.reset();
+    observed.usage.repository_usage = std::move(allocation);
+    observed.recorded_cwd = accepted.recorded_cwd;
+}
+
+void reduce_legacy_repository(const Rollout_usage_record& accepted, Rollout_usage_record& observed)
+{
+    auto allocation = accepted.usage.repository_usage.value_or(
+        addon::Usage_repository{{}, accepted.usage.total_tokens});
+    auto known = accepted.usage.total_tokens - allocation.unattributed_tokens;
+    // Native Codex observations have at most one known repository. Legacy
+    // numeric reductions consume deferred unknown tokens first, then reduce
+    // that sole component without granting authority to move it elsewhere.
+    if (allocation.allocations.size() == 1) {
+        known = std::min(known, observed.usage.total_tokens);
+        allocation.allocations.front().total_tokens = known;
+    }
+    // A mixed external cache has no evidence identifying which known
+    // component a reduction below their combined total should consume.
+    require(known <= observed.usage.total_tokens, "usage_repository_attribution_ambiguous");
+    allocation.unattributed_tokens = observed.usage.total_tokens - known;
+    observed.usage.repository_path.reset();
+    observed.usage.repository_usage = std::move(allocation);
+    observed.recorded_cwd = accepted.recorded_cwd;
+}
+
 // Writes the snapshot's `records`, reconciling every turn by its stable record
 // ID. A turn parsed in this scan wins over one converted from a native seed,
 // which wins over the accepted record, and a turn missing from a rollout parsed
 // again keeps its accepted record. An observation that confirms an accepted
-// turn leaves the accepted record whole: where its rollout lived, its
-// repository attribution, completion date, provenance and category detail are
+// turn leaves the accepted accounting whole: where its rollout lived, its
+// completion date, provenance and category detail are
 // facts of the accepted observation, which the host compares a partial
 // observation against and rejects when they change. So a moved rollout keeps
 // one observation under its accepted identity, a checkout removed or moved
@@ -1288,13 +1369,16 @@ bool confirms(const Rollout_usage_record& accepted, const Rollout_usage_record& 
 // observation's, so a turn accepted before its proof could be established
 // gains it when its rollout is parsed again; the host adds a proof to an
 // accepted record and keeps one an observation lacks. An observation that
-// contradicts an accepted turn is presented for the host to accept or reject;
-// it and every new turn carry the attribution their parse found. Differing
+// contradicts an accepted turn is presented for the host to accept or reject.
+// A separately selected attribution operation may correct a confirmed turn's
+// repository from matching live context. Numeric growth defers that correction
+// and retains the old allocation, with its growth unknown. A host-selected
+// native seed supplies the accepted observation on first import. Differing
 // observations of one turn within this scan fail it.
 bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs::path>& accepted,
     std::uint16_t accepted_version, Record_sorter& accepted_rollout_keys,
     const fs::path& seeded_path, const fs::path& parsed_path, const std::function<bool()>& cancelled,
-    Record_sorter* changes = nullptr)
+    Record_sorter* changes = nullptr, Usage_scan_authority authority = Usage_scan_authority::STANDARD)
 {
     std::optional<Record_stream> retained;
     if (accepted) retained.emplace(*accepted, accepted_version, "usage_cache_unavailable");
@@ -1316,11 +1400,13 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
                 continue;
             }
             require(same_observation(observation, *chosen), "duplicate_usage_record");
+            const bool witnessed = chosen->turn_cwd_witnessed || observation.turn_cwd_witnessed;
             if (observation.usage.source_path.value_or("") < chosen->usage.source_path.value_or("")) {
                 reconcile_temporal_observations(observation.temporal, chosen->temporal);
                 chosen = std::move(observation);
             }
             else reconcile_temporal_observations(chosen->temporal, observation.temporal);
+            chosen->turn_cwd_witnessed = witnessed;
         }
         return chosen;
     };
@@ -1347,12 +1433,15 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
             if (changes) accepted_encoding = encode_record(*accepted_record, 3);
         }
         const bool parsed_again = parsed.head() && parsed.head()->usage.record_id == *id;
-        auto seeded_choice = choose(seeded, *id, !parsed_again);
+        auto seeded_choice = choose(seeded, *id, !accepted_record);
         auto parsed_choice = choose(parsed, *id, true);
+        if (!accepted_record && seeded_choice) accepted_record = *seeded_choice;
         auto& chosen = parsed_again ? parsed_choice : seeded_choice;
         Rollout_usage_record* record = accepted_record ? &*accepted_record : nullptr;
+        if (record) clear_repository_correction(record->usage);
         if (chosen) {
             if (!accepted_record || !confirms(*accepted_record, *chosen)) {
+                if (accepted_record) defer_repository_growth(*accepted_record, *chosen);
                 record = &*chosen;
             }
             else {
@@ -1360,6 +1449,7 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
                     accepted_record->usage.cross_source_event = chosen->usage.cross_source_event;
                 }
                 reconcile_temporal_observations(accepted_record->temporal, chosen->temporal);
+                if (parsed_again) correct_repository(*accepted_record, *chosen, authority);
             }
         }
         auto encoded = encode_record(*record, 3);
@@ -1474,7 +1564,7 @@ void flatten_record_pieces(const addon::Usage_cache_manifest& manifest, const fs
 void merge_incremental_records(const addon::Usage_scan_request& request,
     const addon::Usage_cache_manifest& accepted, const fs::path& work, std::uint16_t accepted_version,
     Record_sorter& accepted_keys, const fs::path& seeded_path, const fs::path& parsed_path,
-    const Usage_scan_limits& limits, const std::function<bool()>& cancelled)
+    const Usage_scan_limits& limits, const std::function<bool()>& cancelled, Usage_scan_authority authority)
 {
     const auto& baseline = *request.cache_selection->accepted;
     const auto source = addon::usage_cache_io_path(addon::path_from_utf8(baseline.root));
@@ -1514,7 +1604,7 @@ void merge_incremental_records(const addon::Usage_scan_request& request,
                 have_retained ? std::optional(accepted_path) : std::nullopt, 3, accepted_keys,
                 seeded.contains(piece) ? work / ("seeded-" + piece) : empty_path,
                 parsed.contains(piece) ? work / ("parsed-" + piece) : empty_path,
-                cancelled, &changes);
+                cancelled, &changes, authority);
             if (!changed) fs::remove(work / piece);
         }
         if (!changed && have_retained) {
@@ -1778,11 +1868,20 @@ bool recheck_rollout_copies(const fs::path& work, const fs::path& peers_path, Re
     return incomplete;
 }
 
-std::string selection_digest(addon::Usage_scan_request request)
+std::string selection_digest(addon::Usage_scan_request request, bool incremental, Usage_scan_authority authority)
 {
     request.snapshot_id.reset();
     request.cursor.reset();
-    return digest(addon::serialize_json_canonical(addon::encode_usage_scan_request(request, 3)));
+    auto identity = addon::Json_value::object();
+    const bool attribution = authority == Usage_scan_authority::REPOSITORY_ATTRIBUTION;
+    identity.set("capability", addon::Json_value(attribution ? addon::k_usage_repository_attribution_capability_id :
+        incremental ? addon::k_usage_incremental_capability_id : "usage-scan"));
+    identity.set("version", addon::Json_value(attribution ? addon::k_usage_repository_attribution_version :
+        incremental ? addon::k_usage_incremental_version : 3));
+    identity.set("operation", addon::Json_value(attribution && incremental ?
+        addon::k_usage_repository_attribution_incremental_operation : addon::k_usage_scan_operation));
+    identity.set("request", addon::encode_usage_scan_request(request, 3));
+    return digest(addon::serialize_json_canonical(identity));
 }
 
 std::optional<addon::Usage_scan_page> scan_selected_cache(
@@ -1792,7 +1891,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     const std::function<bool()>& cancelled,
     Usage_scan_progress& progress,
     const Usage_scan_limits& limits,
-    bool incremental = false)
+    bool incremental = false, Usage_scan_authority authority = Usage_scan_authority::STANDARD)
 {
     addon::Contract_failure failure;
     if (!addon::validate_usage_cache_selection(request, &failure)) {
@@ -1815,7 +1914,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     if (!addon::validate_usage_cache_root(selection.candidate_root, profile_root, &failure)) {
         throw Scan_failure{failure.reason_code};
     }
-    const auto request_hash = selection_digest(request);
+    const auto request_hash = selection_digest(request, incremental, authority);
     if (request.snapshot_id) {
         require(request.cursor.has_value(), "usage_cursor_invalid");
         const auto state = read_json(work / "cache-state");
@@ -1976,11 +2075,11 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         [](const std::string& line) { return line; }, false);
     if (incremental) {
         merge_incremental_records(request, *accepted_manifest, work, accepted_version, accepted_keys,
-            seeded_path, parsed_path, limits, working);
+            seeded_path, parsed_path, limits, working, authority);
     }
     else {
         merge_snapshot_records(work / "records", accepted_records, accepted_version,
-            accepted_keys, seeded_path, parsed_path, working);
+            accepted_keys, seeded_path, parsed_path, working, nullptr, authority);
         if (accepted_manifest && accepted_manifest->format == k_piece_cache_format) fs::remove(*accepted_records);
     }
     accepted_keys.finish(accepted_keys_path);
@@ -2062,7 +2161,7 @@ void Usage_scan_progress::emit()
 
 std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request& request,
     const fs::path& vendor_profile, const fs::path& storage, const std::function<bool()>& cancelled,
-    Usage_scan_progress& progress, std::string* error, const Usage_scan_limits& limits)
+    Usage_scan_progress& progress, std::string* error, const Usage_scan_limits& limits, Usage_scan_authority authority)
 {
     try {
         std::unique_lock lock(scan_mutex, std::defer_lock);
@@ -2075,8 +2174,9 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         }
         check_cancel(cancelled);
         if (request.cache_selection) {
-            return scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits);
+            return scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits, false, authority);
         }
+        require(authority == Usage_scan_authority::STANDARD, "usage_cache_selection_required");
         const auto root = directory(storage, "codex-usage-v1");
         Storage_lock storage_lock(root / "scan.lock", cancelled);
         const auto snapshots = directory(root, "snapshots");
@@ -2167,7 +2267,7 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
 std::optional<addon::Usage_incremental_result> scan_usage_incremental(
     const addon::Usage_scan_request& request, const fs::path& vendor_profile, const fs::path& storage,
     const std::function<bool()>& cancelled, Usage_scan_progress& progress,
-    std::string* error, const Usage_scan_limits& limits)
+    std::string* error, const Usage_scan_limits& limits, Usage_scan_authority authority)
 {
     try {
         require(request.mode == "incremental" && request.cache_selection && request.cache_selection->accepted &&
@@ -2179,7 +2279,7 @@ std::optional<addon::Usage_incremental_result> scan_usage_incremental(
         }
         check_cancel(cancelled);
         addon::Usage_incremental_result result{*request.cache_selection->accepted,
-            scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits, true),
+            scan_selected_cache(request, vendor_profile, storage, cancelled, progress, limits, true, authority),
             request.context.account_context, request.context.profile_storage};
         return result;
     }
@@ -2191,7 +2291,10 @@ std::optional<addon::Usage_incremental_result> scan_usage_incremental(
 
 void handle_usage_incremental(addon::Invocation_context& context)
 {
-    if (context.request().operation != addon::k_usage_scan_operation) {
+    const bool attribution = context.request().capability.capability_id == addon::k_usage_repository_attribution_capability_id;
+    if (context.request().operation != (attribution ? addon::k_usage_repository_attribution_incremental_operation :
+        addon::k_usage_scan_operation))
+    {
         context.reject_unknown_operation();
         return;
     }
@@ -2212,7 +2315,8 @@ void handle_usage_incremental(addon::Invocation_context& context)
         std::chrono::milliseconds(context.request().deadline_ms));
     const auto result = scan_usage_incremental(*request, addon::path_from_utf8(profile->profile_path),
         addon::path_from_utf8(request->context.profile_storage->root),
-        [&context] { return context.cancel_requested(); }, progress, &error);
+        [&context] { return context.cancel_requested(); }, progress, &error, {}, attribution ?
+            Usage_scan_authority::REPOSITORY_ATTRIBUTION : Usage_scan_authority::STANDARD);
     if (!result) {
         context.fail(error == "cancelled" ? addon::Result_status::CANCELLED : addon::Result_status::FAILED, error);
         return;
@@ -2224,7 +2328,8 @@ void handle_usage(addon::Invocation_context& context)
 {
     if (context.request().operation != addon::k_usage_scan_operation) { context.reject_unknown_operation(); return; }
     addon::Contract_failure failure;
-    const auto version = context.request().capability.version;
+    const bool attribution = context.request().capability.capability_id == addon::k_usage_repository_attribution_capability_id;
+    const std::uint16_t version = attribution ? 3 : context.request().capability.version;
     const auto request = addon::decode_usage_scan_request(context.request().payload, &failure, version);
     if (!request) { context.fail(addon::Result_status::FAILED, failure.reason_code); return; }
     const auto profile = selected_profile(request->context, context);
@@ -2237,9 +2342,18 @@ void handle_usage(addon::Invocation_context& context)
         },
         std::chrono::milliseconds(context.request().deadline_ms));
     const auto page = scan_usage(*request, addon::path_from_utf8(profile->profile_path), addon::path_from_utf8(request->context.profile_storage->root),
-        [&context] { return context.cancel_requested(); }, progress, &error);
+        [&context] { return context.cancel_requested(); }, progress, &error, {}, attribution ?
+            Usage_scan_authority::REPOSITORY_ATTRIBUTION : Usage_scan_authority::STANDARD);
     if (!page) { context.fail(error == "cancelled" ? addon::Result_status::CANCELLED : addon::Result_status::FAILED, error); return; }
     context.succeed(addon::encode_usage_scan_result(*page, version));
+}
+
+void handle_usage_repository_attribution(addon::Invocation_context& context)
+{
+    if (context.request().operation == addon::k_usage_repository_attribution_incremental_operation) {
+        handle_usage_incremental(context);
+    }
+    else handle_usage(context);
 }
 
 std::optional<addon::Usage_session_fact> describe_usage_session(const addon::Usage_session_identity& identity)

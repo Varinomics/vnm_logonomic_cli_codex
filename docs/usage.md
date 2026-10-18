@@ -1,6 +1,10 @@
 # Usage evidence and caches
 
 The package scans per-turn native usage under the selected `CODEX_HOME`.
+Each completed turn uses its matching native `turn_context.cwd`; an ID-less
+context belongs to the active turn. Without matching context it falls back to
+the session directory, never the preceding turn's directory. An explicitly
+unknown cwd remains unattributed.
 Both `sessions` and `archived_sessions` contribute native history, including
 on a fresh import or reset. Archiving preserves stable native turn identities;
 overlapping copies contribute each turn once and retained history survives moves.
@@ -37,16 +41,33 @@ moved since acceptance does not change the accepted attribution, a turn
 imported from the native cache keeps its native provenance, and a confirmed
 record without a proof gains one when its rollout is parsed again, for example
 by a repair scan.
-New turns, and turns an observation contradicts, are attributed as their
-checkout stands at the scan; a contradicting observation is presented for the
-host to accept or reject. A selected
+New turns are attributed as their checkout stands at the scan. A contradicting
+observation is presented for the host to accept or reject. If a proved numeric
+increase also changes the observed directory, it keeps prior allocations and
+records only the growth as unknown until the new total is accepted. A selected
 `codex-rollout-cache@1` or `@2` cache, which kept two files per rollout, is
 validated and converted into a fresh candidate without modifying the selected
 input or inventing provenance absent from its records. Native imports preserve
 `cumulative_turn_delta` together with the validated rollout/turn record identity;
 unknown present source semantics fail the import. Aggregate evidence remains
 partial. The usage-scan@1/2 mutable cache namespaces and record grammar are
-unchanged.
+unchanged. Legacy numeric reductions retain the prior repository, consuming
+deferred unknown tokens before reducing the sole known allocation. A mixed
+external allocation can consume unknown tokens, but a reduction that would
+require choosing among known repositories is refused.
+
+The optional `usage-repository-attribution@1` capability provides `scan` and
+`incremental` operations with the existing usage request and result grammars.
+Only these operations can correct an accepted turn's repository. A fresh parse
+must confirm its accepted total and witness a different matching turn cwd that
+resolves to a repository. The correction preserves accepted accounting, dates,
+categories and native provenance, and tags the repository-only replacement for
+host validation. A validated host-selected native seed supplies that accepted
+observation during first import. Missing source, session fallback, unresolved
+cwd and the disappearance of a Git marker cannot retract accepted attribution.
+Existing unchanged caches gain no automatic reread; explicit repair or a
+naturally changed source supplies the evidence. Continuations remain bound to
+the capability and operation that sealed their candidate.
 
 The optional `usage-incremental@1` operation binds each update to the exact
 host-accepted cache. When rollout metadata, parser evidence and historical

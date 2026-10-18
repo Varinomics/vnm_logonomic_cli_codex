@@ -6,6 +6,7 @@
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
+#include <logonomic_cli_addon/usage_repository_attribution.h>
 
 #include <algorithm>
 #include <chrono>
@@ -74,6 +75,17 @@ std::string start(std::string_view turn, int seconds = 1767225601)
 {
     return "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"" +
         std::string(turn) + "\",\"started_at\":" + std::to_string(seconds) + "}}\n";
+}
+
+std::string turn_context(std::string_view turn, const fs::path& cwd)
+{
+    auto payload = addon::Json_value::object();
+    if (!turn.empty()) payload.set("turn_id", addon::Json_value(std::string(turn)));
+    payload.set("cwd", addon::Json_value(addon::path_to_utf8(cwd)));
+    auto event = addon::Json_value::object();
+    event.set("type", addon::Json_value("turn_context"));
+    event.set("payload", std::move(payload));
+    return addon::serialize_json(event) + '\n';
 }
 
 std::string tokens(int total, std::string_view categories = {})
@@ -150,6 +162,47 @@ void reducer_keeps_turn_deltas_resets_and_fork_baselines(const fs::path& path)
         "cache creation retains the native unsupported category");
 }
 
+void reducer_attributes_resumed_turns(const fs::path& fixture)
+{
+    const auto original = fixture / "original-repository";
+    const auto resumed  = fixture / "resumed-repository";
+    check(fs::create_directories(original / ".git"), "create original repository");
+    check(fs::create_directories(resumed / ".git"), "create resumed repository");
+    const auto records = reduce(
+        metadata_with_cwd("resumed", original) +
+        start("first") + turn_context("first", original) + tokens(1200) + complete("first") +
+        start("second") + turn_context("second", resumed) + tokens(1800) + complete("second"),
+        fixture / "rollout-resumed.jsonl");
+    check(records.size() == 2 && records[0].usage.total_tokens == 1200 &&
+        records[1].usage.total_tokens == 600, "resume keeps the correct account-wide token deltas");
+    check(records[0].recorded_cwd == addon::path_to_utf8(original) &&
+        records[1].recorded_cwd == addon::path_to_utf8(resumed),
+        "each completed turn uses its matching native working directory");
+    check(records[0].usage.repository_usage->allocations[0].repository_path == addon::path_to_utf8(original) &&
+        records[1].usage.repository_usage->allocations[0].repository_path == addon::path_to_utf8(resumed),
+        "resumed usage belongs to its native turn repository");
+
+    const auto invalid_context = "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":42,\"cwd\":" +
+        addon::serialize_json(addon::Json_value(addon::path_to_utf8(resumed))) + "}}\n";
+    const auto fallback = reduce(
+        metadata_with_cwd("fallback", original) +
+        start("resumed") + turn_context("", resumed) + tokens(50) + complete("resumed") +
+        start("missing") + turn_context("another-turn", resumed) + tokens(70) + complete("missing") +
+        start("unknown") + turn_context("unknown", {}) + tokens(90) + complete("unknown") +
+        start("malformed") + invalid_context + tokens(110) + complete("malformed"),
+        fixture / "rollout-fallback.jsonl");
+    check(fallback.size() == 4 && fallback[0].recorded_cwd == addon::path_to_utf8(resumed),
+        "native contexts without a turn ID belong to the active turn");
+    check(fallback[1].recorded_cwd == addon::path_to_utf8(original),
+        "missing matching context falls back to session metadata rather than the preceding turn");
+    check(fallback[2].recorded_cwd.empty() &&
+        fallback[2].usage.repository_usage->allocations.empty() &&
+        fallback[2].usage.repository_usage->unattributed_tokens == 20,
+        "a supplied unknown working directory cannot inherit the original repository");
+    check(fallback[3].recorded_cwd == addon::path_to_utf8(original),
+        "a malformed native turn ID cannot supply attribution for the active turn");
+}
+
 bool proves(const codex::Rollout_usage_record& record, std::string_view event_id)
 {
     const auto& proof = record.usage.cross_source_event;
@@ -209,6 +262,392 @@ fs::path accepted_snapshot(const fs::path& storage)
     check(pointer && pointer->find("snapshot") && pointer->find("snapshot")->is_string(),
         "accepted generation has its snapshot identity");
     return root / "snapshots" / pointer->find("snapshot")->as_string();
+}
+
+void scanner_keeps_per_turn_repositories(const fs::path& fixture, bool selected)
+{
+    const auto root     = fixture / (selected ? "turn-selected" : "turn-mutable");
+    const auto profile  = root / "profile";
+    const auto storage  = root / "storage";
+    const auto original = root / "original";
+    const auto resumed  = root / "resumed";
+    check(fs::create_directories(profile / "sessions"), "create turn profile");
+    check(fs::create_directory(storage), "create turn cache storage");
+    check(fs::create_directories(original / ".git"), "create original turn repository");
+    check(fs::create_directories(resumed / ".git"), "create resumed turn repository");
+    const auto source = profile / "sessions" / "rollout-per-turn.jsonl";
+    const auto history = metadata_with_cwd("per-turn", original) +
+        start("first") + turn_context("first", original) + tokens(1200) + complete("first") +
+        start("second") + turn_context("second", resumed) + tokens(1800) + complete("second");
+    write(source, history);
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "turn-account"};
+    if (selected) request.context.profile_storage = addon::Profile_storage_context{1, addon::path_to_utf8(storage)};
+    std::optional<addon::Usage_cache_reference> accepted;
+    for (unsigned generation = 0; generation < 3; ++generation) {
+        if (selected) {
+            const auto candidate = storage / ("generation-" + std::to_string(generation));
+            check(fs::create_directory(candidate), "allocate turn cache candidate");
+            request.cache_selection = addon::Usage_cache_selection{accepted, addon::path_to_utf8(candidate)};
+        }
+        if (generation == 1) {
+            write(source, history + start("third") + tokens(1875) + complete("third"));
+        }
+        std::string error;
+        const auto page = codex::scan_usage(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(page && page->complete && page->records.size() == (generation == 0 ? 2 : 3),
+            error.empty() ? "per-turn scanner retains each completed turn" : error.c_str());
+        check(page->records[0].total_tokens == 1200 && page->records[1].total_tokens == 600,
+            "cache refresh retains the account totals");
+        for (const auto& record : page->records) {
+            const auto& expected = record.record_id == "codex:per-turn:second" ? resumed : original;
+            check(record.repository_usage && record.repository_usage->allocations.size() == 1 &&
+                record.repository_usage->allocations[0].repository_path == addon::path_to_utf8(expected) &&
+                record.repository_usage->allocations[0].total_tokens == record.total_tokens,
+                "fresh, changed and reused caches preserve heterogeneous turn directories");
+        }
+        accepted = page->cache_candidate;
+    }
+}
+
+void mutable_cache_preserves_accepted_attribution(const fs::path& fixture)
+{
+    const auto profile  = fixture / "legacy-attribution-profile";
+    const auto storage  = fixture / "legacy-cwd";
+    const auto original = fixture / "legacy-attribution-original";
+    const auto resumed  = fixture / "legacy-attribution-resumed";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    fs::create_directories(original / ".git");
+    fs::create_directories(resumed / ".git");
+    const auto source = profile / "sessions" / "rollout-legacy-attribution.jsonl";
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "legacy-attribution"};
+    const auto scan = [&] {
+        std::string error;
+        auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+        check(page && page->complete, error.empty() ? "legacy attribution scan completes" : error.c_str());
+        return *page;
+    };
+    const auto bytes = [&](const fs::path& cwd, int total) {
+        return metadata_with_cwd("legacy-attribution", original) + tokens(3) + start("first") +
+            turn_context("first", cwd) + tokens(total + 3) + complete("first");
+    };
+    write(source, bytes(original, 20));
+    scan();
+    write(source, bytes(resumed, 20));
+    const auto confirmed = scan();
+    check(confirmed.records.size() == 1 && confirmed.records.front().total_tokens == 20 &&
+        confirmed.records.front().repository_usage->allocations.front().repository_path == addon::path_to_utf8(original),
+        "legacy ordinary scans cannot move an accepted turn to a different repository");
+    write(source, bytes(resumed, 25) + start("second") + turn_context("second", resumed) + tokens(35) + complete("second"));
+    for (int generation = 0; generation < 2; ++generation) {
+        const auto grown = scan();
+        check(grown.records.size() == 2 && grown.records[0].total_tokens == 25 &&
+            grown.records[0].repository_usage->allocations.front().repository_path == addon::path_to_utf8(original) &&
+            grown.records[0].repository_usage->allocations.front().total_tokens == 20 &&
+            grown.records[0].repository_usage->unattributed_tokens == 5,
+            "legacy growth and unchanged replay preserve known allocations and leave growth unknown");
+        check(grown.records[1].total_tokens == 7 &&
+            grown.records[1].repository_usage->allocations.front().repository_path == addon::path_to_utf8(resumed),
+            "legacy new turns still use their matching native repository");
+    }
+    for (const auto total : {22, 15}) {
+        write(source, bytes(resumed, total));
+        for (int generation = 0; generation < 2; ++generation) {
+            const auto reduced = scan();
+            const auto& record = reduced.records.front();
+            check(record.total_tokens == total && record.repository_usage &&
+                record.repository_usage->allocations.size() == 1 &&
+                record.repository_usage->allocations.front().repository_path == addon::path_to_utf8(original) &&
+                record.repository_usage->allocations.front().total_tokens == std::min(total, 20) &&
+                record.repository_usage->unattributed_tokens == std::max(total - 20, 0),
+                "legacy lower totals consume unknown first and retain the sole known repository");
+        }
+    }
+    const auto replace_allocation = [&](const addon::Usage_repository& allocation) {
+        const auto accepted = accepted_snapshot(storage);
+        const auto read = [](const fs::path& path) {
+            std::ifstream input(path, std::ios::binary);
+            check(static_cast<bool>(input), "read legacy allocation fixture");
+            return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        };
+        auto envelope = addon::parse_json(read(accepted / "records"), {}, nullptr);
+        check(envelope.has_value(), "read sole legacy record envelope");
+        auto record = addon::decode_usage_record(*envelope->find("usage"), nullptr, 2);
+        check(record.has_value(), "read legacy accounting");
+        record->repository_path.reset();
+        record->repository_usage = allocation;
+        envelope->set("usage", addon::encode_usage_record(*record, 2));
+        const auto records = addon::serialize_json(*envelope) + '\n';
+        write(accepted / "records", records);
+        std::istringstream input(read(accepted / "inventory"));
+        std::string inventory;
+        for (std::string line; std::getline(input, line);) {
+            auto entry = addon::parse_json(line, {}, nullptr);
+            check(entry.has_value(), "read legacy inventory entry");
+            if (entry->find("name")->as_string() == "records") {
+                entry->set("sha256", addon::Json_value(addon::to_hex(addon::Sha256::digest(records))));
+            }
+            inventory += addon::serialize_json(*entry) + '\n';
+        }
+        write(accepted / "inventory", inventory);
+        const auto pointer_path = storage / "codex-usage-v1" / "accepted";
+        auto pointer = addon::parse_json(read(pointer_path), {}, nullptr);
+        check(pointer.has_value(), "read legacy accepted pointer");
+        pointer->set("inventory_sha256", addon::Json_value(addon::to_hex(addon::Sha256::digest(inventory))));
+        write(pointer_path, addon::serialize_json(*pointer) + '\n');
+    };
+    replace_allocation({{{addon::path_to_utf8(original), 7}, {addon::path_to_utf8(resumed), 5}}, 3});
+    write(source, bytes(resumed, 13));
+    const auto mixed = scan();
+    check(mixed.records.front().total_tokens == 13 &&
+        mixed.records.front().repository_usage->allocations.size() == 2 &&
+        mixed.records.front().repository_usage->allocations[0].total_tokens == 7 &&
+        mixed.records.front().repository_usage->allocations[1].total_tokens == 5 &&
+        mixed.records.front().repository_usage->unattributed_tokens == 1,
+        "a mixed legacy allocation can consume unknown without choosing a known component");
+    const auto before_refusal = accepted_snapshot(storage);
+    write(source, bytes(resumed, 11));
+    std::string error;
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
+        error == "usage_repository_attribution_ambiguous" && accepted_snapshot(storage) == before_refusal,
+        "an ambiguous mixed reduction retains the accepted legacy generation");
+    replace_allocation({{}, 13});
+    write(source, bytes(resumed, 9));
+    const auto unknown = scan();
+    check(unknown.records.front().total_tokens == 9 &&
+        unknown.records.front().repository_usage->allocations.empty() &&
+        unknown.records.front().repository_usage->unattributed_tokens == 9,
+        "a lower legacy total does not invent attribution for accepted unknown tokens");
+}
+
+void selected_cache_repairs_turn_repository(const fs::path& fixture)
+{
+    const auto profile  = fixture / "repair-profile";
+    const auto storage  = fixture / "repair-storage";
+    const auto original = fixture / "repair-original";
+    const auto resumed  = fixture / "repair-resumed";
+    check(fs::create_directories(profile / "sessions"), "create attribution repair profile");
+    check(fs::create_directory(storage), "create attribution repair storage");
+    check(fs::create_directories(original / ".git"), "create repair original repository");
+    check(fs::create_directories(resumed / ".git"), "create repair resumed repository");
+    const auto source = profile / "sessions" / "rollout-repair.jsonl";
+    const auto transcript = metadata_with_cwd("repair", original) +
+        start("first") + turn_context("first", original) + tokens(1200) + complete("first") +
+        start("second") + turn_context("second", resumed) + tokens(1800) + complete("second");
+    write(source, transcript);
+    addon::Usage_scan_request request;
+    request.context.account_context = addon::Account_context{1, "repair-account"};
+    request.context.profile_storage = addon::Profile_storage_context{1, addon::path_to_utf8(storage)};
+    const auto initial_root = storage / "initial";
+    check(fs::create_directory(initial_root), "allocate initial attribution cache");
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(initial_root)};
+    std::string error;
+    const auto first = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(first && first->complete && first->records.size() == 2 && first->cache_candidate,
+        error.empty() ? "establish attribution cache fixture" : error.c_str());
+
+    // Reconstruct the accepted record produced before native turn cwd was read.
+    // Keep its correct accounting and its unchanged native source fingerprint.
+    const auto historical_root = storage / "historical";
+    check(fs::create_directory(historical_root), "allocate historical attribution cache");
+    for (const auto* name : {"rollouts", "snapshot", "cache-state"}) {
+        check(fs::copy_file(initial_root / name, historical_root / name), "copy historical cache metadata");
+    }
+    std::ifstream input(initial_root / "records", std::ios::binary);
+    std::string line;
+    std::string records;
+    addon::Usage_record historical_turn;
+    while (std::getline(input, line)) {
+        auto row = addon::parse_json(line, {}, nullptr);
+        check(row.has_value(), "read historical attribution record");
+        auto usage = addon::decode_usage_record(*row->find("usage"), nullptr, 3);
+        check(usage.has_value(), "decode historical attribution record");
+        if (usage->record_id == "codex:repair:second") {
+            usage->repository_usage = addon::Usage_repository{{{addon::path_to_utf8(original), 600}}, 0};
+            row->set("usage", addon::encode_usage_record(*usage, 3));
+            row->set("recorded_cwd", addon::Json_value(addon::path_to_utf8(original)));
+            historical_turn = *usage;
+            auto accounting = *row;
+            accounting.erase("temporal_observation");
+            row->find("temporal_observation")->set("accounting_sha256_hex", addon::Json_value(
+                addon::to_hex(addon::Sha256::digest(addon::serialize_json_canonical(accounting)))));
+        }
+        records += addon::serialize_json(*row) + '\n';
+    }
+    input.close();
+    write(historical_root / "records", records);
+    addon::Contract_failure failure;
+    const auto historical = addon::seal_usage_cache_candidate(addon::path_to_utf8(historical_root),
+        addon::path_to_utf8(storage), request.context.account_context, first->snapshot_id,
+        "codex-rollout-cache@3", [] { return false; }, &failure);
+    check(historical.has_value(), "seal historically incorrect repository allocation");
+    using Authority = codex::Usage_scan_authority;
+    const auto scan = [&](const char* name, const std::optional<addon::Usage_cache_reference>& accepted,
+        Authority authority, const char* mode = "repair")
+        {
+            const auto candidate = storage / name;
+            check(fs::create_directory(candidate), "allocate attribution candidate");
+            request.mode = mode;
+            request.snapshot_id.reset();
+            request.cursor.reset();
+            request.cache_selection = addon::Usage_cache_selection{accepted, addon::path_to_utf8(candidate)};
+            error.clear();
+            auto page = codex::scan_usage(request, profile, storage,
+                [] { return false; }, quiet_progress, &error, {}, authority);
+            check(page && page->complete && page->records.size() == 2 && page->cache_candidate,
+                error.empty() ? "repair retains accepted turns" : error.c_str());
+            return *page;
+        };
+    const auto tagged = [](const addon::Usage_record& record) {
+        const auto* tag = record.capabilities.find(addon::k_usage_repository_attribution_capability_id);
+        return tag && addon::decode_usage_repository_attribution_tag(*tag, nullptr) ==
+            addon::Usage_repository_attribution_tag_status::AVAILABLE;
+    };
+    const auto attributed = [&](const addon::Usage_record& record, const fs::path& repository) {
+        return record.repository_usage && record.repository_usage->allocations.size() == 1 &&
+            record.repository_usage->allocations[0].repository_path == addon::path_to_utf8(repository) &&
+            record.repository_usage->allocations[0].total_tokens == record.total_tokens &&
+            record.repository_usage->unattributed_tokens == 0;
+    };
+    const auto ordinary = scan("ordinary", historical, Authority::STANDARD);
+    check(attributed(ordinary.records[1], original) && !tagged(ordinary.records[1]),
+        "ordinary repair preserves accepted attribution without correction authority");
+    const auto repaired = scan("repair", historical, Authority::REPOSITORY_ATTRIBUTION);
+    check(repaired.records[0].total_tokens == 1200 && repaired.records[1].total_tokens == 600,
+        "attribution repair keeps accepted account totals");
+    check(attributed(repaired.records[1], resumed) && tagged(repaired.records[1]),
+        "repair replaces the historical repository with the matching native turn repository");
+    const auto accounting = [](addon::Usage_record record) {
+        record.repository_usage.reset();
+        record.temporal.reset();
+        record.capabilities.erase(addon::k_usage_temporal_capability_id);
+        record.capabilities.erase(addon::k_usage_repository_attribution_capability_id);
+        return addon::encode_usage_record(record, 3);
+    };
+    check(accounting(repaired.records[1]) == accounting(historical_turn),
+        "repository repair preserves accepted numeric, date, category and provenance fields");
+    check(repaired.records[1].temporal && repaired.records[1].temporal->portions.size() == 1 &&
+        repaired.records[1].temporal->portions.front().instant == first->records[1].temporal->portions.front().instant,
+        "repository repair retains the accepted temporal instant");
+
+    request.snapshot_id = repaired.snapshot_id;
+    request.cursor = "0";
+    error.clear();
+    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
+        error == "usage_snapshot_mismatch", "ordinary continuation cannot export an attribution candidate");
+    const auto continuation = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error, {}, Authority::REPOSITORY_ATTRIBUTION);
+    check(continuation && addon::encode_usage_scan_result(*continuation, 3) ==
+        addon::encode_usage_scan_result(repaired, 3), "the selected operation replays its sealed candidate");
+
+    const auto full = scan("full-incremental", historical, Authority::REPOSITORY_ATTRIBUTION, "incremental");
+    request.snapshot_id = full.snapshot_id;
+    request.cursor = "0";
+    error.clear();
+    check(!codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error, {}, Authority::REPOSITORY_ATTRIBUTION) &&
+        error == "usage_snapshot_mismatch", "incremental cannot adopt a full-scan continuation");
+
+    request.snapshot_id.reset();
+    request.cursor.reset();
+    const auto unchanged_root = storage / "unchanged-incremental";
+    check(fs::create_directory(unchanged_root), "allocate unchanged attribution update");
+    request.cache_selection = addon::Usage_cache_selection{historical, addon::path_to_utf8(unchanged_root)};
+    const auto unchanged = codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error, {}, Authority::REPOSITORY_ATTRIBUTION);
+    check(unchanged && !unchanged->changes,
+        "selecting attribution authority does not reread unchanged historical sources");
+    write(source, transcript + tokens(1800));
+    const auto changed_root = storage / "changed-incremental";
+    check(fs::create_directory(changed_root), "allocate changed attribution update");
+    request.cache_selection->candidate_root = addon::path_to_utf8(changed_root);
+    const auto changed = codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error, {}, Authority::REPOSITORY_ATTRIBUTION);
+    check(changed && changed->changes, error.empty() ? "changed attribution scan supplies an update" : error.c_str());
+    check(changed->changes->complete && changed->changes->records.size() == 1 &&
+        attributed(changed->changes->records.front(), resumed) && tagged(changed->changes->records.front()),
+        "naturally changed sources emit only the witnessed repository correction");
+    request.snapshot_id = changed->changes->snapshot_id;
+    request.cursor = "0";
+    error.clear();
+    check(!codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error, {}, Authority::REPOSITORY_ATTRIBUTION) &&
+        error == "usage_snapshot_mismatch", "full scan cannot export an incremental candidate");
+    error.clear();
+    check(!codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error) && error == "usage_snapshot_mismatch",
+        "ordinary incremental cannot export an attribution candidate");
+
+    for (const auto* mode : {"fallback", "unknown", "unresolved", "same-cwd"}) {
+        std::string context;
+        if (std::string_view(mode) == "unknown") context = turn_context("second", {});
+        if (std::string_view(mode) == "unresolved") context = turn_context("second", fixture / "missing-checkout");
+        if (std::string_view(mode) == "same-cwd") {
+            check(fs::remove(original / ".git"), "remove original Git marker");
+            context = turn_context("second", original);
+        }
+        write(source, metadata_with_cwd("repair", original) + start("first") + tokens(1200) + complete("first") +
+            start("second") + context + tokens(1800) + complete("second"));
+        const auto retained = scan(mode, historical, Authority::REPOSITORY_ATTRIBUTION);
+        check(attributed(retained.records[1], original) && !tagged(retained.records[1]),
+            "fallback, unknown, unresolved or vanished same-cwd evidence cannot retract accepted attribution");
+    }
+    check(fs::create_directory(original / ".git"), "restore original Git marker");
+
+    write(source, metadata_with_cwd("repair", original) +
+        start("second") + turn_context("second", resumed) + tokens(1800) + complete("second"));
+    const auto unproved = scan("unproved", historical, Authority::REPOSITORY_ATTRIBUTION);
+    check(unproved.records[0].total_tokens == 1200 && unproved.records[1].total_tokens == 600 &&
+        attributed(unproved.records[1], resumed),
+        "missing baseline cannot inflate accepted accounting during witnessed repository repair");
+
+    write(source, metadata_with_cwd("repair", original) + start("first") + tokens(1200) + complete("first") +
+        start("second") + turn_context("second", resumed) + tokens(2000) + complete("second"));
+    for (const auto authority : {Authority::STANDARD, Authority::REPOSITORY_ATTRIBUTION}) {
+        const auto grown = scan(authority == Authority::STANDARD ? "ordinary-growth" : "selected-growth",
+            historical, authority);
+        const auto& second = grown.records[1];
+        check(second.total_tokens == 800 && second.repository_usage &&
+            second.repository_usage->allocations.size() == 1 &&
+            second.repository_usage->allocations[0].repository_path == addon::path_to_utf8(original) &&
+            second.repository_usage->allocations[0].total_tokens == 600 &&
+            second.repository_usage->unattributed_tokens == 200 && !tagged(second),
+            "proved growth preserves prior known allocation and defers repository correction");
+        const auto corrected = scan(authority == Authority::STANDARD ? "after-ordinary-growth" : "after-selected-growth",
+            grown.cache_candidate, Authority::REPOSITORY_ATTRIBUTION);
+        check(corrected.records[1].total_tokens == 800 && attributed(corrected.records[1], resumed) &&
+            tagged(corrected.records[1]), "accepted growth can be corrected on a later matching observation");
+    }
+    write(source, metadata_with_cwd("repair", original) + start("first") + tokens(1200) + complete("first") +
+        start("second") + tokens(2000) + complete("second"));
+    for (const auto authority : {Authority::STANDARD, Authority::REPOSITORY_ATTRIBUTION}) {
+        const auto grown = scan(authority == Authority::STANDARD ? "fallback-growth" : "selected-fallback-growth",
+            repaired.cache_candidate, authority);
+        const auto& second = grown.records[1];
+        check(second.total_tokens == 800 && second.repository_usage &&
+            second.repository_usage->allocations.size() == 1 &&
+            second.repository_usage->allocations[0].repository_path == addon::path_to_utf8(resumed) &&
+            second.repository_usage->allocations[0].total_tokens == 600 &&
+            second.repository_usage->unattributed_tokens == 200 && !tagged(second),
+            "proved growth after lost turn context preserves accepted attribution");
+    }
+    write(source, metadata_with_cwd("repair", original) + start("first") + tokens(1200) + complete("first") +
+        start("second") + turn_context("second", resumed) + tokens(1700) + complete("second"));
+    const auto lower = scan("lower", historical, Authority::REPOSITORY_ATTRIBUTION);
+    check(lower.records[1].total_tokens == 500 && !tagged(lower.records[1]) &&
+        lower.records[1].aggregate_evidence == "partial", "a lower total has no repository correction authority");
+
+    check(fs::remove(source), "remove repair source");
+    const auto missing = scan("missing", historical, Authority::REPOSITORY_ATTRIBUTION);
+    check(attributed(missing.records[1], original) && !tagged(missing.records[1]),
+        "missing source keeps historical accepted attribution");
+    const auto replay = scan("replay", repaired.cache_candidate, Authority::REPOSITORY_ATTRIBUTION);
+    check(attributed(replay.records[1], resumed) && !tagged(replay.records[1]),
+        "replay retains corrected attribution without a stale correction request");
 }
 
 void scanner_sorts_pages_and_preserves_cache_on_retry(const fs::path& fixture)
@@ -538,6 +977,55 @@ void set_seed(addon::Usage_scan_request* request, const fs::path& artifact, std:
     write(artifact, bytes);
     request->native_file_cache = addon::Usage_native_file_cache{
         utf8(artifact), addon::to_hex(addon::Sha256::digest(bytes)), "account", true};
+}
+
+void native_seed_repairs_only_witnessed_repository(const fs::path& fixture)
+{
+    const auto profile  = fixture / "seed-repair-profile";
+    const auto storage  = fixture / "seed-repair-storage";
+    const auto original = fixture / "seed-repair-original";
+    const auto resumed  = fixture / "seed-repair-resumed";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    fs::create_directories(original / ".git");
+    fs::create_directories(resumed / ".git");
+    const auto source = profile / "sessions" / "rollout-seed-repair.jsonl";
+    auto wrapper = native_wrapper(source, "seed-repair", 19);
+    wrapper.find("records")->as_array().front().set("recorded_cwd", addon::Json_value(utf8(original)));
+    addon::Usage_scan_request request;
+    request.mode = "repair";
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "account"};
+    set_seed(&request, storage / "native-cache.jsonl", addon::serialize_json(wrapper) + '\n');
+    unsigned generation = 0;
+    for (const bool witnessed : {false, true}) {
+        write(source, metadata_with_cwd("seed-repair", resumed) + tokens(4) + start("turn") +
+            (witnessed ? turn_context("turn", resumed) : std::string{}) + tokens(23) + complete("turn"));
+        for (const auto authority : {codex::Usage_scan_authority::STANDARD,
+                codex::Usage_scan_authority::REPOSITORY_ATTRIBUTION})
+        {
+            const auto root = storage / ("candidate-" + std::to_string(generation++));
+            check(fs::create_directory(root), "allocate first native import candidate");
+            request.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(root)};
+            std::string error;
+            const auto page = codex::scan_usage(request, profile, storage, [] { return false; },
+                quiet_progress, &error, {}, authority);
+            check(page && page->complete && page->records.size() == 1,
+                error.empty() ? "first import retains native accepted turn" : error.c_str());
+            const auto& record = page->records.front();
+            check(record.total_tokens == 19 && record.model == "native-model" &&
+                record.source_counter_semantics == "cumulative_turn_delta" &&
+                record.input.value == 14 && record.output.value == 5 &&
+                record.completed_date == "2026-01-02" && record.source_path == utf8(source),
+                "a live first-import parse preserves validated seed accounting and native provenance");
+            const bool corrected = witnessed && authority == codex::Usage_scan_authority::REPOSITORY_ATTRIBUTION;
+            const auto& repository = corrected ? resumed : original;
+            check(record.repository_usage && record.repository_usage->allocations.size() == 1 &&
+                record.repository_usage->allocations.front().repository_path == utf8(repository) &&
+                (record.capabilities.find(addon::k_usage_repository_attribution_capability_id) != nullptr) == corrected,
+                "first native import corrects only a live witnessed cwd on the selected operation");
+        }
+    }
 }
 
 void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
@@ -2733,6 +3221,29 @@ int main(int argc, char** argv)
         Temporary_directory fixture;
         if (argc == 3) {
             const std::string mode = argv[2];
+            if (mode == "turn-cwd") {
+                reducer_attributes_resumed_turns(fixture.path);
+                return 0;
+            }
+            if (mode == "turn-cwd-cache") {
+                scanner_keeps_per_turn_repositories(fixture.path, false);
+                scanner_keeps_per_turn_repositories(fixture.path, true);
+                return 0;
+            }
+            if (mode == "turn-cwd-repair") {
+                mutable_cache_preserves_accepted_attribution(fixture.path);
+                selected_cache_repairs_turn_repository(fixture.path);
+                native_seed_repairs_only_witnessed_repository(fixture.path);
+                return 0;
+            }
+            if (mode == "turn-cwd-legacy") {
+                mutable_cache_preserves_accepted_attribution(fixture.path);
+                return 0;
+            }
+            if (mode == "turn-cwd-selected") {
+                selected_cache_repairs_turn_repository(fixture.path);
+                return 0;
+            }
             if (mode == "archived-mutable" || mode == "archived-selected") {
                 scanner_reads_archived_rollouts(fixture.path, mode == "archived-selected");
                 return 0;
@@ -2752,6 +3263,12 @@ int main(int argc, char** argv)
         }
         projector_does_not_retain_ignored_large_payloads();
         reducer_keeps_turn_deltas_resets_and_fork_baselines(fixture.path / "rollout-fixture.jsonl");
+        reducer_attributes_resumed_turns(fixture.path);
+        scanner_keeps_per_turn_repositories(fixture.path, false);
+        scanner_keeps_per_turn_repositories(fixture.path, true);
+        mutable_cache_preserves_accepted_attribution(fixture.path);
+        selected_cache_repairs_turn_repository(fixture.path);
+        native_seed_repairs_only_witnessed_repository(fixture.path);
         reducer_proves_only_complete_turns(fixture.path / "rollout-fixture.jsonl");
         scanner_sorts_pages_and_preserves_cache_on_retry(fixture.path);
         scanner_reads_archived_rollouts(fixture.path, false);
