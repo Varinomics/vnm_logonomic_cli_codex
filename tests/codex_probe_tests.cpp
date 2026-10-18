@@ -569,6 +569,27 @@ void account_resolution_uses_frozen_origin()
     check(profile && std::filesystem::path(profile->profile_path) == std::filesystem::path(origin) / "relative-profile",
         "relative CODEX_HOME never uses adapter cwd");
     check(profile->adapter_account_key == codex::profile_account_key(profile->profile_path), "stable opaque account identity");
+
+    // The host expands supported shell assignments before accounts@2 sees them.
+    const auto selected = std::filesystem::path(fallback) / ".codex-work";
+    environment.effective_environment.set("CODEX_HOME", addon::Json_value(addon::path_to_utf8(selected)));
+    for (const char* script : {
+        "CODEX_HOME=\"$HOME/.codex-work\" codex",
+        "CODEX_HOME=\"${HOME}/.codex-work\" codex",
+        "set CODEX_HOME=%USERPROFILE%/.codex-work\ncodex",
+        "$env:CODEX_HOME=\"$env:USERPROFILE/.codex-work\"; codex"})
+    {
+        launcher.script_body = script;
+        profile = codex::profile_selection(environment, launcher, fallback, origin, &error);
+        check(profile && std::filesystem::path(profile->profile_path) == selected,
+            "expanded launcher profile must retain the host's effective path");
+        check(profile->adapter_account_key == codex::profile_account_key(addon::path_to_utf8(selected)),
+            "expanded launcher profile must retain the selected account identity");
+    }
+    environment.effective_environment.set("CODEX_HOME", addon::Json_value("relative-profile"));
+    profile = codex::profile_selection(environment, launcher, fallback, origin, &error);
+    check(profile && std::filesystem::path(profile->profile_path) == std::filesystem::path(origin) / "relative-profile",
+        "frozen relative profile remains relative to the host normalization directory");
 }
 
 void accounts_are_named_after_their_profile_folders()
