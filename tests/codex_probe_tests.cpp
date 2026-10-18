@@ -145,14 +145,22 @@ void current_account_identity_uses_selected_principal_workspace_and_backend()
     rotated.set("authToken", addon::Json_value(codex_fixture::token() + "-rotated"));
     check(*current_account_observation(account, rotated).find("identity_key") == key,
         "credential rotation does not change the stable current identity");
+    for (const std::string_view subject : {"other-subject", ""}) {
+        const auto alias = current_account_observation(account, codex_fixture::authentication(
+            codex_fixture::token("user-fixture", "workspace-fixture", subject)));
+        check(alias.find("identity_key") && *alias.find("identity_key") == key,
+            "the same provider user and workspace retain one identity across credential subjects");
+    }
     for (const auto& other : {
         current_account_observation(account, codex_fixture::authentication(codex_fixture::token("other-user"))),
         current_account_observation(codex_fixture::account("other-workspace"),
             codex_fixture::authentication(codex_fixture::token("user-fixture", "other-workspace"))),
+        current_account_observation(account, codex_fixture::authentication(codex_fixture::token(
+            "user-fixture", "workspace-fixture", "subject-fixture", "https://other-auth.example.test"))),
         current_account_observation(codex_fixture::account("workspace-fixture", "https://other.example.test"), auth)})
     {
         check(other.find("identity_key") && *other.find("identity_key") != key,
-            "different principal, workspace or backend remains separate");
+            "different principal, workspace, issuer or backend remains separate");
     }
     const auto mismatched = current_account_observation(codex_fixture::account("other-workspace"), auth);
     check(!mismatched.find("identity_key"), "incoherent selected token and native workspace cannot group accounts");

@@ -95,8 +95,10 @@ and accepted protocol records still undergo structural and identity validation.
 With `current-account@1` negotiated, authentication uses the selected launcher's
 native app-server in the existing authentication observation. The helper reads
 `account/read` and `getAuthStatus` and derives an opaque identity from the selected
-credential's principal, workspace and native backend routing. Profile account
-keys still own their separate conversations and usage history. Unsupported or
+credential's issuer and stable provider user ID, workspace and native backend
+routing. Separate logins for the same provider user retain the same identity even
+when their token subjects differ or are absent. Profile account keys still own
+their separate conversations and usage history. Unsupported or
 incoherent identity evidence leaves profiles separate; it does not infer equality
 from email, plan or a local credential file. Native stdout, stderr, tokens and
 errors remain private to the helper; only validated authentication state and the

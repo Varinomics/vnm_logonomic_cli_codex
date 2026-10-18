@@ -91,11 +91,10 @@ std::string current_identity(const addon::Json_value& account, const addon::Json
     const auto workspace = text(routing, "chatgptAccountId");
     const auto backend = text(routing, "backendOrigin");
     const auto issuer = text(*claims, "iss");
-    const auto subject = text(*claims, "sub");
     const auto chatgpt_user = text(native_auth, "chatgpt_user_id");
     const auto alternate_user = text(native_auth, "user_id");
     const auto user = chatgpt_user.empty() ? alternate_user : chatgpt_user;
-    if (workspace.empty() || backend.empty() || issuer.empty() || subject.empty() || user.empty() ||
+    if (workspace.empty() || backend.empty() || issuer.empty() || user.empty() ||
         (!chatgpt_user.empty() && !alternate_user.empty() && chatgpt_user != alternate_user) ||
         text(native_auth, "chatgpt_account_id") != workspace)
     {
@@ -103,10 +102,11 @@ std::string current_identity(const addon::Json_value& account, const addon::Json
     }
     // The credential came from this native process's selected AuthManager,
     // not an arbitrary local auth.json. Its claims are not a login verifier.
-    // Include the backend and principal as well as workspace: a shared team
-    // workspace must not collapse different users, and custom origins stay apart.
+    // Login subjects can differ for the same provider user. Scope that stable
+    // user to its issuer, workspace and backend so shared workspaces still keep
+    // different users apart, and custom origins remain separate.
     auto identity = addon::Json_value::array();
-    for (const auto part : {issuer, subject, user, workspace, backend}) {
+    for (const auto part : {issuer, user, workspace, backend}) {
         identity.push_back(addon::Json_value(part));
     }
     return "codex-current-" + addon::to_hex(addon::Sha256::digest(addon::serialize_json(identity)));

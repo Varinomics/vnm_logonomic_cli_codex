@@ -9,12 +9,18 @@
 
 namespace codex_fixture {
 
-inline std::string token(std::string_view user = "user-fixture", std::string_view workspace = "workspace-fixture")
+inline std::string token(
+    std::string_view user      = "user-fixture",
+    std::string_view workspace = "workspace-fixture",
+    std::string_view subject   = "subject-fixture",
+    std::string_view issuer    = "https://auth.example.test")
 {
     namespace addon = logonomic::cli_addon;
     auto claims = addon::Json_value::object();
-    claims.set("iss", addon::Json_value("https://auth.example.test"));
-    claims.set("sub", addon::Json_value(user));
+    claims.set("iss", addon::Json_value(issuer));
+    if (!subject.empty()) {
+        claims.set("sub", addon::Json_value(subject));
+    }
     auto auth = addon::Json_value::object();
     auth.set("chatgpt_user_id", addon::Json_value(user));
     auth.set("chatgpt_account_id", addon::Json_value(workspace));
