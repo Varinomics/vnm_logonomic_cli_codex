@@ -1,6 +1,9 @@
 # Usage evidence and caches
 
 The package scans per-turn native usage under the selected `CODEX_HOME`.
+Both `sessions` and `archived_sessions` contribute native history, including
+on a fresh import or reset. Archiving preserves stable native turn identities;
+overlapping copies contribute each turn once and retained history survives moves.
 Accounting, cache acceptance and progress follow the independently versioned
 [usage-scan contracts](https://github.com/Varinomics/Logonomic/tree/master/sdk/logonomic_cli_addon_sdk/docs).
 
@@ -12,7 +15,11 @@ rollout in `rollouts` beside the sorted `records`, so it holds the same four
 files however many rollouts a home has. An incremental scan parses rollouts whose
 size or modification time changed, or whose optional temporal evidence has not
 been examined, and streams the selected cache's records for the others; repair
-and reset parse every rollout. Equal
+and reset parse every rollout. When a source is parsed, unchanged current copies
+of that native session are also compared. Native identities come from rollout
+metadata or saved observations; a copy absent from both needs only its native
+session metadata read to identify it. Unrelated unchanged sources keep
+fingerprint reuse. Equal
 size and modification time are taken to mean unchanged content, the check the
 pre-cutover scanner used, because rollouts are append-only and repair rereads
 every rollout. Turns reconcile by their stable record IDs: a rollout parsed
@@ -48,6 +55,8 @@ or exporting its accounting records. It verifies the selected manifest and the
 metadata files it consumes. A metadata change still publishes a candidate even
 when it does not change the token total. Changed updates export only changed
 absolute observations; omissions retain accepted accounting. Their
+incremental coverage retains previously accepted gaps; repair or reset verifies
+current sources in full before declaring complete coverage. The
 `codex-rollout-cache@4` candidates partition records by stable session identity,
 reconcile the affected pieces, and reuse immutable unaffected pieces in a
 self-contained generation. Reused files retain their sealed identity; changed

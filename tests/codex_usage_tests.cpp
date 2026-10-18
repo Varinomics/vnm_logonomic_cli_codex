@@ -301,6 +301,181 @@ std::string utf8(const fs::path& path)
     return std::string(bytes.begin(), bytes.end());
 }
 
+void scanner_reads_archived_rollouts(const fs::path& fixture, bool selected)
+{
+    const auto root    = fixture / (selected ? "as" : "am");
+    const auto profile = root / "profile";
+    const auto storage = root / "storage";
+    const auto archive = profile / "archived_sessions";
+    check(fs::create_directories(archive / "2026"), "create archived-only native history");
+    check(fs::create_directory(storage), "create archive scan storage");
+    const auto historical = archive / "2026" / "rollout-history.jsonl";
+    write(historical, metadata("history") + start("first") + tokens(1200) + complete("first"));
+    addon::Usage_scan_request request;
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "archive-account"};
+    std::optional<addon::Usage_cache_reference> accepted;
+    std::string error;
+    unsigned generation = 0;
+    const auto scan = [
+            &request, &profile, &storage, &accepted, &error, &generation, selected
+        ](const char* mode)
+        {
+            request.mode = mode;
+            if (selected) {
+                const auto candidate = storage / ("candidate-" + std::to_string(generation++));
+                check(fs::create_directory(candidate), "allocate archive scan candidate");
+                request.cache_selection = addon::Usage_cache_selection{
+                    std::string_view(mode) == "reset" ? std::nullopt : accepted, utf8(candidate)};
+            }
+            const auto page = codex::scan_usage(request, profile, storage,
+                [] { return false; }, quiet_progress, &error);
+            check(page && page->complete && !page->incomplete_historical_coverage,
+                error.empty() ? "archive scan completes" : error.c_str());
+            accepted = page->cache_candidate;
+            return *page;
+        };
+    const auto totals = [](const addon::Usage_scan_page& page) {
+        std::map<std::string, std::uint64_t> result;
+        for (const auto& record : page.records) {
+            check(result.emplace(record.record_id, record.total_tokens).second,
+                "each native turn appears exactly once");
+        }
+        return result;
+    };
+    const std::map<std::string, std::uint64_t> history{{"codex:history:first", 1200}};
+    check(totals(scan("incremental")) == history,
+        "fresh import discovers archived usage without a sessions directory");
+    check(totals(scan("reset")) == history, "reset discovers archived native history");
+
+    const auto active = profile / "sessions" / "rollout-active.jsonl";
+    check(fs::create_directory(active.parent_path()), "create active native history");
+    const auto active_bytes = metadata("active") + start("second") + tokens(600) + complete("second");
+    write(active, active_bytes);
+    std::map<std::string, std::uint64_t> expected = history;
+    expected["codex:active:second"] = 600;
+    check(totals(scan("incremental")) == expected, "active and archived roots contribute to one scan");
+
+    const auto moved = archive / active.filename();
+    fs::rename(active, moved);
+    const auto archived = scan("incremental");
+    check(totals(archived) == expected, "an archive move keeps stable turn IDs and tokens");
+    const auto accepted_turn = std::find_if(archived.records.begin(), archived.records.end(), [](const auto& record) {
+        return record.record_id == "codex:active:second";
+    });
+    check(accepted_turn != archived.records.end() && accepted_turn->source_path == utf8(fs::absolute(active)),
+        "archiving retains the accepted observation's source identity");
+
+    write(active, active_bytes);
+    check(totals(scan("repair")) == expected, "overlapping active and archive copies count once");
+    std::optional<addon::Usage_cache_reference> unindexed;
+    if (selected) {
+        const auto earlier = storage / "unindexed";
+        check(fs::create_directory(earlier), "allocate cache without a native-session index");
+        const auto current = addon::path_from_utf8(accepted->root);
+        for (const auto* name : {"snapshot", "cache-state", "records"}) {
+            check(fs::copy_file(current / name, earlier / name), "copy accepted accounting evidence");
+        }
+        {
+            std::ifstream input(current / "rollouts", std::ios::binary);
+            std::ofstream output(earlier / "rollouts", std::ios::binary);
+            check(input && output, "open unindexed rollout metadata");
+            std::string line;
+            while (std::getline(input, line)) {
+                auto row = addon::parse_json(line, {}, nullptr);
+                check(row.has_value(), "decode accepted rollout metadata");
+                row->erase("native_session");
+                output << addon::serialize_json(*row) << '\n';
+            }
+            check(input.eof() && output, "write unindexed rollout metadata");
+        }
+        addon::Contract_failure failure;
+        unindexed = addon::seal_usage_cache_candidate(utf8(earlier), utf8(storage), request.context.account_context,
+            accepted->snapshot_id, "codex-rollout-cache@3", [] { return false; }, &failure);
+        check(unindexed.has_value(), "seal saved accounting without a native-session index");
+        accepted = unindexed;
+        check(totals(scan("incremental")) == expected,
+            "a cache without the native-session index retains accepted accounting");
+        check(addon::validate_usage_cache_candidate(*unindexed, utf8(storage), request.context.account_context,
+            [] { return false; }, &failure).has_value(), "an unindexed selected input stays intact");
+    }
+    write(active, metadata("active") + start("second") + tokens(700) + complete("second"));
+    auto conflicting = request;
+    conflicting.mode = "incremental";
+    if (selected) {
+        const auto candidate = storage / "conflicting";
+        check(fs::create_directory(candidate), "allocate conflicting archive candidate");
+        conflicting.cache_selection = addon::Usage_cache_selection{accepted, utf8(candidate)};
+    }
+    const auto collision = codex::scan_usage(conflicting, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(!collision, "incremental scan accepted conflicting current active and archive copies");
+    check(error == "duplicate_usage_record", "conflicting copies report duplicate usage");
+    if (selected) {
+        const auto candidate = storage / "unindexed-conflict";
+        check(fs::create_directory(candidate), "allocate unindexed conflict candidate");
+        conflicting.cache_selection = addon::Usage_cache_selection{unindexed, utf8(candidate)};
+        check(!codex::scan_usage(conflicting, profile, storage,
+            [] { return false; }, quiet_progress, &error) && error == "duplicate_usage_record",
+            "an unindexed cache compares conflicting current copies against each other");
+    }
+    write(active, active_bytes);
+    check(totals(scan("incremental")) == expected, "a rejected copy leaves accepted history usable");
+    check(totals(scan("reset")) == expected, "fresh reconstruction deduplicates both native roots");
+    check(fs::remove(active), "remove the overlapping active copy");
+    write(moved, active_bytes + start("third") + tokens(900) + complete("third"));
+    expected["codex:active:third"] = 300;
+    check(totals(scan("incremental")) == expected, "an archived rollout's new turn contributes its delta");
+
+    if (selected) {
+        write(moved, active_bytes + start("third") + tokens(900) + complete("third") +
+            "{\"type\":\"response_item\",\"payload\":{\"content\":[]}}\n");
+        const auto candidate = storage / "piece-candidate";
+        check(fs::create_directory(candidate), "allocate archive piece-cache candidate");
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(candidate)};
+        const auto update = codex::scan_usage_incremental(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(update && update->changes && update->changes->records.empty(),
+            "adopting archived history into record pieces preserves accounting");
+        accepted = update->changes->cache_candidate;
+        const auto four_turns = active_bytes + start("third") + tokens(900) + complete("third") +
+            start("fourth") + tokens(1400) + complete("fourth");
+        write(moved, four_turns);
+        const auto next = storage / "piece-next";
+        check(fs::create_directory(next), "allocate changed archive piece-cache candidate");
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(next)};
+        const auto changed = codex::scan_usage_incremental(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(changed && changed->changes && changed->changes->records.size() == 1 &&
+            changed->changes->records.front().record_id == "codex:active:fourth" &&
+            changed->changes->records.front().total_tokens == 500,
+            "piece-cache incremental discovery reads appended archived turns once");
+        accepted = changed->changes->cache_candidate;
+        expected["codex:active:fourth"] = 500;
+        write(active, four_turns);
+        const auto overlap = storage / "piece-overlap";
+        check(fs::create_directory(overlap), "allocate overlapping piece-cache candidate");
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(overlap)};
+        const auto copies = codex::scan_usage_incremental(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(copies && copies->changes && copies->changes->records.empty(),
+            "piece-cache incremental overlap preserves each accepted turn once");
+        accepted = copies->changes->cache_candidate;
+        write(moved, active_bytes + start("third") + tokens(900) + complete("third") +
+            start("fourth") + tokens(1500) + complete("fourth"));
+        const auto conflict = storage / "piece-conflict";
+        check(fs::create_directory(conflict), "allocate conflicting piece-cache candidate");
+        request.cache_selection = addon::Usage_cache_selection{accepted, utf8(conflict)};
+        check(!codex::scan_usage_incremental(request, profile, storage,
+            [] { return false; }, quiet_progress, &error) && error == "duplicate_usage_record",
+            "piece-cache incremental scans compare changed archives with unchanged active copies");
+        write(moved, four_turns);
+        check(fs::remove(active), "remove the overlapping piece-cache source");
+    }
+    check(fs::remove(moved) && fs::remove(historical), "remove native histories after acceptance");
+    check(totals(scan("incremental")) == expected, "absent native sources retain accepted history");
+}
+
 addon::Json_value native_wrapper(const fs::path& source, std::string_view rollout, int total)
 {
     auto record = addon::Json_value::object();
@@ -1550,6 +1725,9 @@ void incremental_adoption_keeps_unexamined_temporal_evidence(const fs::path& fix
             auto row = addon::parse_json(line, {}, nullptr);
             check(row.has_value(), "read saved adoption evidence");
             row->erase(std::string_view(name) == "rollouts" ? "temporal_parser" : "temporal_observation");
+            if (std::string_view(name) == "rollouts") {
+                row->erase("native_session");
+            }
             replacement += addon::serialize_json(*row) + '\n';
         }
         input.close();
@@ -1635,8 +1813,9 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
         !find(first, "codex:predecessor:a").cross_source_event && proved_b(first),
         "the scan carries the proof of the turn with a baseline");
 
-    write(source, metadata("predecessor") + start("b") + tokens(25) + complete("b") +
-        start("c") + tokens(30) + complete("c"));
+    const auto without_predecessor = metadata("predecessor") + start("b") + tokens(25) + complete("b") +
+        start("c") + tokens(30) + complete("c");
+    write(source, without_predecessor);
     auto accepted = first.cache_candidate;
     for (const auto* mode : {"incremental", "repair"}) {
         const auto page = scan(mode, accepted);
@@ -1645,6 +1824,128 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
         check(find(page, "codex:predecessor:c").total_tokens == 5, "the next turn adds exactly its delta");
         accepted = page.cache_candidate;
     }
+    const auto archive = profile / "archived_sessions";
+    check(fs::create_directory(archive), "create the truncated-copy archive");
+    write(archive / source.filename(), without_predecessor);
+    const auto copied = scan("incremental", accepted);
+    check(copied.records.size() == 3 && proved_b(copied) &&
+        find(copied, "codex:predecessor:a").total_tokens == 10 &&
+        find(copied, "codex:predecessor:c").total_tokens == 5,
+        "current copies compare with each other while accepted baseline evidence survives");
+}
+
+void selected_cache_preserves_peer_validation(const fs::path& fixture, bool seeded)
+{
+    const auto root    = fixture / (seeded ? "peer-seed" : "peer-coverage");
+    const auto profile = root / "profile";
+    const auto storage = root / "storage";
+    check(fs::create_directories(profile / "sessions"), "create active peer profile");
+    check(fs::create_directory(profile / "archived_sessions"), "create archived peer profile");
+    check(fs::create_directory(storage), "create peer-validation storage");
+    const auto active = profile / "sessions" / "rollout-peer.jsonl";
+    const auto archive = profile / "archived_sessions" / active.filename();
+    const auto original = metadata("peer") + start("turn") +
+        tokens(600, ",\"input_tokens\":595,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn");
+    write(active, original);
+    addon::Usage_scan_request request;
+    request.mode = "incremental";
+    request.context.account_context = addon::Account_context{1, "account"};
+    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
+    unsigned generation = 0;
+    const auto allocate = [&](std::optional<addon::Usage_cache_reference> accepted) {
+        const auto candidate = storage / ("candidate-" + std::to_string(generation++));
+        check(fs::create_directory(candidate), "allocate peer-validation candidate");
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), utf8(candidate)};
+    };
+    std::string error;
+    allocate(std::nullopt);
+    const auto first = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(first && first->cache_candidate && first->records.size() == 1, "accept the active observation first");
+    write(archive, original);
+    allocate(first->cache_candidate);
+    const auto overlap = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(overlap && overlap->cache_candidate && overlap->records.size() == 1 &&
+        overlap->records.front().source_path == utf8(active), "accept the equal archive copy under the original identity");
+
+    if (seeded) {
+        write(active, metadata("peer") + start("turn") +
+            tokens(700, ",\"input_tokens\":695,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn"));
+        const auto modified = std::chrono::sys_days{std::chrono::year{2026} / 1 / 2} +
+            std::chrono::hours{12} + std::chrono::milliseconds{123};
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+        fs::last_write_time(active, std::chrono::clock_cast<fs::file_time_type::clock>(modified));
+#else
+        fs::last_write_time(active, fs::file_time_type::clock::from_sys(modified));
+#endif
+        auto wrapper = native_wrapper(active, "peer", 700);
+        wrapper.find("records")->as_array().front().erase("model");
+        wrapper.set("size", addon::Json_value((std::int64_t)fs::file_size(active)));
+        wrapper.set("modified_msecs", addon::Json_value((std::int64_t)
+            std::chrono::duration_cast<std::chrono::milliseconds>(modified.time_since_epoch()).count()));
+        set_seed(&request, storage / "native-file-cache.jsonl", addon::serialize_json(wrapper) + '\n');
+        allocate(overlap->cache_candidate);
+        const auto result = codex::scan_usage(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(!result, "an accurate fresh seed bypassed its conflicting unchanged archive peer");
+        check(error == "duplicate_usage_record", error.c_str());
+        return;
+    }
+
+    const auto saved = storage / "unindexed";
+    check(fs::create_directory(saved), "allocate unbound-peer cache fixture");
+    const auto accepted = addon::path_from_utf8(overlap->cache_candidate->root);
+    for (const auto* name : {"snapshot", "cache-state", "records"}) {
+        check(fs::copy_file(accepted / name, saved / name), "copy accepted peer accounting");
+    }
+    {
+        std::ifstream input(accepted / "rollouts", std::ios::binary);
+        std::ofstream output(saved / "rollouts", std::ios::binary);
+        check(input && output, "open unbound-peer metadata fixture");
+        std::string line;
+        while (std::getline(input, line)) {
+            auto row = addon::parse_json(line, {}, nullptr);
+            check(row.has_value(), "decode peer rollout metadata");
+            if (row->find("source")->as_string() == utf8(archive)) {
+                row->erase("native_session");
+            }
+            output << addon::serialize_json(*row) << '\n';
+        }
+        check(input.eof() && output, "write unbound-peer metadata fixture");
+    }
+    addon::Contract_failure failure;
+    const auto unindexed = addon::seal_usage_cache_candidate(utf8(saved), utf8(storage), request.context.account_context,
+        overlap->snapshot_id, "codex-rollout-cache@3", [] { return false; }, &failure);
+    check(unindexed.has_value(), "seal unbound-peer accounting fixture");
+    const auto previous_modified = fs::last_write_time(archive);
+    write(archive, std::string(original.size() - 1, 'x') + '\n');
+    fs::last_write_time(archive, previous_modified);
+    write(profile / "sessions" / "rollout-new.jsonl", metadata("new") + start("turn") + tokens(9) + complete("turn"));
+    allocate(unindexed);
+    const auto incomplete = codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(incomplete && incomplete->changes && incomplete->changes->cache_candidate &&
+        incomplete->changes->incomplete_historical_coverage, "unreadable unbound peer retains incomplete coverage");
+    allocate(incomplete->changes->cache_candidate);
+    const auto unchanged = codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(unchanged.has_value(), "unchanged incomplete generation remains usable");
+    check(!unchanged->changes || unchanged->changes->incomplete_historical_coverage,
+        "unchanged reuse promoted unresolved peer coverage to complete");
+    check(!unchanged->changes, "unchanged incomplete coverage retains the exact accepted generation");
+    allocate(incomplete->changes->cache_candidate);
+    const auto replay = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(replay && replay->incomplete_historical_coverage && replay->records.size() == 2,
+        "an incremental complete snapshot also retains unresolved coverage and accepted accounting");
+    write(archive, original);
+    request.mode = "repair";
+    allocate(replay->cache_candidate);
+    const auto repaired = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(repaired && !repaired->incomplete_historical_coverage && repaired->records.size() == 2,
+        "full verification of the restored sources resolves the peer coverage gap");
 }
 
 void selected_cache_pages_while_another_account_scans(const fs::path& fixture)
@@ -2432,6 +2733,14 @@ int main(int argc, char** argv)
         Temporary_directory fixture;
         if (argc == 3) {
             const std::string mode = argv[2];
+            if (mode == "archived-mutable" || mode == "archived-selected") {
+                scanner_reads_archived_rollouts(fixture.path, mode == "archived-selected");
+                return 0;
+            }
+            if (mode == "peer-seed" || mode == "peer-coverage") {
+                selected_cache_preserves_peer_validation(fixture.path, mode == "peer-seed");
+                return 0;
+            }
             if (mode == "selected-page") {
                 selected_cache_pages_while_another_account_scans(fixture.path);
                 return 0;
@@ -2445,9 +2754,13 @@ int main(int argc, char** argv)
         reducer_keeps_turn_deltas_resets_and_fork_baselines(fixture.path / "rollout-fixture.jsonl");
         reducer_proves_only_complete_turns(fixture.path / "rollout-fixture.jsonl");
         scanner_sorts_pages_and_preserves_cache_on_retry(fixture.path);
+        scanner_reads_archived_rollouts(fixture.path, false);
+        scanner_reads_archived_rollouts(fixture.path, true);
         scanner_accepts_new_profiles_and_retains_transient_empty_history(fixture.path);
         native_seed_replay_and_required_cache_loss(fixture.path);
         native_seed_fingerprint_uses_system_clock(fixture.path);
+        selected_cache_preserves_peer_validation(fixture.path, false);
+        selected_cache_preserves_peer_validation(fixture.path, true);
         native_seed_cancellation_preserves_accepted_history(fixture.path);
         rejected_scan_cannot_publish_refreshed_history_after_source_deletion(fixture.path);
         transient_refresh_discards_partial_records_before_acceptance(fixture.path);
