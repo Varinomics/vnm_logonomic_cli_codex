@@ -43,10 +43,7 @@ std::string initial_implementation_state()
 
 addon::Structured_inspect_result inspect_implementation(const addon::Structured_inspection& inspection)
 {
-    addon::Json_parse_limits limits;
-    limits.max_bytes        = 4 * k_max_bytes;
-    limits.max_string_bytes = 2 * k_max_bytes;
-    const auto parsed = addon::parse_json(inspection.protocol_state, limits, nullptr);
+    const auto parsed = addon::parse_exchange_protocol_state(inspection.protocol_state);
     if (!parsed || !parsed->is_object() || parsed->as_object().size() != 6) {
         return failed();
     }
@@ -92,6 +89,9 @@ addon::Structured_inspect_result inspect_implementation(const addon::Structured_
         const std::string message = first == std::string::npos ? std::string{} : inspection.stderr_bytes.substr(first, last - first + 1);
         return failed(message == "Not logged in" ? "authentication_required" : "startup_failed");
     };
+    addon::Json_parse_limits limits;
+    limits.max_bytes        = 4 * k_max_bytes;
+    limits.max_string_bytes = 2 * k_max_bytes;
     while (true) {
         const auto end = pending->find('\n');
         if (end == std::string::npos) {
