@@ -355,14 +355,16 @@ void mutable_cache_preserves_accepted_attribution(const fs::path& fixture)
     }
     for (const auto total : {22, 15}) {
         write(source, bytes(resumed, total));
+        const auto expected_total = static_cast<std::uint64_t>(total);
+        const auto expected_known = std::min(expected_total, std::uint64_t{20});
         for (int generation = 0; generation < 2; ++generation) {
             const auto reduced = scan();
             const auto& record = reduced.records.front();
-            check(record.total_tokens == total && record.repository_usage &&
+            check(record.total_tokens == expected_total && record.repository_usage &&
                 record.repository_usage->allocations.size() == 1 &&
                 record.repository_usage->allocations.front().repository_path == addon::path_to_utf8(original) &&
-                record.repository_usage->allocations.front().total_tokens == std::min(total, 20) &&
-                record.repository_usage->unattributed_tokens == std::max(total - 20, 0),
+                record.repository_usage->allocations.front().total_tokens == expected_known &&
+                record.repository_usage->unattributed_tokens == expected_total - expected_known,
                 "legacy lower totals consume unknown first and retain the sole known repository");
         }
     }
