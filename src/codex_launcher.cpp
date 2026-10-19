@@ -226,40 +226,6 @@ addon::Launcher_candidate generic_codex_candidate(const addon::Discover_request&
     };
 }
 
-std::string trim(std::string_view value)
-{
-    const auto first = value.find_first_not_of(" \t\r\n");
-    const auto last  = value.find_last_not_of(" \t\r\n");
-    return first == std::string_view::npos
-        ? std::string{} : std::string(value.substr(first, last - first + 1));
-}
-
-std::string unquote(std::string_view value)
-{
-    std::string result = trim(value);
-    if (result.size() >= 2 &&
-        ((result.front() == '\'' && result.back() == '\'') ||
-         (result.front() == '"'  && result.back() == '"')))
-    {
-        return result.substr(1, result.size() - 2);
-    }
-    return result;
-}
-
-std::string base_name(std::string_view value)
-{
-    std::string name = lower(unquote(value));
-    const auto separator = name.find_last_of("/\\");
-    if (separator != std::string::npos) name.erase(0, separator + 1);
-    for (const std::string_view suffix : {".exe", ".cmd", ".ps1", ".bat"}) {
-        if (name.ends_with(suffix)) {
-            name.resize(name.size() - suffix.size());
-            break;
-        }
-    }
-    return name;
-}
-
 bool package_flag(std::string_view value)
 {
     return value == "-y" || value == "--yes" || value == "--quiet" ||
@@ -275,80 +241,24 @@ bool separate_option_value(std::string_view argument)
     return !argument.empty() && (argument == "-" || argument.front() != '-');
 }
 
-bool environment_name(std::string_view name)
-{
-    if (name.empty() || (name.front() != '_' &&
-        !std::isalpha(static_cast<unsigned char>(name.front())))) return false;
-    return std::all_of(name.begin(), name.end(), [](unsigned char character) {
-        return character == '_' || (character >= 'A' && character <= 'Z') ||
-            (character >= 'a' && character <= 'z') ||
-            (character >= '0' && character <= '9');
-    });
-}
-
-std::optional<std::pair<std::string, std::string>> assignment(std::string_view text)
-{
-    const std::string value = unquote(text);
-    const auto separator = value.find('=');
-    if (separator == std::string::npos) return std::nullopt;
-    const std::string name = trim(value.substr(0, separator));
-    if (!environment_name(name) || value.find('\0') != std::string::npos) return std::nullopt;
-    return std::pair{name, unquote(value.substr(separator + 1))};
-}
-
-std::vector<std::string> tokens(std::string_view text)
-{
-    static const std::regex pattern(R"re("(?:\\.|[^"])*"|'[^']*'|\S+)re");
-    const std::string input(text);
-    std::vector<std::string> result;
-    for (std::sregex_iterator match(input.begin(), input.end(), pattern), end;
-         match != end; ++match)
-    {
-        result.push_back(match->str());
-    }
-    return result;
-}
-
-std::vector<std::string> segments(std::string_view line)
-{
-    std::vector<std::string> result;
-    std::string current;
-    char quote = 0;
-    for (std::size_t index = 0; index < line.size(); ++index) {
-        const char character = line[index];
-        if (character == '\\' && quote == '"' && index + 1 < line.size()) {
-            current += character;
-            current += line[++index];
-            continue;
-        }
-        if (character == quote) quote = 0;
-        else if (!quote && (character == '\'' || character == '"')) quote = character;
-        else if (!quote && (character == ';' || character == '&' || character == '|')) {
-            if (!trim(current).empty()) result.push_back(trim(current));
-            current.clear();
-            continue;
-        }
-        current += character;
-    }
-    if (!trim(current).empty()) result.push_back(trim(current));
-    return result;
-}
-
 std::optional<Launcher_command> recognize(std::string_view script, int depth)
 {
     if (depth == 0) return std::nullopt;
     Environment inherited;
     std::istringstream lines{std::string(script)};
     for (std::string line; std::getline(lines, line);) {
-        line = trim(line);
+        line = addon::trim(line, Launcher_whitespace::ASCII);
         if (line.empty() || line.starts_with('#') || line.starts_with("//") ||
             lower(line).starts_with("rem ")) continue;
-        for (std::string segment : segments(line)) {
+        for (std::string segment : addon::launcher_segments(line, Launcher_whitespace::ASCII)) {
             const std::string normalized = lower(segment);
             std::optional<std::pair<std::string, std::string>> standalone;
-            if (normalized.starts_with("set ")) standalone = assignment(segment.substr(4));
-            else if (normalized.starts_with("export ")) standalone = assignment(segment.substr(7));
-            else if (normalized.starts_with("$env:")) standalone = assignment(segment.substr(5));
+            if (normalized.starts_with("set ")) standalone = addon::environment_assignment(
+                segment.substr(4), Launcher_whitespace::ASCII);
+            else if (normalized.starts_with("export ")) standalone = addon::environment_assignment(
+                segment.substr(7), Launcher_whitespace::ASCII);
+            else if (normalized.starts_with("$env:")) standalone = addon::environment_assignment(
+                segment.substr(5), Launcher_whitespace::ASCII);
             if (standalone) {
                 inherited.push_back(*standalone);
                 continue;
@@ -359,26 +269,26 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
             static const std::regex leading(R"re(^([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s]*)\s*)re");
             std::smatch match;
             while (std::regex_search(segment, match, leading)) {
-                environment.emplace_back(match[1].str(), unquote(match[2].str()));
+                environment.emplace_back(match[1].str(), addon::unquote(match[2].str(), Launcher_whitespace::ASCII));
                 segment.erase(0, match.length());
             }
-            const auto words = tokens(segment);
+            const auto words = addon::launcher_tokens(segment);
             std::size_t index = 0;
             while (index < words.size()) {
-                const auto value = assignment(words[index]);
-                const auto prefix = lower(unquote(words[index]));
+                const auto value = addon::environment_assignment(words[index], Launcher_whitespace::ASCII);
+                const auto prefix = lower(addon::unquote(words[index], Launcher_whitespace::ASCII));
                 if (value) environment.push_back(*value);
                 else if (prefix != "call" && prefix != "command" && prefix != "exec" && prefix != "&") break;
                 ++index;
             }
             if (index == words.size()) continue;
-            const std::string program = unquote(words[index]);
-            const std::string base = base_name(program);
+            const std::string program = addon::unquote(words[index], Launcher_whitespace::ASCII);
+            const std::string base = addon::base_name(program, Launcher_whitespace::ASCII);
             if (base == "codex" || base.starts_with("codex@")) return Launcher_command{program, {}, environment};
             if (base == "npx" || base == "bunx") {
                 std::vector<std::string> arguments;
                 for (++index; index < words.size(); ++index) {
-                    const auto argument = unquote(words[index]);
+                    const auto argument = addon::unquote(words[index], Launcher_whitespace::ASCII);
                     arguments.push_back(argument);
                     if (argument.starts_with('-')) {
                         if (!package_flag(argument)) break;
@@ -396,14 +306,14 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                      base == "bash" || base == "sh")
             {
                 for (++index; index + 1 < words.size(); ++index) {
-                    const auto argument = lower(unquote(words[index]));
+                    const auto argument = lower(addon::unquote(words[index], Launcher_whitespace::ASCII));
                     if (argument != "/c" && argument != "-c" && argument != "-command") continue;
                     std::string tail;
                     for (++index; index < words.size(); ++index) {
                         if (!tail.empty()) tail += ' ';
                         tail += words[index];
                     }
-                    auto command = recognize(unquote(tail), depth - 1);
+                    auto command = recognize(addon::unquote(tail, Launcher_whitespace::ASCII), depth - 1);
                     if (command) {
                         command->environment.insert(command->environment.begin(), environment.begin(), environment.end());
                         return command;
@@ -443,7 +353,7 @@ std::optional<std::string> stream_version(std::string_view value)
     std::istringstream input(text);
     std::string version;
     for (std::string line; std::getline(input, line);) {
-        line = trim(line);
+        line = addon::trim(line, Launcher_whitespace::ASCII);
         if (line.empty()) continue;
         lines.push_back(line);
         std::smatch match;
@@ -641,7 +551,7 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
 
 bool supported_session_arguments(const std::vector<std::string>& argv, bool resume)
 {
-    if (argv.empty() || (base_name(argv.front()) != "codex" && !base_name(argv.front()).starts_with("codex@"))) {
+    if (argv.empty() || (addon::base_name(argv.front(), Launcher_whitespace::ASCII) != "codex" && !addon::base_name(argv.front(), Launcher_whitespace::ASCII).starts_with("codex@"))) {
         return false;
     }
     std::vector<std::string> values{
@@ -763,7 +673,7 @@ std::optional<Verified_launch> verified_launch(
     }
     else
     if (launcher.runner_key == addon::k_runner_powershell && launcher_argv.size() == 4 &&
-        base_name(launcher_argv[0]) == "powershell" && launcher_argv[1] == "-NoLogo" &&
+        addon::base_name(launcher_argv[0], Launcher_whitespace::ASCII) == "powershell" && launcher_argv[1] == "-NoLogo" &&
         launcher_argv[2] == "-Command" && launcher_argv[3] == launcher.script_body)
     {
         for (const unsigned char character : launcher.script_body) {
@@ -778,7 +688,7 @@ std::optional<Verified_launch> verified_launch(
     else {
         return std::nullopt;
     }
-    if (literal.empty() || (base_name(literal.front()) != "codex" && !base_name(literal.front()).starts_with("codex@")) ||
+    if (literal.empty() || (addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "codex" && !addon::base_name(literal.front(), Launcher_whitespace::ASCII).starts_with("codex@")) ||
         (delegated && !supported_session_arguments(literal, false)) || !effective_environment.is_object())
     {
         return std::nullopt;
@@ -813,7 +723,7 @@ std::optional<Verified_launch> verified_launch(
             std::string extensions;
             std::istringstream entries(environment_value(environment, "PATHEXT"));
             for (std::string extension; std::getline(entries, extension, ';');) {
-                extension = trim(extension);
+                extension = addon::trim(extension, Launcher_whitespace::ASCII);
                 if (lower(extension) == ".js" || extension.empty()) {
                     continue;
                 }
