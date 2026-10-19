@@ -162,6 +162,100 @@ void reducer_keeps_turn_deltas_resets_and_fork_baselines(const fs::path& path)
         "cache creation retains the native unsupported category");
 }
 
+void reducer_preserves_fork_turn_precision(const fs::path& path)
+{
+    const std::string fork_metadata =
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fork\","
+        "\"timestamp\":\"2026-01-01T00:00:00.500Z\",\"cwd\":\"\",\"forked_from_id\":\"parent\"}}\n";
+    // These native UUIDv7 IDs were generated at .250, .750 and 01.100.
+    const std::string inherited = "019b76da-a8fa-7000-8000-000000000001";
+    const std::string first     = "019b76da-aaee-7000-8000-000000000001";
+    const std::string second    = "019b76da-ac4c-7000-8000-000000000001";
+    const std::string history =
+        start(inherited, 1767225600) + tokens(100) + complete(inherited);
+    const std::string later =
+        start(second, 1767225601) + tokens(130) + complete(second);
+    const auto records = reduce(
+        fork_metadata + history +
+        start(first, 1767225600) + tokens(120) + complete(first) + later, path);
+    check(records.size() == 2 && records[0].usage.record_id == "codex:fork:" + first &&
+        records[0].usage.total_tokens == 20 && records[1].usage.total_tokens == 10,
+        "native seconds must not discard a local turn in the fork's creation second");
+
+    const std::string without_seconds =
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"" + first + "\"}}\n";
+    const auto precise_only = reduce(
+        fork_metadata + history + without_seconds + tokens(120) + complete(first) + later, path);
+    check(precise_only.size() == 2 && precise_only[0].usage.total_tokens == 20 &&
+        precise_only[1].usage.total_tokens == 10,
+        "UUIDv7 precision is also available when native seconds are absent");
+
+    const auto seconds_only = reduce(
+        fork_metadata + start("inherited", 1767225599) + tokens(100) + complete("inherited") +
+        start("local", 1767225601) + tokens(130) + complete("local"), path);
+    check(seconds_only.size() == 1 && seconds_only[0].usage.total_tokens == 30,
+        "turn identities without UUIDv7 retain the native seconds fallback");
+}
+
+void reducer_keeps_categories_across_interrupted_turns(const fs::path& path)
+{
+    const std::string baseline = metadata() + start("first") +
+        tokens(10, ",\"input_tokens\":6,\"output_tokens\":4,\"cached_input_tokens\":0") +
+        complete("first");
+    const std::string interrupted = start("interrupted") +
+        tokens(110, ",\"input_tokens\":66,\"output_tokens\":44,\"cached_input_tokens\":20");
+    const std::string next = start("next") +
+        tokens(160, ",\"input_tokens\":96,\"output_tokens\":64,\"cached_input_tokens\":25") +
+        complete("next");
+    const auto records = reduce(baseline + interrupted + next, path);
+    check(records.size() == 2, "an interrupted turn remains pending until the next completion");
+    const auto& usage = records[1].usage;
+    check(usage.total_tokens == 150 && usage.input.value == 90 &&
+        usage.output.value == 60 && usage.cache_read.value == 25,
+        "pending totals and categories span the same interrupted-turn boundary");
+    check(usage.input.coverage->covered_records == 1 &&
+        usage.output.coverage->covered_records == 1 &&
+        usage.cache_read.coverage->covered_records == 1 && !usage.cross_source_event,
+        "known pending categories stay covered without claiming one complete native turn");
+    for (const std::uint16_t version : {std::uint16_t{2}, std::uint16_t{3}}) {
+        auto encoded_usage = usage;
+        if (version == 3) {
+            encoded_usage.aggregate_evidence = "partial";
+        }
+        addon::Contract_failure failure;
+        const auto decoded = addon::decode_usage_record(
+            addon::encode_usage_record(encoded_usage, version), &failure, version);
+        check(decoded && decoded->total_tokens == 150 && decoded->input.value == 90 &&
+            decoded->output.value == 60 && decoded->cache_read.value == 25,
+            "interrupted category values survive the supported usage codecs");
+    }
+    const auto completed = reduce(baseline + interrupted + complete("interrupted") + next, path);
+    check(completed.size() == 3 &&
+        completed[1].usage.total_tokens + completed[2].usage.total_tokens == usage.total_tokens &&
+        *completed[1].usage.input.value + *completed[2].usage.input.value == *usage.input.value &&
+        *completed[1].usage.output.value + *completed[2].usage.output.value == *usage.output.value,
+        "an explicit intermediate completion changes grouping, not aggregate usage");
+
+    const auto missing = reduce(
+        baseline + start("interrupted") +
+        tokens(50, ",\"input_tokens\":30,\"cached_input_tokens\":5") +
+        tokens(110, ",\"input_tokens\":66,\"output_tokens\":44,\"cached_input_tokens\":20") + next, path);
+    check(missing.size() == 2 && missing[1].usage.total_tokens == 150 &&
+        missing[1].usage.input.value == 90 && missing[1].usage.output.value == 0 &&
+        missing[1].usage.output.coverage->covered_records == 0 &&
+        missing[1].usage.output.coverage->support == addon::Usage_support::UNKNOWN,
+        "a missing category in pending usage stays unknown after the next turn starts");
+
+    const auto reset = reduce(
+        baseline + interrupted + start("next") +
+        tokens(20, ",\"input_tokens\":12,\"output_tokens\":8,\"cached_input_tokens\":3") +
+        complete("next"), path);
+    check(reset.size() == 2 && reset[1].usage.total_tokens == 120 &&
+        reset[1].usage.input.value == 72 && reset[1].usage.output.value == 48 &&
+        reset[1].usage.cache_read.value == 23,
+        "a cumulative counter reset adds its new categories to interrupted pending usage");
+}
+
 void reducer_attributes_resumed_turns(const fs::path& fixture)
 {
     const auto original = fixture / "original-repository";
@@ -262,6 +356,84 @@ fs::path accepted_snapshot(const fs::path& storage)
     check(pointer && pointer->find("snapshot") && pointer->find("snapshot")->is_string(),
         "accepted generation has its snapshot identity");
     return root / "snapshots" / pointer->find("snapshot")->as_string();
+}
+
+void selected_cache_reparses_previous_parser_revision(const fs::path& fixture)
+{
+    const auto profile = fixture / "parser-revision-profile";
+    const auto storage = fixture / "parser-revision-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto source = profile / "sessions" / "rollout-fork.jsonl";
+    const std::string inherited = "019b76da-a8fa-7000-8000-000000000001";
+    const std::string local = "019b76da-aaee-7000-8000-000000000001";
+    const std::string second = "019b76da-ac4c-7000-8000-000000000001";
+    write(source, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fork\","
+        "\"timestamp\":\"2026-01-01T00:00:00.500Z\",\"cwd\":\"\",\"forked_from_id\":\"parent\"}}\n" +
+        start(inherited, 1767225600) + tokens(100) + complete(inherited) +
+        start(local, 1767225600) + tokens(120) + complete(local) +
+        start(second, 1767225601) + tokens(130) + complete(second));
+    addon::Usage_scan_request request;
+    request.mode = "incremental";
+    request.context.profile_storage = addon::Profile_storage_context{1, addon::path_to_utf8(storage)};
+    request.context.account_context = addon::Account_context{1, "parser-revision-account"};
+    const auto initial = storage / "initial";
+    fs::create_directory(initial);
+    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(initial)};
+    std::string error;
+    const auto first = codex::scan_usage(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(first && first->complete && first->records.size() == 2 && first->cache_candidate,
+        error.empty() ? "establish precise fork accounting" : error.c_str());
+
+    // Reconstruct revision 1's omitted same-second local turn without changing
+    // the native file or its cached fingerprint and temporal parser marker.
+    const auto historical = storage / "historical";
+    fs::create_directory(historical);
+    for (const auto* name : {"snapshot", "cache-state"}) {
+        check(fs::copy_file(initial / name, historical / name), "copy prior parser cache metadata");
+    }
+    for (const auto* name : {"rollouts", "records"}) {
+        std::ifstream input(initial / name, std::ios::binary);
+        check(static_cast<bool>(input), "read prior parser fixture");
+        std::string replacement;
+        for (std::string line; std::getline(input, line);) {
+            auto row = addon::parse_json(line, {}, nullptr);
+            check(row.has_value(), "decode prior parser fixture");
+            if (std::string_view(name) == "rollouts") {
+                row->set("revision", addon::Json_value(1));
+            }
+            else {
+                const auto record = addon::decode_usage_record(*row->find("usage"), nullptr, 3);
+                check(record.has_value(), "decode prior fork record");
+                if (record->record_id == "codex:fork:" + local) continue;
+            }
+            replacement += addon::serialize_json(*row) + '\n';
+        }
+        write(historical / name, replacement);
+    }
+    addon::Contract_failure failure;
+    const auto accepted = addon::seal_usage_cache_candidate(addon::path_to_utf8(historical),
+        addon::path_to_utf8(storage), request.context.account_context, first->snapshot_id,
+        "codex-rollout-cache@3", [] { return false; }, &failure);
+    check(accepted.has_value(), "seal the prior parser's incomplete accounting");
+    const auto refreshed = storage / "refreshed";
+    fs::create_directory(refreshed);
+    request.cache_selection = addon::Usage_cache_selection{accepted, addon::path_to_utf8(refreshed)};
+    const auto update = codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(update && update->changes && update->changes->complete && update->changes->cache_candidate &&
+        update->changes->records.size() == 1 &&
+        update->changes->records.front().record_id == "codex:fork:" + local &&
+        update->changes->records.front().total_tokens == 20,
+        error.empty() ? "an unchanged revision 1 rollout recovers its missing local turn" : error.c_str());
+    const auto reused = storage / "reused";
+    fs::create_directory(reused);
+    request.cache_selection = addon::Usage_cache_selection{
+        update->changes->cache_candidate, addon::path_to_utf8(reused)};
+    const auto unchanged = codex::scan_usage_incremental(request, profile, storage,
+        [] { return false; }, quiet_progress, &error);
+    check(unchanged && !unchanged->changes, "the refreshed parser cache is reused without another change");
 }
 
 void scanner_keeps_per_turn_repositories(const fs::path& fixture, bool selected)
@@ -1069,7 +1241,7 @@ void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
         "consumed stale seed cannot resurrect older history after cache loss");
 }
 
-void native_seed_fingerprint_uses_system_clock(const fs::path& fixture)
+void native_seed_reparses_previous_parser_revision(const fs::path& fixture)
 {
     const auto profile = fixture / "fingerprint-profile";
     const auto storage = fixture / "fingerprint-storage";
@@ -1089,8 +1261,8 @@ void native_seed_fingerprint_uses_system_clock(const fs::path& fixture)
     fs::last_write_time(source, file_modified);
     check(fs::last_write_time(source) == file_modified, "fixture preserves exact millisecond file timestamp");
 
-    // Distinct counts reveal whether the trusted fingerprint reuses the native
-    // evidence or reparses the source. No wall-clock sampling defines identity.
+    // The native cache uses the original parser. Even its matching size and
+    // system-clock timestamp cannot bypass the package's newer reducer.
     auto wrapper = native_wrapper(source, "fingerprint", 17);
     wrapper.set("size", addon::Json_value(static_cast<std::int64_t>(fs::file_size(source))));
     wrapper.set("modified_msecs", addon::Json_value(static_cast<std::int64_t>(
@@ -1100,16 +1272,18 @@ void native_seed_fingerprint_uses_system_clock(const fs::path& fixture)
     set_seed(&request, artifact, addon::serialize_json(wrapper) + '\n');
     std::string error;
     auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
-        "matching system-clock milliseconds reuse native cache evidence");
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 23,
+        "an older native parser is refreshed despite a matching fingerprint");
 
     request.native_file_cache.reset();
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
-        "native timestamp identity survives accepted-cache reload");
-    fs::last_write_time(source, file_modified + std::chrono::seconds{2});
+    write(source, metadata("fingerprint") + start("turn") + tokens(29) + complete("turn"));
+    fs::last_write_time(source, file_modified);
     page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 23,
+        "the refreshed parser reuses unchanged size and timestamp after cache reload");
+    fs::last_write_time(source, file_modified + std::chrono::seconds{2});
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 29,
         "changed timestamp with unchanged size refreshes native cache evidence");
 }
 
@@ -3265,6 +3439,9 @@ int main(int argc, char** argv)
         }
         projector_does_not_retain_ignored_large_payloads();
         reducer_keeps_turn_deltas_resets_and_fork_baselines(fixture.path / "rollout-fixture.jsonl");
+        reducer_preserves_fork_turn_precision(fixture.path / "rollout-fixture.jsonl");
+        reducer_keeps_categories_across_interrupted_turns(fixture.path / "rollout-fixture.jsonl");
+        selected_cache_reparses_previous_parser_revision(fixture.path);
         reducer_attributes_resumed_turns(fixture.path);
         scanner_keeps_per_turn_repositories(fixture.path, false);
         scanner_keeps_per_turn_repositories(fixture.path, true);
@@ -3277,7 +3454,7 @@ int main(int argc, char** argv)
         scanner_reads_archived_rollouts(fixture.path, true);
         scanner_accepts_new_profiles_and_retains_transient_empty_history(fixture.path);
         native_seed_replay_and_required_cache_loss(fixture.path);
-        native_seed_fingerprint_uses_system_clock(fixture.path);
+        native_seed_reparses_previous_parser_revision(fixture.path);
         selected_cache_preserves_peer_validation(fixture.path, false);
         selected_cache_preserves_peer_validation(fixture.path, true);
         native_seed_cancellation_preserves_accepted_history(fixture.path);

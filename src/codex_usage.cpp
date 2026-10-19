@@ -39,7 +39,10 @@ namespace {
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
 constexpr std::size_t k_line_limit = 4 * 1024 * 1024;
-constexpr int k_parser_revision = 1;
+constexpr int k_parser_revision = 2;
+// Native cache capabilities describe the original reducer, even after the
+// package changes its parsing of fork boundaries and interrupted turns.
+constexpr int k_native_cache_parser_revision = 1;
 // A usage-scan@3 candidate keeps one metadata line per rollout in `rollouts`
 // beside the snapshot's sorted `records`, so it holds four files however many
 // rollouts a home has. @1 and @2 kept a metadata and a records file per
@@ -723,7 +726,7 @@ void seed_native_cache(const addon::Usage_scan_request& request, const fs::path&
         require(file.has_value(), error);
         auto metadata = addon::Json_value::object();
         metadata.set("native_seed", addon::Json_value(descriptor.sha256_hex));
-        metadata.set("revision", addon::Json_value(file->parser_current ? k_parser_revision : 0));
+        metadata.set("revision", addon::Json_value(file->parser_current ? k_native_cache_parser_revision : 0));
         metadata.set("source", addon::Json_value(file->path));
         metadata.set("size", addon::Json_value(std::to_string(file->size)));
         metadata.set("modified_native_msecs", addon::Json_value(std::to_string(file->modified_msecs)));

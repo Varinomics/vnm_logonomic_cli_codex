@@ -124,19 +124,23 @@ std::optional<std::int64_t> timestamp(std::string_view iso)
 
 std::optional<std::int64_t> turn_started(const addon::Json_value& payload, const std::string& turn)
 {
+    // Native started_at is truncated to seconds. A UUIDv7 turn retains the
+    // precision needed to distinguish inherited and local turns within the
+    // fork's creation second.
+    if (turn.size() >= 15 && turn[8] == '-' && turn[13] == '-' && turn[14] == '7') {
+        const std::string hex = turn.substr(0, 8) + turn.substr(9, 4);
+        std::int64_t result = 0;
+        const auto parsed = std::from_chars(hex.data(), hex.data() + hex.size(), result, 16);
+        if (parsed.ec == std::errc{} && parsed.ptr == hex.data() + hex.size() && result > 0) {
+            return result;
+        }
+    }
     if (const auto seconds = count(member(payload, "started_at"));
         seconds && *seconds <= std::numeric_limits<std::int64_t>::max() / 1000)
     {
         return static_cast<std::int64_t>(*seconds) * 1000;
     }
-    if (turn.size() < 15 || turn[8] != '-' || turn[13] != '-' || turn[14] != '7') {
-        return std::nullopt;
-    }
-    const std::string hex = turn.substr(0, 8) + turn.substr(9, 4);
-    std::int64_t result = 0;
-    const auto parsed = std::from_chars(hex.data(), hex.data() + hex.size(), result, 16);
-    return parsed.ec == std::errc{} && parsed.ptr == hex.data() + hex.size() && result > 0
-        ? std::optional(result) : std::nullopt;
+    return std::nullopt;
 }
 
 std::optional<std::string> completion_date(const addon::Json_value& event, const addon::Json_value& payload)
@@ -313,7 +317,8 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             // and no tokens pending from a turn that never completed.
             complete_turn_event = have_total && pending == 0;
             saw_turn_sample = false;
-            input_tokens.reset(); output_tokens.reset(); cache_tokens.reset();
+            // Categories share pending's lifetime: an interrupted turn can
+            // contribute to the next completion, including incomplete coverage.
             return true;
         }
         if (type == "token_count") {
