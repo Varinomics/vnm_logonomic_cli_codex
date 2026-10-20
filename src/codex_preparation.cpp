@@ -7,6 +7,7 @@
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launch_preparation.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -148,7 +149,7 @@ bool takes_initial_prompt(
 bool leaves_prompt_position(const addon::Prepare_request& request)
 {
     const auto literal = request.launcher.runner_key == addon::k_runner_direct
-        ? request.launcher_argv : literal_launcher_argv(request.launcher.script_body);
+        ? request.launcher_argv : addon::literal_argv(request.launcher.script_body);
     return supported_session_arguments(literal, false) &&
         std::none_of(literal.begin() + 1, literal.end(), [](const std::string& argument) {
             const auto option = argument.substr(0, argument.find('='));
@@ -265,7 +266,7 @@ void prepare_resume(addon::Invocation_context& context)
         return;
     }
     const auto literal = request->context.launcher.runner_key == addon::k_runner_direct
-        ? request->context.launcher_argv : literal_launcher_argv(request->context.launcher.script_body);
+        ? request->context.launcher_argv : addon::literal_argv(request->context.launcher.script_body);
     if (!supported_session_arguments(literal, true)) {
         context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unsupported");
         return;
