@@ -4,6 +4,7 @@
 #include "codex_usage_records.h"
 #include "codex_native_usage.h"
 
+#include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 #include <logonomic_cli_addon/usage_repository_attribution.h>
@@ -38,6 +39,9 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
+
+using addon::json::member;
+
 constexpr std::size_t k_line_limit = 4 * 1024 * 1024;
 constexpr int k_parser_revision = 2;
 // Native cache capabilities describe the original reducer, even after the
@@ -332,13 +336,6 @@ std::optional<addon::Json_value> read_json(const fs::path& path)
     require(value.has_value() && value->is_object(), "usage_cache_invalid");
     require(!read_line(input, &line), "usage_cache_invalid");
     return value;
-}
-
-const addon::Json_value& member(const addon::Json_value& object, std::string_view name)
-{
-    static const addon::Json_value missing;
-    const auto* value = object.find(name);
-    return value ? *value : missing;
 }
 
 std::string string_member(const addon::Json_value& object, std::string_view name)
