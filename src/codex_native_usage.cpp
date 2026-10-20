@@ -1,5 +1,6 @@
 #include "codex_native_usage.h"
 #include "codex_accounts.h"
+#include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #include <logonomic_cli_addon/package_source.h>
@@ -12,18 +13,8 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 
-const addon::Json_value& member(const addon::Json_value& object, std::string_view name)
-{
-    static const addon::Json_value missing;
-    const auto* value = object.find(name);
-    return value ? *value : missing;
-}
-
-std::string text(const addon::Json_value& object, std::string_view name)
-{
-    const auto& value = member(object, name);
-    return value.is_string() ? value.as_string() : std::string{};
-}
+using addon::json::member;
+using addon::json::text;
 
 std::optional<std::int64_t> integer(const addon::Json_value& value)
 {
