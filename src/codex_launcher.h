@@ -59,10 +59,6 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
     const logonomic::cli_addon::Discover_request& request,
     Codex_profile_discovery_stats* out_profile_stats);
 
-// Literal argv follows the host's direct-launch grammar; it never evaluates a
-// shell expression. Recognition is deliberately separate from executable proof.
-std::vector<std::string> literal_launcher_argv(std::string_view script);
-
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
 std::string parse_version_output(std::string_view output, std::string_view errors);
 

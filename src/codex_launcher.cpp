@@ -326,51 +326,6 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
     return std::nullopt;
 }
 
-const std::string& semver_pattern()
-{
-    static const std::string pattern =
-        R"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
-        R"((?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?)"
-        R"((?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)";
-    return pattern;
-}
-
-bool semver(std::string_view value)
-{
-    static const std::regex pattern("^" + semver_pattern() + "$", std::regex::ECMAScript);
-    return std::regex_match(value.begin(), value.end(), pattern);
-}
-
-std::optional<std::string> stream_version(std::string_view value)
-{
-    if (value.size() > 65536 || value.find('\0') != std::string_view::npos ||
-        !addon::is_valid_utf8(value)) return std::nullopt;
-    static const std::regex labelled("^(?:codex-cli|codex)(?:\\s+version)?(?:\\s*[:=]\\s*|\\s+)v?(" +
-        semver_pattern() + ")(?:\\s+\\([^\\r\\n()]{1,128}\\))?\\s*$", std::regex::icase);
-    std::vector<std::string> lines;
-    std::string text(value);
-    std::replace(text.begin(), text.end(), '\r', '\n');
-    std::istringstream input(text);
-    std::string version;
-    for (std::string line; std::getline(input, line);) {
-        line = addon::trim(line, Launcher_whitespace::ASCII);
-        if (line.empty()) continue;
-        lines.push_back(line);
-        std::smatch match;
-        if (std::regex_match(line, match, labelled)) {
-            if (!version.empty() && version != match[1].str()) return std::nullopt;
-            version = match[1].str();
-        }
-    }
-    if (!version.empty()) return version;
-    if (lines.size() == 1) {
-        auto candidate = lines.front();
-        if (candidate.starts_with('v') || candidate.starts_with('V')) candidate.erase(0, 1);
-        if (semver(candidate)) return candidate;
-    }
-    return std::string{};
-}
-
 } // namespace
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script)
@@ -443,31 +398,9 @@ std::vector<addon::Launcher_candidate> discover_launchers(
     return candidates;
 }
 
-std::vector<std::string> literal_launcher_argv(std::string_view script)
-{
-    std::vector<std::string> result;
-    std::string current;
-    bool quoted = false;
-    int quotes = 0;
-    for (const char character : script) {
-        if (character == '"') {
-            if (++quotes == 3) { current += '"'; quotes = 0; }
-            continue;
-        }
-        if (quotes == 1) quoted = !quoted;
-        quotes = 0;
-        if (!quoted && std::isspace(static_cast<unsigned char>(character))) {
-            if (!current.empty()) { result.push_back(current); current.clear(); }
-        }
-        else current += character;
-    }
-    if (!current.empty()) result.push_back(current);
-    return result;
-}
-
 bool version_is_at_least(std::string_view version, int major, int minor, int patch)
 {
-    if (!semver(version)) return false;
+    if (!addon::is_semantic_version(version)) return false;
     std::array<std::string_view, 3> components;
     auto remaining = version.substr(0, version.find_first_of("-+"));
     for (auto& component : components) {
@@ -487,8 +420,9 @@ bool version_is_at_least(std::string_view version, int major, int minor, int pat
 
 std::string parse_version_output(std::string_view output, std::string_view errors)
 {
-    const auto first  = stream_version(output);
-    const auto second = stream_version(errors);
+    constexpr std::string_view labels[] = {"codex-cli", "codex"};
+    const auto first  = addon::parse_version_stream(output, labels, Launcher_whitespace::ASCII);
+    const auto second = addon::parse_version_stream(errors, labels, Launcher_whitespace::ASCII);
     if (!first || !second || (!first->empty() && !second->empty() && *first != *second)) return {};
     return first->empty() ? *second : *first;
 }
@@ -683,7 +617,7 @@ std::optional<Verified_launch> verified_launch(
                 return std::nullopt;
             }
         }
-        literal = literal_launcher_argv(launcher.script_body);
+        literal = addon::literal_argv(launcher.script_body);
     }
     else {
         return std::nullopt;
@@ -750,7 +684,7 @@ std::optional<Verified_launch> verified_launch(
         const std::string platform_name = "@openai/codex-" + target->first;
         const std::string native_version = package_version + "-" + target->first;
         const auto* dependencies = package->find("optionalDependencies");
-        if (!semver(package_version) || member_text(*package, "name") != "@openai/codex" ||
+        if (!addon::is_semantic_version(package_version) || member_text(*package, "name") != "@openai/codex" ||
             addon::path_from_utf8(bin_path).lexically_normal() != fs::path("bin/codex.js") ||
             !dependencies || member_text(*dependencies, platform_name) != "npm:@openai/codex@" + native_version)
         {
