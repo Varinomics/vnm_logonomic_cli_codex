@@ -43,11 +43,11 @@ std::string initial_implementation_state()
 
 addon::Structured_inspect_result inspect_implementation(const addon::Structured_inspection& inspection)
 {
-    const auto parsed = addon::parse_exchange_protocol_state(inspection.protocol_state);
+    auto parsed = addon::parse_exchange_protocol_state(inspection.protocol_state);
     if (!parsed || !parsed->is_object() || parsed->as_object().size() != 6) {
         return failed();
     }
-    Json state = *parsed;
+    Json state = std::move(*parsed);
     for (const auto key : {"pending_base64", "result_base64", "root_thread_id"}) {
         if (!state.find(key) || !state.find(key)->is_string()) {
             return failed();
@@ -62,8 +62,8 @@ addon::Structured_inspect_result inspect_implementation(const addon::Structured_
     if (!ids || !ids->is_array() || ids->as_array().size() > k_max_items) {
         return failed();
     }
-    auto pending = addon::decode_base64(text(state, "pending_base64"));
-    auto answer  = addon::decode_base64(text(state, "result_base64"));
+    auto pending = addon::decode_base64(state.find("pending_base64")->as_string());
+    auto answer  = addon::decode_base64(state.find("result_base64")->as_string());
     std::string thread = text(state, "root_thread_id");
     bool started   = state.find("turn_started")->as_boolean();
     bool completed = state.find("turn_completed")->as_boolean();
@@ -92,13 +92,14 @@ addon::Structured_inspect_result inspect_implementation(const addon::Structured_
     addon::Json_parse_limits limits;
     limits.max_bytes        = 4 * k_max_bytes;
     limits.max_string_bytes = 2 * k_max_bytes;
+    std::string_view remaining = *pending;
     while (true) {
-        const auto end = pending->find('\n');
-        if (end == std::string::npos) {
+        const auto end = remaining.find('\n');
+        if (end == std::string_view::npos) {
             break;
         }
-        const std::string line = pending->substr(0, end);
-        pending->erase(0, end + 1);
+        const auto line = remaining.substr(0, end);
+        remaining.remove_prefix(end + 1);
         if (!nonempty(line)) {
             continue;
         }
@@ -168,7 +169,7 @@ addon::Structured_inspect_result inspect_implementation(const addon::Structured_
     }
     addon::Structured_inspect_result result;
     if (inspection.final) {
-        if (inspection.timed_out || inspection.exit_code != 0 || nonempty(*pending) ||
+        if (inspection.timed_out || inspection.exit_code != 0 || nonempty(remaining) ||
             thread.empty() || !started || !completed || answer->empty())
         {
             return protocol_failure();
@@ -181,7 +182,7 @@ addon::Structured_inspect_result inspect_implementation(const addon::Structured_
     for (const auto& id : completed_ids) {
         serialized_ids.push_back(Json(id));
     }
-    state.set("pending_base64", Json(addon::encode_base64(*pending)));
+    state.set("pending_base64", Json(addon::encode_base64(remaining)));
     state.set("result_base64", Json(addon::encode_base64(*answer)));
     state.set("root_thread_id", Json(thread));
     state.set("turn_started", Json(started));
