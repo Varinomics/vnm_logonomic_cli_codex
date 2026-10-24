@@ -107,18 +107,6 @@ std::optional<Profile_selection> selected_profile(const addon::Session_launch_co
     return selected;
 }
 
-addon::Legacy_import_result import_account(const addon::Import_record_request& request)
-{
-    addon::Contract_failure failure;
-    const auto legacy = addon::decode_legacy_account_record(request.record, &failure);
-    if (!legacy || legacy->provider_id != "codex" || !legacy->profile_path) return {};
-    const std::string key = profile_account_key(*legacy->profile_path);
-    if (key.empty()) return {};
-    auto conversion = addon::Json_value::object();
-    conversion.set("adapter_account_key", addon::Json_value(key));
-    return *addon::Legacy_import_result::from_conversion(std::move(conversion));
-}
-
 void handle_accounts(addon::Invocation_context& context)
 {
     if (context.cancel_requested()) { context.fail(addon::Result_status::CANCELLED, "cancelled"); return; }

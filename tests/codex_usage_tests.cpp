@@ -1,7 +1,6 @@
 #include "codex_jsonl_projector.h"
 #include "codex_usage.h"
 #include "codex_usage_records.h"
-#include "codex_native_usage.h"
 #include "codex_accounts.h"
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/package_source.h>
@@ -1089,220 +1088,54 @@ void scanner_reads_archived_rollouts(const fs::path& fixture, bool selected)
     check(totals(scan("incremental")) == expected, "absent native sources retain accepted history");
 }
 
-addon::Json_value native_wrapper(const fs::path& source, std::string_view rollout, int total)
+void current_cache_replay_and_loss(const fs::path& fixture)
 {
-    auto record = addon::Json_value::object();
-    record.set("session_id", addon::Json_value("codex:" + std::string(rollout) + ":turn"));
-    record.set("rollout_id", addon::Json_value(rollout));
-    record.set("turn_id", addon::Json_value("turn"));
-    record.set("completed_date", addon::Json_value("2026-01-02"));
-    record.set("source_path", addon::Json_value(utf8(source)));
-    record.set("total_tokens", addon::Json_value(total));
-    record.set("recorded_cwd", addon::Json_value(""));
-    record.set("model", addon::Json_value("native-model"));
-    record.set("counter_field", addon::Json_value("total_token_usage.total_tokens"));
-    record.set("counter_semantics", addon::Json_value("cumulative_turn_delta"));
-    auto breakdown = addon::Json_value::object();
-    breakdown.set("version", addon::Json_value(2));
-    breakdown.set("coverage_unit", addon::Json_value("sessions"));
-    for (const auto& entry : {std::pair{"input_tokens", total - 5}, std::pair{"output_tokens", 5},
-            std::pair{"cache_read_input_tokens", 0}, std::pair{"cache_creation_input_tokens", -1}}) {
-        auto field = addon::Json_value::object();
-        field.set("support", addon::Json_value(entry.second < 0 ? "unsupported" : "supported"));
-        field.set("covered_records", addon::Json_value(entry.second < 0 ? 0 : 1));
-        field.set("total_records", addon::Json_value(1));
-        if (entry.second >= 0) field.set("known_tokens", addon::Json_value(entry.second));
-        breakdown.set(entry.first, std::move(field));
-    }
-    auto capabilities = addon::Json_value::object();
-    capabilities.set("token_breakdown", std::move(breakdown));
-    auto identity = addon::Json_value::object();
-    const auto public_id = "codex:" + std::string(rollout) + ":turn";
-    identity.set("version", addon::Json_value(1));
-    identity.set("record_id", addon::Json_value(public_id));
-    identity.set("session_key", addon::Json_value(rollout));
-    identity.set("legacy_record_id", addon::Json_value(public_id));
-    identity.set("legacy_session_key", addon::Json_value(rollout));
-    capabilities.set("usage-record-identity", std::move(identity));
-    record.set("session_id", addon::Json_value(addon::to_hex(reinterpret_cast<const std::uint8_t*>(public_id.data()), public_id.size())));
-    record.set("capabilities", std::move(capabilities));
-    auto wrapper = addon::Json_value::object();
-    wrapper.set("path", addon::Json_value(utf8(source)));
-    wrapper.set("size", addon::Json_value(0));
-    wrapper.set("modified_msecs", addon::Json_value(0));
-    auto records = addon::Json_value::array();
-    records.push_back(std::move(record));
-    wrapper.set("records", std::move(records));
-    capabilities = addon::Json_value::object();
-    auto marker = addon::Json_value::object();
-    marker.set("version", addon::Json_value(2));
-    marker.set("parser_revision", addon::Json_value(2));
-    capabilities.set("token_breakdown_cache", std::move(marker));
-    marker = addon::Json_value::object();
-    marker.set("version", addon::Json_value(1));
-    marker.set("parser_revision", addon::Json_value(1));
-    capabilities.set("repository_usage_cache", std::move(marker));
-    wrapper.set("capabilities", std::move(capabilities));
-    return wrapper;
-}
-
-void set_seed(addon::Usage_scan_request* request, const fs::path& artifact, std::string_view bytes)
-{
-    write(artifact, bytes);
-    request->native_file_cache = addon::Usage_native_file_cache{
-        utf8(artifact), addon::to_hex(addon::Sha256::digest(bytes)), "account", true};
-}
-
-void native_seed_repairs_only_witnessed_repository(const fs::path& fixture)
-{
-    const auto profile  = fixture / "seed-repair-profile";
-    const auto storage  = fixture / "seed-repair-storage";
-    const auto original = fixture / "seed-repair-original";
-    const auto resumed  = fixture / "seed-repair-resumed";
-    fs::create_directories(profile / "sessions");
-    fs::create_directory(storage);
-    fs::create_directories(original / ".git");
-    fs::create_directories(resumed / ".git");
-    const auto source = profile / "sessions" / "rollout-seed-repair.jsonl";
-    auto wrapper = native_wrapper(source, "seed-repair", 19);
-    wrapper.find("records")->as_array().front().set("recorded_cwd", addon::Json_value(utf8(original)));
-    addon::Usage_scan_request request;
-    request.mode = "repair";
-    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
-    request.context.account_context = addon::Account_context{1, "account"};
-    set_seed(&request, storage / "native-cache.jsonl", addon::serialize_json(wrapper) + '\n');
-    unsigned generation = 0;
-    for (const bool witnessed : {false, true}) {
-        write(source, metadata_with_cwd("seed-repair", resumed) + tokens(4) + start("turn") +
-            (witnessed ? turn_context("turn", resumed) : std::string{}) + tokens(23) + complete("turn"));
-        for (const auto authority : {codex::Usage_scan_authority::STANDARD,
-                codex::Usage_scan_authority::REPOSITORY_ATTRIBUTION})
-        {
-            const auto root = storage / ("candidate-" + std::to_string(generation++));
-            check(fs::create_directory(root), "allocate first native import candidate");
-            request.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(root)};
-            std::string error;
-            const auto page = codex::scan_usage(request, profile, storage, [] { return false; },
-                quiet_progress, &error, {}, authority);
-            check(page && page->complete && page->records.size() == 1,
-                error.empty() ? "first import retains native accepted turn" : error.c_str());
-            const auto& record = page->records.front();
-            check(record.total_tokens == 19 && record.model == "native-model" &&
-                record.source_counter_semantics == "cumulative_turn_delta" &&
-                record.input.value == 14 && record.output.value == 5 &&
-                record.completed_date == "2026-01-02" && record.source_path == utf8(source),
-                "a live first-import parse preserves validated seed accounting and native provenance");
-            const bool corrected = witnessed && authority == codex::Usage_scan_authority::REPOSITORY_ATTRIBUTION;
-            const auto& repository = corrected ? resumed : original;
-            check(record.repository_usage && record.repository_usage->allocations.size() == 1 &&
-                record.repository_usage->allocations.front().repository_path == utf8(repository) &&
-                (record.capabilities.find(addon::k_usage_repository_attribution_capability_id) != nullptr) == corrected,
-                "first native import corrects only a live witnessed cwd on the selected operation");
-        }
-    }
-}
-
-void native_seed_replay_and_required_cache_loss(const fs::path& fixture)
-{
-    const auto profile = fixture / "seed-profile";
-    const auto storage = fixture / "seed-storage";
+    const auto profile = fixture / "replay-profile";
+    const auto storage = fixture / "replay-storage";
     fs::create_directories(profile / "sessions"); fs::create_directory(storage);
     const auto source = profile / "sessions" / "rollout-retained.jsonl";
-    const auto artifact = storage / "native-file-cache.jsonl";
-    const auto bytes = addon::serialize_json(native_wrapper(source, "legacy", 17)) + '\n';
+    write(source, metadata("retained") + start("turn") +
+        tokens(17, ",\"input_tokens\":12,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn"));
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
-    set_seed(&request, artifact, bytes);
     std::string error;
     auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17,
-        "missing native rollout retained through typed cache seed");
-    check(!page->records[0].source_counter_semantics, "usage2 native conversion remains unchanged");
-    check(page->records[0].input.value == 12 && page->records[0].input.coverage->covered_records == 1 &&
-        page->records[0].cache_creation.coverage->support == addon::Usage_support::UNSUPPORTED,
-        "native cached category evidence preserved exactly");
-    write(source, metadata("legacy") + start("turn") + tokens(23) + complete("turn"));
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records[0].total_tokens == 23, "live file advances seeded stable turn");
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17 &&
+        page->records[0].input.value == 12 && page->records[0].output.value == 5,
+        "current rollout accounting and category evidence are accepted");
     fs::remove(source);
     page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records[0].total_tokens == 23, "same consumed seed cannot overwrite newer retained counts");
-    set_seed(&request, artifact, "");
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 17 &&
+        page->records[0].input.value == 12 && page->records[0].output.value == 5,
+        "accepted current cache retains missing-rollout accounting and categories");
+    write(source, metadata("retained") + start("turn") + tokens(23) + complete("turn"));
     page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records[0].total_tokens == 23, "empty host FILE_CACHE preserves durable package history");
+    check(page && page->records[0].total_tokens == 23, "live file advances the accepted stable turn");
+    fs::remove(source);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    check(page && page->records[0].total_tokens == 23, "fresh scans retain the latest accepted observation");
     const auto cache = accepted_snapshot(storage);
     for (const auto& entry : fs::directory_iterator(cache)) {
         if (entry.path().extension() == ".records") fs::remove(entry.path());
     }
     check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "required_usage_cache_unavailable",
-        "empty required seed plus lost retained cache fails before replacement");
-    set_seed(&request, artifact, bytes);
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "required_usage_cache_unavailable",
-        "consumed stale seed cannot resurrect older history after cache loss");
+        "lost accepted cache files fail before replacement");
 }
 
-void native_seed_reparses_previous_parser_revision(const fs::path& fixture)
+void current_scan_cancellation_preserves_accepted_history(const fs::path& fixture)
 {
-    const auto profile = fixture / "fingerprint-profile";
-    const auto storage = fixture / "fingerprint-storage";
+    const auto profile = fixture / "scan-cancel-profile";
+    const auto storage = fixture / "scan-cancel-storage";
     fs::create_directories(profile / "sessions");
     fs::create_directory(storage);
-    const auto source = profile / "sessions" / "rollout-fingerprint.jsonl";
-    const auto artifact = storage / "native-file-cache.jsonl";
-    write(source, metadata("fingerprint") + start("turn") + tokens(23) + complete("turn"));
-
-    const auto modified = std::chrono::sys_days{std::chrono::year{2026} / 1 / 2} +
-        std::chrono::hours{12} + std::chrono::milliseconds{123};
-#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
-    const auto file_modified = std::chrono::clock_cast<fs::file_time_type::clock>(modified);
-#else
-    const auto file_modified = fs::file_time_type::clock::from_sys(modified);
-#endif
-    fs::last_write_time(source, file_modified);
-    check(fs::last_write_time(source) == file_modified, "fixture preserves exact millisecond file timestamp");
-
-    // The native cache uses the original parser. Even its matching size and
-    // system-clock timestamp cannot bypass the package's newer reducer.
-    auto wrapper = native_wrapper(source, "fingerprint", 17);
-    wrapper.set("size", addon::Json_value(static_cast<std::int64_t>(fs::file_size(source))));
-    wrapper.set("modified_msecs", addon::Json_value(static_cast<std::int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(modified.time_since_epoch()).count())));
-    addon::Usage_scan_request request;
-    request.context.account_context = addon::Account_context{1, "account"};
-    set_seed(&request, artifact, addon::serialize_json(wrapper) + '\n');
-    std::string error;
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.size() == 1 && page->records[0].total_tokens == 23,
-        "an older native parser is refreshed despite a matching fingerprint");
-
-    request.native_file_cache.reset();
-    write(source, metadata("fingerprint") + start("turn") + tokens(29) + complete("turn"));
-    fs::last_write_time(source, file_modified);
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.size() == 1 && page->records[0].total_tokens == 23,
-        "the refreshed parser reuses unchanged size and timestamp after cache reload");
-    fs::last_write_time(source, file_modified + std::chrono::seconds{2});
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.size() == 1 && page->records[0].total_tokens == 29,
-        "changed timestamp with unchanged size refreshes native cache evidence");
-}
-
-void native_seed_cancellation_preserves_accepted_history(const fs::path& fixture)
-{
-    const auto profile = fixture / "seed-cancel-profile";
-    const auto storage = fixture / "seed-cancel-storage";
-    fs::create_directories(profile / "sessions");
-    fs::create_directory(storage);
-    const auto artifact = storage / "native-file-cache.jsonl";
-    const auto bytes = addon::serialize_json(native_wrapper(profile / "sessions" / "rollout-a.jsonl", "a", 17)) + '\n' +
-        addon::serialize_json(native_wrapper(profile / "sessions" / "rollout-b.jsonl", "b", 18)) + '\n';
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
     std::string error;
     const auto baseline = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(baseline && baseline->records.empty(), "establish accepted empty history");
     const auto accepted = accepted_snapshot(storage);
-    set_seed(&request, artifact, bytes);
+    write(profile / "sessions" / "rollout-a.jsonl", metadata("a") + start("turn") + tokens(17) + complete("turn"));
+    write(profile / "sessions" / "rollout-b.jsonl", metadata("b") + start("turn") + tokens(18) + complete("turn"));
     const auto snapshots = storage / "codex-usage-v1" / "snapshots";
     const auto cancel_after_first_file = [&] {
         if (!fs::exists(snapshots)) return false;
@@ -1315,14 +1148,11 @@ void native_seed_cancellation_preserves_accepted_history(const fs::path& fixture
         return false;
     };
     check(!codex::scan_usage(request, profile, storage, cancel_after_first_file, quiet_progress, &error) && error == "cancelled",
-        "cancel through production predicate after one native candidate file");
-    check(accepted_snapshot(storage) == accepted, "cancelled native import cannot replace accepted evidence");
+        "cancel through production predicate after one current candidate file");
+    check(accepted_snapshot(storage) == accepted, "cancelled scan cannot replace accepted evidence");
     const auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 2 && page->records[0].total_tokens + page->records[1].total_tokens == 35,
-        "retry imports every native file without acknowledging the cancelled partial import");
-    request.native_file_cache->sha256_hex = std::string(64, '0');
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) && error == "native_usage_cache_digest_mismatch",
-        "digest mismatch cannot publish imported evidence");
+        "retry parses every source without publishing the cancelled partial scan");
 }
 
 void rejected_scan_cannot_publish_refreshed_history_after_source_deletion(const fs::path& fixture)
@@ -1446,72 +1276,6 @@ void accepted_inventory_controls_cache_replay(const fs::path& fixture)
     }
     check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
         error == "required_usage_cache_unavailable", "changed accepted content fails its bound inventory digest");
-}
-
-void empty_native_cache_is_accepted_evidence(const fs::path& fixture)
-{
-    const auto profile = fixture / "empty-seed-profile";
-    const auto storage = fixture / "empty-seed-storage";
-    fs::create_directories(profile / "sessions");
-    fs::create_directory(storage);
-    const auto artifact = storage / "native-file-cache.jsonl";
-    addon::Usage_scan_request request;
-    request.context.account_context = addon::Account_context{1, "account"};
-    set_seed(&request, artifact, "");
-    std::string error;
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
-        error == "required_usage_cache_unavailable", "absent required evidence is not a validated empty cache");
-    auto wrapper = native_wrapper(profile / "sessions" / "rollout-empty.jsonl", "empty", 17);
-    wrapper.set("records", addon::Json_value::array());
-    set_seed(&request, artifact, addon::serialize_json(wrapper) + '\n');
-    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->complete && page->records.empty(), "valid native file with no completed turns is accepted evidence");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.empty(), "required empty native cache remains valid on seed replay");
-    set_seed(&request, artifact, "");
-    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records.empty(), "empty host FILE_CACHE retains a validated empty accepted generation");
-}
-
-void native_seed_names_each_rollout_once(const fs::path& fixture)
-{
-    // A native seed that names one rollout twice fails the scan in both cache
-    // layouts.
-    const auto profile = fixture / "twice-profile";
-    const auto storage = fixture / "twice-storage";
-    fs::create_directories(profile / "sessions");
-    fs::create_directory(storage);
-    const auto wrapper = addon::serialize_json(native_wrapper(profile / "sessions" / "rollout-twice.jsonl", "twice", 17)) + '\n';
-    addon::Usage_scan_request request;
-    request.context.account_context = addon::Account_context{1, "account"};
-    set_seed(&request, storage / "native-file-cache.jsonl", wrapper + wrapper);
-    std::string error;
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
-        error == "native_usage_cache_duplicate_path", "a per-rollout scan refuses a seed that names a rollout twice");
-    check(fs::create_directory(storage / "candidate"), "allocate a candidate for the doubled seed");
-    request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
-    request.cache_selection = addon::Usage_cache_selection{std::nullopt, utf8(storage / "candidate")};
-    check(!codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error) &&
-        error == "native_usage_cache_duplicate_path", "a selected-cache scan refuses a seed that names a rollout twice");
-}
-
-void native_turn_identity_remains_validated(const fs::path& source)
-{
-    auto wrapper = native_wrapper(source, "native", 17);
-    std::string error;
-    unsigned emitted = 0;
-    const auto converted = codex::convert_native_cache_file(wrapper, [&](const auto& record) {
-        addon::Contract_failure failure;
-        const auto decoded = addon::decode_usage_record(addon::encode_usage_record(record.usage, 2), &failure, 2);
-        check(decoded && decoded->record_id == "codex:native:turn" && decoded->total_tokens == 17,
-            "native turn identity and count survive strict public conversion");
-        ++emitted;
-        return true;
-    }, &error);
-    check(converted && emitted == 1, "native private diagnostics do not invalidate a public usage record");
-    wrapper.find("records")->as_array()[0].set("turn_id", addon::Json_value("different-turn"));
-    check(!codex::convert_native_cache_file(wrapper, [](const auto&) { return true; }, &error),
-        "native cumulative-turn identity mismatch is still rejected");
 }
 
 void selected_cache_preserves_host_authority(const fs::path& fixture)
@@ -1957,39 +1721,31 @@ void selected_cache_retains_repository_attribution(const fs::path& fixture)
         "a moved rollout keeps its accepted location and attribution");
 }
 
-void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::path& fixture)
+void selected_cache_keeps_accepted_turns_when_their_rollout_is_parsed(const fs::path& fixture)
 {
-    // A turn imported from the native cache carries native counter provenance,
-    // model and category detail that a parse of its rollout does not
-    // reproduce. The host rejects a partial observation that changes them, so
-    // parsing the rollout later must confirm the accepted record, not replace it.
-    const auto profile  = fixture / "imported-profile";
-    const auto storage  = fixture / "imported-storage";
-    const auto checkout = fixture / "imported-checkout";
+    // Re-reading a confirmed turn preserves the accepted category detail,
+    // provenance and attribution, even when the current parse lacks them.
+    const auto profile  = fixture / "accepted-profile";
+    const auto storage  = fixture / "accepted-storage";
+    const auto checkout = fixture / "accepted-checkout";
     fs::create_directories(profile / "sessions");
     fs::create_directory(storage);
     fs::create_directories(checkout / ".git");
-    const auto source = profile / "sessions" / "rollout-imported.jsonl";
-    auto wrapper = native_wrapper(source, "imported", 19);
-    wrapper.find("records")->as_array().front().set("recorded_cwd", addon::Json_value(utf8(checkout)));
-    const auto seed_path  = storage / "native-file-cache.jsonl";
-    const auto seed_bytes = addon::serialize_json(wrapper) + '\n';
-    write(seed_path, seed_bytes);
-
+    const auto source = profile / "sessions" / "rollout-accepted.jsonl";
+    write(source, metadata_with_cwd("accepted", checkout) + start("turn") +
+        tokens(19, ",\"input_tokens\":14,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn"));
     addon::Usage_scan_request request;
     request.context.profile_storage = addon::Profile_storage_context{1, utf8(storage)};
-    request.context.account_context = addon::Account_context{1, "imported-account"};
-    request.native_file_cache = addon::Usage_native_file_cache{
-        utf8(seed_path), addon::to_hex(addon::Sha256::digest(seed_bytes)), "imported-account", true};
+    request.context.account_context = addon::Account_context{1, "accepted-account"};
     const auto cancelled = [] { return false; };
     std::string error;
     const auto scan = [&](const char* name, const char* mode, const std::optional<addon::Usage_cache_reference>& accepted) {
         const auto path = storage / name;
-        check(fs::create_directory(path), "allocate imported candidate");
+        check(fs::create_directory(path), "allocate accepted candidate");
         request.mode = mode;
         request.cache_selection = addon::Usage_cache_selection{accepted, utf8(path)};
         auto page = codex::scan_usage(request, profile, storage, cancelled, quiet_progress, &error);
-        check(page && page->complete && page->cache_candidate, error.empty() ? "imported scan succeeds" : error.c_str());
+        check(page && page->complete && page->cache_candidate, error.empty() ? "accepted scan succeeds" : error.c_str());
         return *page;
     };
     const auto encoded = [](addon::Usage_record record) {
@@ -2000,28 +1756,27 @@ void selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(const fs::
     };
 
     const auto first = scan("first", "incremental", std::nullopt);
-    check(first.records.size() == 1 && first.records.front().record_id == "codex:imported:turn" &&
+    check(first.records.size() == 1 && first.records.front().record_id == "codex:accepted:turn" &&
         first.records.front().source_counter_semantics == "cumulative_turn_delta" &&
         first.records.front().repository_usage && first.records.front().repository_usage->allocations.size() == 1,
-        "the imported turn is accepted with its native provenance and attribution");
+        "the accepted turn is accepted with its native provenance and attribution");
 
     check(fs::remove(checkout / ".git"), "remove the fixture Git marker");
     // The rollout's leading sample is a baseline, so its parse proves the turn.
-    write(source, metadata("imported") + tokens(4) + start("turn") + tokens(23) + complete("turn") +
+    write(source, metadata("accepted") + tokens(4) + start("turn") + tokens(23) + complete("turn") +
         start("next") + tokens(30) + complete("next"));
-    request.native_file_cache.reset();
     auto accepted = first.cache_candidate;
     for (const auto* mode : {"incremental", "repair"}) {
         // Records are sorted by ID, so the new turn comes first.
         const auto page = scan(mode, mode, accepted);
-        check(page.records.size() == 2, "the imported rollout holds two turns");
+        check(page.records.size() == 2, "the accepted rollout holds two turns");
         auto confirmed = page.records.back();
-        check(confirmed.cross_source_event && confirmed.cross_source_event->event_id == "imported:turn",
-            "a confirmed imported turn gains the proof its parse established");
+        check(confirmed.cross_source_event && confirmed.cross_source_event->event_id == "accepted:turn",
+            "a confirmed accepted turn gains the proof its parse established");
         confirmed.cross_source_event.reset();
         check(encoded(confirmed) == encoded(first.records.front()),
-            "parsing an imported turn's rollout keeps its accepted record");
-        check(page.records.front().record_id == "codex:imported:next" && page.records.front().total_tokens == 7,
+            "parsing an accepted turn's rollout keeps its accepted record");
+        check(page.records.front().record_id == "codex:accepted:next" && page.records.front().total_tokens == 7,
             "the rollout's new turn adds exactly its delta");
         accepted = page.cache_candidate;
     }
@@ -2498,9 +2253,9 @@ void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixtu
         "current copies compare with each other while accepted baseline evidence survives");
 }
 
-void selected_cache_preserves_peer_validation(const fs::path& fixture, bool seeded)
+void selected_cache_preserves_peer_validation(const fs::path& fixture)
 {
-    const auto root    = fixture / (seeded ? "peer-seed" : "peer-coverage");
+    const auto root    = fixture / "peer-coverage";
     const auto profile = root / "profile";
     const auto storage = root / "storage";
     check(fs::create_directories(profile / "sessions"), "create active peer profile");
@@ -2532,30 +2287,6 @@ void selected_cache_preserves_peer_validation(const fs::path& fixture, bool seed
         [] { return false; }, quiet_progress, &error);
     check(overlap && overlap->cache_candidate && overlap->records.size() == 1 &&
         overlap->records.front().source_path == utf8(active), "accept the equal archive copy under the original identity");
-
-    if (seeded) {
-        write(active, metadata("peer") + start("turn") +
-            tokens(700, ",\"input_tokens\":695,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn"));
-        const auto modified = std::chrono::sys_days{std::chrono::year{2026} / 1 / 2} +
-            std::chrono::hours{12} + std::chrono::milliseconds{123};
-#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
-        fs::last_write_time(active, std::chrono::clock_cast<fs::file_time_type::clock>(modified));
-#else
-        fs::last_write_time(active, fs::file_time_type::clock::from_sys(modified));
-#endif
-        auto wrapper = native_wrapper(active, "peer", 700);
-        wrapper.find("records")->as_array().front().erase("model");
-        wrapper.set("size", addon::Json_value((std::int64_t)fs::file_size(active)));
-        wrapper.set("modified_msecs", addon::Json_value((std::int64_t)
-            std::chrono::duration_cast<std::chrono::milliseconds>(modified.time_since_epoch()).count()));
-        set_seed(&request, storage / "native-file-cache.jsonl", addon::serialize_json(wrapper) + '\n');
-        allocate(overlap->cache_candidate);
-        const auto result = codex::scan_usage(request, profile, storage,
-            [] { return false; }, quiet_progress, &error);
-        check(!result, "an accurate fresh seed bypassed its conflicting unchanged archive peer");
-        check(error == "duplicate_usage_record", error.c_str());
-        return;
-    }
 
     const auto saved = storage / "unindexed";
     check(fs::create_directory(saved), "allocate unbound-peer cache fixture");
@@ -3167,13 +2898,9 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     request.context.launch_environment = addon::Launch_environment{
         addon::host_platform_id(), addon::Json_value::object(), std::nullopt};
     request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(candidate)};
-    const auto imported_source = profile / "sessions" / "rollout-imported.jsonl";
-    auto imported = native_wrapper(imported_source, "imported", 19);
-    const auto seed_path = addon::path_from_utf8(*allocated) / "native-file-cache.jsonl";
-    const auto seed_bytes = addon::serialize_json(imported) + '\n';
-    write(seed_path, seed_bytes);
-    request.native_file_cache = addon::Usage_native_file_cache{
-        addon::path_to_utf8(seed_path), addon::to_hex(addon::Sha256::digest(seed_bytes)), account_key, true};
+    const auto retained_source = profile / "sessions" / "rollout-retained.jsonl";
+    write(retained_source, metadata("retained") + start("turn") +
+        tokens(19, ",\"input_tokens\":14,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn"));
     addon::Simulator_invocation_options invocation;
     invocation.profile_storage = request.context.profile_storage;
     const auto acknowledge_id = host.invoke({"profile-storage", 1}, "acknowledge",
@@ -3196,7 +2923,6 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
         std::vector<std::string> expected;
         if (!continuation) {
             expected.push_back("Preparing the usage cache");
-            if (request.native_file_cache) expected.push_back("Importing earlier usage history");
             expected.insert(expected.end(), {
                 "Reading Codex sessions", "Sorting usage records", "Merging usage history", "Saving the usage cache"});
         }
@@ -3216,19 +2942,19 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     const auto last = scan();
     check(last.complete && last.records.size() == 15 && last.cache_candidate == first.cache_candidate,
         "actual adapter preserves cache descriptor across pages");
-    const auto check_import = [](const auto& first_page, const auto& last_page) {
+    const auto check_retained = [](const auto& first_page, const auto& last_page) {
         bool found = false;
         for (const auto* page : {&first_page, &last_page}) {
             for (const auto& record : page->records) {
-                if (record.record_id != "codex:imported:turn") continue;
+                if (record.record_id != "codex:retained:turn") continue;
                 found = true;
                 check(record.source_counter_semantics == "cumulative_turn_delta" &&
                     record.aggregate_evidence == "partial" && record.total_tokens == 19 &&
                     record.input.value == 14 && record.output.value == 5,
-                    "actual adapter preserves imported turn-delta attribution and partial evidence");
+                    "actual adapter preserves retained turn-delta attribution and partial evidence");
             }
         }
-        check(found, "native source-absent record survives packaged scan");
+        check(found, "accepted current record survives packaged scans");
     };
     const auto check_temporal = [](const auto& first_page, const auto& last_page) {
         std::uint64_t instant_tokens = 0;
@@ -3249,19 +2975,19 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
             }
         }
         check(instant_tokens == 269 && unavailable_tokens == 20,
-            "packaged pages conserve certified deltas separately from first-turn/imported accounting");
+            "packaged pages conserve certified deltas separately from first-turn/retained accounting");
     };
-    check_import(first, last);
+    check_retained(first, last);
     check_temporal(first, last);
     check(addon::validate_usage_cache_candidate(*last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "actual adapter cache verifies after paging");
+    check(fs::remove(retained_source), "remove the accepted source to exercise retained cache evidence");
     const auto unchanged_candidate = allocation_parent / "scan-unchanged";
     check(fs::create_directory(addon::usage_cache_io_path(unchanged_candidate)), "allocate incremental adapter candidate");
     auto incremental = request;
     incremental.mode = "incremental";
     incremental.snapshot_id.reset();
     incremental.cursor.reset();
-    incremental.native_file_cache.reset();
     incremental.cache_selection = addon::Usage_cache_selection{
         first.cache_candidate, addon::path_to_utf8(unchanged_candidate)};
     const auto unchanged_id = host.invoke({addon::k_usage_incremental_capability_id, 1}, "scan",
@@ -3325,27 +3051,12 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     const auto replay_last = scan();
     check(replay_last.complete && replay_last.records.size() == 15 && replay_last.cache_candidate == replay.cache_candidate,
         "selected cache replay preserves all records across pages");
-    check_import(replay, replay_last);
+    check_retained(replay, replay_last);
     check_temporal(replay, replay_last);
     check(addon::validate_usage_cache_candidate(*replay_last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "replayed cache seals and reopens");
-    imported.find("records")->as_array().front().set("counter_semantics", addon::Json_value("future_counter"));
-    const auto unknown_bytes = addon::serialize_json(imported) + '\n';
-    write(seed_path, unknown_bytes);
-    request.native_file_cache->sha256_hex = addon::to_hex(addon::Sha256::digest(unknown_bytes));
-    const auto unknown_candidate = allocation_parent / "unknown-provenance";
-    check(fs::create_directory(addon::usage_cache_io_path(unknown_candidate)), "allocate unknown-provenance candidate");
-    request.snapshot_id.reset();
-    request.cursor.reset();
-    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(unknown_candidate)};
-    const auto unknown_id = host.invoke({"usage-scan", 3}, "scan",
-        addon::encode_usage_scan_request(request, 3), 15000, invocation);
-    const auto unknown = host.wait_outcome(unknown_id, 16000);
-    check(unknown && unknown->status != addon::Host_status::SUCCESS && unknown->reason_code == "native_usage_cache_invalid",
-        "unknown native provenance fails without producing a silently rewritten candidate");
     // The preceding provider-owned formats kept files per rollout; @1 records
     // also used the usage2 grammar, whose missing provenance cannot be guessed.
-    request.native_file_cache.reset();
     for (const int format : {1, 2}) {
         const auto name = "preceding-format-" + std::to_string(format);
         const auto old_reference = per_rollout_fixture(*first.cache_candidate, allocation_parent / name, *allocated,
@@ -3380,7 +3091,7 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
             }
         }
         else {
-            check_import(upgraded, upgraded_last);
+            check_retained(upgraded, upgraded_last);
         }
         check(addon::validate_usage_cache_candidate(*old_reference, *allocated,
             request.context.account_context, [] { return false; }, &failure).has_value(),
@@ -3409,7 +3120,6 @@ int main(int argc, char** argv)
             if (mode == "turn-cwd-repair") {
                 mutable_cache_preserves_accepted_attribution(fixture.path);
                 selected_cache_repairs_turn_repository(fixture.path);
-                native_seed_repairs_only_witnessed_repository(fixture.path);
                 return 0;
             }
             if (mode == "turn-cwd-legacy") {
@@ -3424,8 +3134,8 @@ int main(int argc, char** argv)
                 scanner_reads_archived_rollouts(fixture.path, mode == "archived-selected");
                 return 0;
             }
-            if (mode == "peer-seed" || mode == "peer-coverage") {
-                selected_cache_preserves_peer_validation(fixture.path, mode == "peer-seed");
+            if (mode == "peer-coverage") {
+                selected_cache_preserves_peer_validation(fixture.path);
                 return 0;
             }
             if (mode == "selected-page") {
@@ -3447,23 +3157,17 @@ int main(int argc, char** argv)
         scanner_keeps_per_turn_repositories(fixture.path, true);
         mutable_cache_preserves_accepted_attribution(fixture.path);
         selected_cache_repairs_turn_repository(fixture.path);
-        native_seed_repairs_only_witnessed_repository(fixture.path);
         reducer_proves_only_complete_turns(fixture.path / "rollout-fixture.jsonl");
         scanner_sorts_pages_and_preserves_cache_on_retry(fixture.path);
         scanner_reads_archived_rollouts(fixture.path, false);
         scanner_reads_archived_rollouts(fixture.path, true);
         scanner_accepts_new_profiles_and_retains_transient_empty_history(fixture.path);
-        native_seed_replay_and_required_cache_loss(fixture.path);
-        native_seed_reparses_previous_parser_revision(fixture.path);
-        selected_cache_preserves_peer_validation(fixture.path, false);
-        selected_cache_preserves_peer_validation(fixture.path, true);
-        native_seed_cancellation_preserves_accepted_history(fixture.path);
+        current_cache_replay_and_loss(fixture.path);
+        selected_cache_preserves_peer_validation(fixture.path);
+        current_scan_cancellation_preserves_accepted_history(fixture.path);
         rejected_scan_cannot_publish_refreshed_history_after_source_deletion(fixture.path);
         transient_refresh_discards_partial_records_before_acceptance(fixture.path);
         accepted_inventory_controls_cache_replay(fixture.path);
-        empty_native_cache_is_accepted_evidence(fixture.path);
-        native_seed_names_each_rollout_once(fixture.path);
-        native_turn_identity_remains_validated(fixture.path / "rollout-native.jsonl");
         selected_cache_preserves_host_authority(fixture.path);
         selected_cache_stays_compact_across_incremental_scans(fixture.path);
         incremental_scan_preserves_the_accepted_generation(fixture.path);
@@ -3471,7 +3175,7 @@ int main(int argc, char** argv)
         incremental_adoption_keeps_unexamined_temporal_evidence(fixture.path);
         selected_cache_reconciles_turns_by_identity(fixture.path);
         selected_cache_retains_repository_attribution(fixture.path);
-        selected_cache_keeps_imported_turns_when_their_rollout_is_parsed(fixture.path);
+        selected_cache_keeps_accepted_turns_when_their_rollout_is_parsed(fixture.path);
         selected_cache_keeps_turns_a_rescan_cannot_contradict(fixture.path);
         selected_cache_pages_while_another_account_scans(fixture.path);
         selected_cache_refreshes_missing_temporal_history(fixture.path);

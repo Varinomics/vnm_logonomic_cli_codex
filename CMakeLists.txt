@@ -71,7 +71,6 @@ add_library(codex_provider STATIC
     src/codex_startup_probe.cpp
     src/codex_usage.cpp
     src/codex_usage_temporal.cpp
-    src/codex_native_usage.cpp
     src/codex_usage_records.cpp)
 codex_target(codex_provider)
 target_include_directories(codex_provider PUBLIC src)

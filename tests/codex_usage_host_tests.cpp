@@ -1,20 +1,11 @@
 // The Logonomic host's usage exchanges with this package, driven through the
-// SDK host simulator: an explicit import of retained native history, replay
-// of that history from the host-selected cache, and the answers the host
-// needs to reject a partial reduction and to recover by reset.
-//
-// Each step plays the host's side of usage-scan@3 and legacy-state-import@1:
-// it allocates the candidate, chooses the accepted selection the way the host
-// does after accepting or rejecting a page, and writes the native seed in the
-// host's FILE_CACHE export form. What is checked is only what this package
-// answers; the host's own acceptance rules are tested in Logonomic against
-// fixture packages.
+// SDK host simulator. The host selects accepted caches and rejects partial
+// reductions; current source, missing-source replay and reset remain distinct.
 
 #include "codex_accounts.h"
 
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/ids.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/usage_session.h>
 #include <logonomic_cli_addon/profile_storage.h>
@@ -93,77 +84,6 @@ std::string rollout_turn(std::string_view rollout, int tokens)
             "\"turn_id\":\"turn-one\"}}\n";
 }
 
-addon::Json_value breakdown_field(std::optional<int> tokens, bool supported)
-{
-    auto field = addon::Json_value::object();
-    field.set("support", addon::Json_value(supported ? "supported" : "unsupported"));
-    field.set("covered_records", addon::Json_value(tokens ? 1 : 0));
-    field.set("total_records", addon::Json_value(1));
-    if (tokens) {
-        field.set("known_tokens", addon::Json_value(*tokens));
-    }
-    return field;
-}
-
-// One line of the host's native FILE_CACHE export for a retained native turn,
-// after the host converted its identity to this package: the stored record
-// keeps its native fields, its session_id becomes the hex of the converted
-// record ID, and usage-record-identity carries both identities.
-std::string retained_turn_seed_line(const fs::path& source, std::string_view rollout, int input, int output)
-{
-    const std::string record_id = "codex:" + std::string(rollout) + ":turn-one";
-    auto breakdown = addon::Json_value::object();
-    breakdown.set("version", addon::Json_value(2));
-    breakdown.set("coverage_unit", addon::Json_value("sessions"));
-    breakdown.set("input_tokens", breakdown_field(input, true));
-    breakdown.set("output_tokens", breakdown_field(output, true));
-    breakdown.set("cache_read_input_tokens", breakdown_field(0, true));
-    breakdown.set("cache_creation_input_tokens", breakdown_field(std::nullopt, false));
-    auto identity = addon::Json_value::object();
-    identity.set("version", addon::Json_value(1));
-    identity.set("record_id", addon::Json_value(record_id));
-    identity.set("session_key", addon::Json_value(rollout));
-    identity.set("legacy_record_id", addon::Json_value(record_id));
-    identity.set("legacy_session_key", addon::Json_value(rollout));
-    auto capabilities = addon::Json_value::object();
-    capabilities.set("token_breakdown", std::move(breakdown));
-    capabilities.set("usage-record-identity", std::move(identity));
-
-    auto record = addon::Json_value::object();
-    record.set("session_id", addon::Json_value(addon::to_hex(
-        reinterpret_cast<const std::uint8_t*>(record_id.data()), record_id.size())));
-    record.set("rollout_id", addon::Json_value(rollout));
-    record.set("turn_id", addon::Json_value("turn-one"));
-    record.set("completed_date", addon::Json_value("2026-01-02"));
-    record.set("total_tokens", addon::Json_value(input + output));
-    record.set("source_path", addon::Json_value(addon::path_to_utf8(source)));
-    record.set("recorded_cwd", addon::Json_value(""));
-    record.set("model", addon::Json_value("native-model"));
-    record.set("counter_field", addon::Json_value("total_token_usage.total_tokens"));
-    record.set("counter_semantics", addon::Json_value("cumulative_turn_delta"));
-    record.set("capabilities", std::move(capabilities));
-
-    auto markers = addon::Json_value::object();
-    auto marker = addon::Json_value::object();
-    marker.set("version", addon::Json_value(2));
-    marker.set("parser_revision", addon::Json_value(2));
-    markers.set("token_breakdown_cache", std::move(marker));
-    marker = addon::Json_value::object();
-    marker.set("version", addon::Json_value(1));
-    marker.set("parser_revision", addon::Json_value(1));
-    markers.set("repository_usage_cache", std::move(marker));
-    auto records = addon::Json_value::array();
-    records.push_back(std::move(record));
-    auto file = addon::Json_value::object();
-    file.set("path", addon::Json_value(addon::path_to_utf8(source)));
-    file.set("size", addon::Json_value(0));
-    file.set("modified_msecs", addon::Json_value(0));
-    file.set("records", std::move(records));
-    file.set("capabilities", std::move(markers));
-    // The host serializes stored records with sorted members.
-    return addon::serialize_json_canonical(file) + '\n';
-}
-
 // The host side of one account's usage exchanges with the packaged adapter.
 class Packaged_host
 {
@@ -179,7 +99,6 @@ public:
             return std::find(live.begin(), live.end(), pair) != live.end();
         };
         check(is_live({"usage-scan", 3}), "the package negotiates host-selected cache acceptance");
-        check(is_live({"legacy-state-import", 1}), "the package negotiates native history import");
 
         m_account_key = codex::profile_account_key(addon::path_to_utf8(profile));
         std::string error;
@@ -208,12 +127,11 @@ public:
         check(m_host.shutdown(1000, nullptr), "packaged adapter exits by itself, without contacting a model");
     }
 
-    const std::string& account_key() const { return m_account_key; }
     fs::path storage_root() const { return addon::path_from_utf8(m_storage_root); }
 
     // A fresh, host-owned candidate allocation and the accepted cache the
-    // host's durable usage state selects. Continuation state, reset mode and
-    // any native seed from an earlier exchange do not carry over.
+    // host's durable usage state selects. Continuation state and reset mode
+    // from an earlier exchange do not carry over.
     void select(std::string_view name, std::optional<addon::Usage_cache_reference> accepted)
     {
         const auto candidate = storage_root() / fs::path(std::string(name));
@@ -221,21 +139,10 @@ public:
         m_request.snapshot_id.reset();
         m_request.cursor.reset();
         m_request.mode = "incremental";
-        m_request.native_file_cache.reset();
         m_request.cache_selection = addon::Usage_cache_selection{std::move(accepted), addon::path_to_utf8(candidate)};
     }
 
     void reset_mode() { m_request.mode = "reset"; }
-
-    // The retained native seed as the host writes it: beside the account's
-    // storage, with its digest and the account it was exported from.
-    void seed(std::string_view name, std::string_view bytes, bool cache_required)
-    {
-        const auto path = storage_root() / fs::path(std::string(name));
-        write(path, bytes);
-        m_request.native_file_cache = addon::Usage_native_file_cache{
-            addon::path_to_utf8(path), addon::to_hex(addon::Sha256::digest(bytes)), m_account_key, cache_required};
-    }
 
     addon::Host_outcome scan_outcome()
     {
@@ -312,21 +219,6 @@ public:
     {
         return fs::exists(addon::usage_cache_io_path(
             addon::path_from_utf8(m_request.cache_selection->candidate_root)) / "cache-manifest.json");
-    }
-
-    std::optional<addon::Json_value> import_record(std::string_view kind, const addon::Json_value& record)
-    {
-        const auto id = m_host.invoke({"legacy-state-import", 1}, addon::k_import_record_operation,
-            addon::encode_import_record_request(kind, record), 5000);
-        const auto outcome = m_host.wait_outcome(id, 6000);
-        check(outcome && outcome->status == addon::Host_status::SUCCESS, "legacy import answers");
-        addon::Contract_failure failure;
-        const auto result = addon::decode_import_record_result(outcome->payload, &failure);
-        check(result.has_value(), "legacy import result decodes: " + failure.detail);
-        if (!result->matched()) {
-            return std::nullopt;
-        }
-        return *result->conversion();
     }
 
 private:
@@ -413,77 +305,6 @@ void selected_cache_survives_reduction_and_reset(const fs::path& package, const 
     host.finish();
 }
 
-// addon_usage_cache_import_packaged_codex, package half: the identity and
-// seed exchanges of an explicit import of retained native history whose
-// rollout no longer exists, and its replay from the sealed cache.
-void retained_native_turn_imports_and_replays(const fs::path& package, const fs::path& fixture)
-{
-    const auto profile = fixture / "native-codex";
-    fs::create_directories(profile / "sessions");
-    const auto source = profile / "sessions" / "rollout-import.jsonl";
-    Packaged_host host(package, fixture, profile);
-
-    addon::Legacy_account_record account{"codex", "native-account", addon::path_to_utf8(profile)};
-    const auto resolved = host.import_record(addon::k_legacy_account_record_kind,
-        addon::encode_legacy_account_record(account));
-    const auto* resolved_key = resolved ? resolved->find("adapter_account_key") : nullptr;
-    check(resolved_key && resolved_key->is_string() && resolved_key->as_string() == host.account_key(),
-        "the native account maps to the profile's add-on account");
-
-    // The host converts every retained record's identity before the scan and
-    // back again on rollback; a native turn keeps its identity both ways.
-    const std::string record_id = "codex:import-history:turn-one";
-    for (const std::string direction : {"to-add-on", "to-legacy"}) {
-        addon::Legacy_usage_records records{direction, "codex", "native-account", host.account_key(), {}};
-        records.records.push_back({0, record_id, std::string("import-history"), addon::path_to_utf8(source)});
-        const auto converted = host.import_record(addon::k_legacy_usage_records_kind,
-            addon::encode_legacy_usage_records(records));
-        check(converted.has_value(), direction + " conversion matches the native turn");
-        addon::Contract_failure failure;
-        const auto identities = addon::decode_legacy_usage_conversion(*converted, direction, &failure);
-        check(identities && identities->size() == 1 && identities->front().record_id == record_id &&
-            identities->front().session_key == std::optional<std::string>("import-history"),
-            direction + " conversion keeps the native turn identity");
-    }
-
-    // A required seed the host could not fill fails the import instead of
-    // starting the account from nothing.
-    host.select("missing-seed", std::nullopt);
-    host.seed("native-file-cache-missing.jsonl", "", true);
-    const auto missing = host.scan_outcome();
-    check(missing.status == addon::Host_status::FAILED && missing.reason_code == "required_usage_cache_unavailable",
-        "an empty required seed fails the import: " + missing.reason_code);
-    check(!host.candidate_sealed(), "a failed import seals no candidate");
-
-    host.select("import", std::nullopt);
-    host.seed("native-file-cache-import.jsonl", retained_turn_seed_line(source, "import-history", 14, 5), true);
-    const auto imported = host.scan();
-    const auto check_turn = [&](const addon::Usage_scan_page& page, const std::string& step) {
-        const auto turn = only_record(page, step);
-        check(turn.record_id == record_id && turn.session_key == std::optional<std::string>("import-history"),
-            step + ": the converted native identity is kept");
-        check(turn.total_tokens == 19 && turn.input.value == std::optional<std::uint64_t>(14) &&
-            turn.output.value == std::optional<std::uint64_t>(5),
-            step + ": retained counts and categories are kept");
-        check(turn.source_counter_semantics == std::optional<std::string>("cumulative_turn_delta") &&
-            turn.aggregate_evidence == std::optional<std::string>("partial"),
-            step + ": a retained turn delta is not a complete aggregate");
-        check(turn.source_path == std::optional<std::string>(addon::path_to_utf8(source)) &&
-            turn.completed_date == "2026-01-02" && turn.model == std::optional<std::string>("native-model") &&
-            turn.counter_field == std::optional<std::string>("total_token_usage.total_tokens"),
-            step + ": native provenance is kept for the host's merge");
-    };
-    check_turn(imported, "import");
-    check(host.sealed(*imported.cache_candidate), "the imported history is sealed before it is returned");
-
-    // Reopening reconciles from the host-selected cache, without a seed.
-    host.select("replay", imported.cache_candidate);
-    const auto replayed = host.scan();
-    check_turn(replayed, "replay");
-    check(replayed.cache_candidate != imported.cache_candidate, "replay seals a new candidate");
-    host.finish();
-}
-
 } // namespace
 
 int main(int argc, char** argv)
@@ -493,7 +314,6 @@ int main(int argc, char** argv)
         const auto package = addon::path_from_utf8(argv[1]);
         Temporary_directory fixture;
         selected_cache_survives_reduction_and_reset(package, fixture.path() / "acceptance");
-        retained_native_turn_imports_and_replays(package, fixture.path() / "import");
         return 0;
     }
     catch (const std::exception& error) {

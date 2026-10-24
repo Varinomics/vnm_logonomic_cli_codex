@@ -4,7 +4,6 @@
 #include <logonomic_cli_addon/usage_scan.h>
 #include <logonomic_cli_addon/usage_incremental.h>
 #include <logonomic_cli_addon/usage_session.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 
 #include <chrono>
 #include <cstdint>
@@ -88,7 +87,5 @@ void handle_usage_repository_attribution(logonomic::cli_addon::Invocation_contex
 void handle_usage_session(logonomic::cli_addon::Invocation_context& context);
 std::optional<logonomic::cli_addon::Usage_session_fact> describe_usage_session(
     const logonomic::cli_addon::Usage_session_identity& identity);
-logonomic::cli_addon::Legacy_import_result import_usage(
-    const logonomic::cli_addon::Import_record_request& request);
 
 } // namespace codex

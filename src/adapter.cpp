@@ -10,7 +10,6 @@
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/startup_observer.h>
@@ -22,40 +21,6 @@
 namespace {
 
 namespace addon = logonomic::cli_addon;
-
-void history(addon::Invocation_context& context)
-{
-    addon::Contract_failure failure;
-    const auto request = addon::decode_import_record_request(context.request().payload, &failure);
-    if (!request) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
-        return;
-    }
-    if (request->kind == addon::k_legacy_account_record_kind) {
-        context.succeed(addon::encode_import_record_result(codex::import_account(*request)));
-        return;
-    }
-    if (request->kind == addon::k_legacy_usage_records_kind) {
-        context.succeed(addon::encode_import_record_result(codex::import_usage(*request)));
-        return;
-    }
-    if (request->kind != addon::k_legacy_resume_record_kind) {
-        context.fail(addon::Result_status::UNAVAILABLE, "unknown_record_kind");
-        return;
-    }
-    const auto record = addon::decode_legacy_resume_record(request->record, &failure);
-    if (!record) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
-        return;
-    }
-    addon::Legacy_import_result result;
-    if (record->provider_id == "codex") {
-        auto value = addon::Json_value::object();
-        value.set("provider_session_id", addon::Json_value(record->provider_session_id));
-        result = *addon::Legacy_import_result::from_conversion(addon::encode_legacy_resume_conversion(value));
-    }
-    context.succeed(addon::encode_import_record_result(result));
-}
 
 void discovery(addon::Invocation_context& context)
 {
@@ -124,10 +89,6 @@ void invoke(addon::Invocation_context& context)
             codex::handle_usage_session(context);
         }
         else
-        if (request.capability.capability_id == "legacy-state-import" && request.operation == addon::k_import_record_operation) {
-            history(context);
-        }
-        else
         if (request.capability.capability_id == "profile-storage" && request.operation == "acknowledge") {
             addon::acknowledge_profile_storage(context);
         }
@@ -187,7 +148,6 @@ int main()
         {addon::k_usage_incremental_capability_id, addon::k_usage_incremental_version},
         {addon::k_usage_repository_attribution_capability_id, addon::k_usage_repository_attribution_version},
         {addon::k_usage_session_capability_id, addon::k_usage_session_version},
-        {"legacy-state-import", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

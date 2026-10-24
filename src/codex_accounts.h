@@ -1,7 +1,6 @@
 #pragma once
 
 #include <logonomic_cli_addon/adapter_runtime.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #include <optional>
@@ -24,7 +23,6 @@ std::optional<Profile_selection> profile_selection(
 std::optional<Profile_selection> selected_profile(
     const logonomic::cli_addon::Session_launch_context& request,
     logonomic::cli_addon::Invocation_context& context);
-logonomic::cli_addon::Legacy_import_result import_account(const logonomic::cli_addon::Import_record_request& request);
 void handle_accounts(logonomic::cli_addon::Invocation_context& context);
 
 } // namespace codex

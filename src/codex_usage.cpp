@@ -2,7 +2,6 @@
 #include "codex_accounts.h"
 #include "codex_jsonl_projector.h"
 #include "codex_usage_records.h"
-#include "codex_native_usage.h"
 
 #include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
@@ -44,9 +43,6 @@ using addon::json::member;
 
 constexpr std::size_t k_line_limit = 4 * 1024 * 1024;
 constexpr int k_parser_revision = 2;
-// Native cache capabilities describe the original reducer, even after the
-// package changes its parsing of fork boundaries and interrupted turns.
-constexpr int k_native_cache_parser_revision = 1;
 // A usage-scan@3 candidate keeps one metadata line per rollout in `rollouts`
 // beside the snapshot's sorted `records`, so it holds four files however many
 // rollouts a home has. @1 and @2 kept a metadata and a records file per
@@ -130,8 +126,6 @@ std::string digest(std::string_view value)
 
 std::string cache_key(std::string_view source)
 {
-    // This is a new package cache identity. Native history IDs are carried
-    // through explicit import unchanged; no native Qt-fold hash is recreated.
     return digest(profile_account_key(source));
 }
 
@@ -424,16 +418,8 @@ std::optional<Fingerprint> fingerprint(const fs::path& path)
 
 bool fingerprint_matches(const addon::Json_value& metadata, const Fingerprint& value)
 {
-    if (member(metadata, "size") != addon::Json_value(std::to_string(value.size))) return false;
-    if (member(metadata, "modified") == addon::Json_value(addon::file_time_ticks_text(value.modified))) return true;
-#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
-    const auto modified = std::chrono::clock_cast<std::chrono::system_clock>(value.modified);
-#else
-    const auto modified = fs::file_time_type::clock::to_sys(value.modified);
-#endif
-    const auto native_msecs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        modified.time_since_epoch()).count();
-    return member(metadata, "modified_native_msecs") == addon::Json_value(std::to_string(native_msecs));
+    return member(metadata, "size") == addon::Json_value(std::to_string(value.size)) &&
+        member(metadata, "modified") == addon::Json_value(addon::file_time_ticks_text(value.modified));
 }
 
 // A line to sort and the key it sorts by.
@@ -635,7 +621,7 @@ void copy_accepted_cache(const addon::Json_value& accepted, const fs::path& snap
     }
 }
 
-addon::Json_value accepted_generation(const fs::path& work, const addon::Json_value& seeds,
+addon::Json_value accepted_generation(const fs::path& work,
     const std::optional<addon::Account_context>& account, const std::function<bool()>& cancelled)
 {
     std::ofstream inventory(work / "inventory", std::ios::binary | std::ios::trunc);
@@ -659,79 +645,8 @@ addon::Json_value accepted_generation(const fs::path& work, const addon::Json_va
     auto accepted = addon::Json_value::object();
     accepted.set("snapshot", addon::Json_value(work.filename().string()));
     accepted.set("account", account_value(account));
-    accepted.set("native_seeds", seeds);
     accepted.set("inventory_sha256", addon::Json_value(hash_file(work / "inventory", cancelled)));
     return accepted;
-}
-
-// Converts a host-staged native cache once per seed digest. `adopt` stores a
-// converted rollout in the caller's cache layout, whose metadata names the
-// seed; a layout refuses a rollout one seed names twice with
-// native_usage_cache_duplicate_path.
-void seed_native_cache(const addon::Usage_scan_request& request, const fs::path& storage,
-    bool have_accepted, addon::Json_value* seeds,
-    const std::function<void(const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records)>& adopt,
-    const std::function<bool()>& cancelled, std::uint16_t version = 2)
-{
-    if (!request.native_file_cache) return;
-    const auto& descriptor = *request.native_file_cache;
-    require(request.context.account_context && descriptor.source_account_key == request.context.account_context->adapter_account_key,
-        "native_usage_cache_account_mismatch");
-    require(digest_name(descriptor.sha256_hex), "native_usage_cache_invalid");
-    const auto path = addon::path_from_utf8(descriptor.path);
-    require(path.is_absolute() && profile_account_key(path_text(path.parent_path())) == profile_account_key(path_text(storage)) &&
-        fs::is_regular_file(fs::symlink_status(path)), "native_usage_cache_path_invalid");
-    for (const auto& seed : seeds->as_array()) {
-        require(seed.is_string() && digest_name(seed.as_string()), "required_usage_cache_unavailable");
-        if (seed.as_string() == descriptor.sha256_hex) {
-            return;
-        }
-    }
-    std::ifstream input(path, std::ios::binary);
-    require(static_cast<bool>(input), "native_usage_cache_unavailable");
-    addon::Sha256 hash;
-    std::array<char, 65536> bytes{};
-    std::uint64_t length = 0;
-    while (input.read(bytes.data(), bytes.size()) || input.gcount() > 0) {
-        check_cancel(cancelled);
-        const auto size = static_cast<std::size_t>(input.gcount());
-        hash.update(bytes.data(), size);
-        length += size;
-    }
-    require(!input.bad() && addon::to_hex(hash.finish()) == descriptor.sha256_hex, "native_usage_cache_digest_mismatch");
-    if (length == 0) {
-        require(!descriptor.cache_required || have_accepted, "required_usage_cache_unavailable");
-        seeds->push_back(addon::Json_value(descriptor.sha256_hex));
-        return; // An empty host cache never clears durable package evidence.
-    }
-    input.clear(); input.seekg(0);
-    addon::Sha256 checked_hash;
-    std::string line;
-    while (read_line(input, &line)) {
-        check_cancel(cancelled);
-        checked_hash.update(line); checked_hash.update("\n");
-        const auto wrapper = addon::parse_json(line, {}, nullptr);
-        require(wrapper && wrapper->is_object(), "native_usage_cache_invalid");
-        const auto key = cache_key(string_member(*wrapper, "path"));
-        std::vector<Sort_record> records;
-        std::string error;
-        const auto file = convert_native_cache_file(*wrapper, [&](const Rollout_usage_record& record) {
-            check_cancel(cancelled);
-            records.push_back({record.usage.record_id, encode_record(record, version)});
-            return true;
-        }, &error, version);
-        require(file.has_value(), error);
-        auto metadata = addon::Json_value::object();
-        metadata.set("native_seed", addon::Json_value(descriptor.sha256_hex));
-        metadata.set("revision", addon::Json_value(file->parser_current ? k_native_cache_parser_revision : 0));
-        metadata.set("source", addon::Json_value(file->path));
-        metadata.set("size", addon::Json_value(std::to_string(file->size)));
-        metadata.set("modified_native_msecs", addon::Json_value(std::to_string(file->modified_msecs)));
-        adopt(key, std::move(metadata), std::move(records));
-    }
-    require(addon::to_hex(checked_hash.finish()) == descriptor.sha256_hex, "native_usage_cache_digest_mismatch");
-    check_cancel(cancelled);
-    seeds->push_back(addon::Json_value(descriptor.sha256_hex));
 }
 
 bool id_less(std::string_view left, std::string_view right)
@@ -936,7 +851,6 @@ void reduce_legacy_repository(const Rollout_usage_record& accepted, Rollout_usag
 enum class Snapshot_evidence : char
 {
     RETAINED = '0',
-    SEEDED   = '1',
     LIVE     = '2'
 };
 
@@ -999,7 +913,9 @@ void write_unique_snapshot_records(const fs::path& sorted, const std::optional<f
     std::string line;
     while (read_line(input, &line)) {
         check_cancel(cancelled);
-        require(line.size() > 2 && line[1] == '\t' && line[0] >= '0' && line[0] <= '2',
+        require(line.size() > 2 && line[1] == '\t' &&
+                (line[0] == (char)Snapshot_evidence::RETAINED ||
+                 line[0] == (char)Snapshot_evidence::LIVE),
             "usage_storage_read_failed");
         const auto evidence = (Snapshot_evidence)line[0];
         auto record = decode_record(std::string_view(line).substr(2), version);
@@ -1052,8 +968,8 @@ void sorted_snapshot(const fs::path& work, std::uint64_t sort_run_bytes, const s
         const auto metadata = read_json(entry.path());
         require(metadata.has_value(), "usage_cache_invalid");
         const auto source = string_member(*metadata, "source");
-        const auto evidence = member(*metadata, "live_snapshot") == identifier ? Snapshot_evidence::LIVE :
-            member(*metadata, "seed_snapshot") == identifier ? Snapshot_evidence::SEEDED : Snapshot_evidence::RETAINED;
+        const auto evidence = member(*metadata, "live_snapshot") == identifier
+            ? Snapshot_evidence::LIVE : Snapshot_evidence::RETAINED;
         require(cache_key(source) == filename.substr(0, 64), "usage_cache_identity_mismatch");
         const auto records = work / (filename.substr(0, 64) + ".records");
         require(fs::is_regular_file(fs::symlink_status(records)), "usage_cache_invalid");
@@ -1355,46 +1271,41 @@ void reduce_legacy_repository(const Rollout_usage_record& accepted, Rollout_usag
 }
 
 // Writes the snapshot's `records`, reconciling every turn by its stable record
-// ID. A turn parsed in this scan wins over one converted from a native seed,
-// which wins over the accepted record, and a turn missing from a rollout parsed
-// again keeps its accepted record. An observation that confirms an accepted
-// turn leaves the accepted accounting whole: where its rollout lived, its
+// ID. A turn parsed in this scan is reconciled with the accepted record, and
+// a turn missing from a rollout parsed again keeps its accepted record. An
+// observation that confirms an accepted turn leaves the accepted accounting
+// whole: where its rollout lived, its
 // completion date, provenance and category detail are
 // facts of the accepted observation, which the host compares a partial
 // observation against and rejects when they change. So a moved rollout keeps
 // one observation under its accepted identity, a checkout removed or moved
-// since acceptance cannot retract the accepted attribution, and a turn
-// imported from the native cache keeps its native provenance when its rollout
-// is parsed. A confirmed record without an event proof takes the
+// since acceptance cannot retract the accepted attribution. A confirmed
+// record without an event proof takes the
 // observation's, so a turn accepted before its proof could be established
 // gains it when its rollout is parsed again; the host adds a proof to an
 // accepted record and keeps one an observation lacks. An observation that
 // contradicts an accepted turn is presented for the host to accept or reject.
 // A separately selected attribution operation may correct a confirmed turn's
 // repository from matching live context. Numeric growth defers that correction
-// and retains the old allocation, with its growth unknown. A host-selected
-// native seed supplies the accepted observation on first import. Differing
+// and retains the old allocation, with its growth unknown. Differing
 // observations of one turn within this scan fail it.
 bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs::path>& accepted,
     std::uint16_t accepted_version, Record_sorter& accepted_rollout_keys,
-    const fs::path& seeded_path, const fs::path& parsed_path, const std::function<bool()>& cancelled,
+    const fs::path& parsed_path, const std::function<bool()>& cancelled,
     Record_sorter* changes = nullptr, Usage_scan_authority authority = Usage_scan_authority::STANDARD)
 {
     std::optional<Record_stream> retained;
     if (accepted) retained.emplace(*accepted, accepted_version, "usage_cache_unavailable");
-    Record_stream seeded(seeded_path, 3, "usage_storage_read_failed");
     Record_stream parsed(parsed_path, 3, "usage_storage_read_failed");
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
     // Reads one turn's observations from a stream, keeping the one whose
-    // rollout path sorts first; differing observations fail the scan. A stream
-    // outranked by another one for this turn is drained unexamined.
-    const auto choose = [&cancelled](Record_stream& stream, const std::string& id, bool examine) {
+    // rollout path sorts first; differing observations fail the scan.
+    const auto choose = [&cancelled](Record_stream& stream, const std::string& id) {
         std::optional<Rollout_usage_record> chosen;
         while (stream.head() && stream.head()->usage.record_id == id) {
             check_cancel(cancelled);
             auto observation = stream.take();
-            if (!examine) continue;
             if (!chosen) {
                 chosen = std::move(observation);
                 continue;
@@ -1415,7 +1326,7 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
     for (;;) {
         check_cancel(cancelled);
         std::optional<std::string> id;
-        for (const auto* stream : {retained ? &*retained : nullptr, &seeded, &parsed}) {
+        for (const auto* stream : {retained ? &*retained : nullptr, &parsed}) {
             if (stream && stream->head() && (!id || id_less(stream->head()->usage.record_id, *id))) {
                 id = stream->head()->usage.record_id;
             }
@@ -1433,10 +1344,7 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
             if (changes) accepted_encoding = encode_record(*accepted_record, 3);
         }
         const bool parsed_again = parsed.head() && parsed.head()->usage.record_id == *id;
-        auto seeded_choice = choose(seeded, *id, !accepted_record);
-        auto parsed_choice = choose(parsed, *id, true);
-        if (!accepted_record && seeded_choice) accepted_record = *seeded_choice;
-        auto& chosen = parsed_again ? parsed_choice : seeded_choice;
+        auto chosen = choose(parsed, *id);
         Rollout_usage_record* record = accepted_record ? &*accepted_record : nullptr;
         if (record) clear_repository_correction(record->usage);
         if (chosen) {
@@ -1465,8 +1373,8 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
 }
 
 // Requires that every accepted record's rollout, keyed in `keys_path`, is one
-// the candidate's `rollouts` lists, whether from the accepted cache, the
-// native seed or a live rollout. Both files are sorted by cache key, so one
+// the candidate's `rollouts` lists, whether from the accepted cache or a
+// live rollout. Both files are sorted by cache key, so one
 // pass joins them.
 void require_listed_rollouts(const fs::path& keys_path, const fs::path& rollouts_path,
     const std::function<bool()>& cancelled)
@@ -1563,15 +1471,13 @@ void flatten_record_pieces(const addon::Usage_cache_manifest& manifest, const fs
 
 void merge_incremental_records(const addon::Usage_scan_request& request,
     const addon::Usage_cache_manifest& accepted, const fs::path& work, std::uint16_t accepted_version,
-    Record_sorter& accepted_keys, const fs::path& seeded_path, const fs::path& parsed_path,
+    Record_sorter& accepted_keys, const fs::path& parsed_path,
     const Usage_scan_limits& limits, const std::function<bool()>& cancelled, Usage_scan_authority authority)
 {
     const auto& baseline = *request.cache_selection->accepted;
     const auto source = addon::usage_cache_io_path(addon::path_from_utf8(baseline.root));
-    const auto seeded = partition_records(seeded_path, work, "seeded-", 3, cancelled);
     const auto parsed = partition_records(parsed_path, work, "parsed-", 3, cancelled);
-    std::set<std::string> touched = seeded;
-    touched.insert(parsed.begin(), parsed.end());
+    const auto& touched = parsed;
     std::set<std::string> retained;
     const bool adopting = accepted.format != k_piece_cache_format;
     if (adopting) {
@@ -1602,7 +1508,6 @@ void merge_incremental_records(const addon::Usage_scan_request& request,
             }
             changed = merge_snapshot_records(work / piece,
                 have_retained ? std::optional(accepted_path) : std::nullopt, 3, accepted_keys,
-                seeded.contains(piece) ? work / ("seeded-" + piece) : empty_path,
                 parsed.contains(piece) ? work / ("parsed-" + piece) : empty_path,
                 cancelled, &changes, authority);
             if (!changed) fs::remove(work / piece);
@@ -1618,7 +1523,6 @@ void merge_incremental_records(const addon::Usage_scan_request& request,
             }
         }
         if (adopting && changed && have_retained) fs::remove(accepted_path);
-        if (seeded.contains(piece)) fs::remove(work / ("seeded-" + piece));
         if (parsed.contains(piece)) fs::remove(work / ("parsed-" + piece));
     }
     changes.finish(work / "changes");
@@ -1641,20 +1545,18 @@ void append_rollout_records(const fs::path& spool, Record_sorter& parsed,
 }
 
 // Writes the snapshot's `rollouts` in cache-key order, reconciling by key the
-// accepted metadata, the seed's and the rollouts found in native history
-// directories, and parses each found rollout whose metadata does not describe
-// it, passing the records of every parse that holds to `parsed`. A seed's
-// metadata replaces the accepted metadata of its rollout. Rollouts found under
+// accepted metadata and the rollouts found in native history directories,
+// and parses each found rollout whose metadata does not describe it, passing
+// the records of every parse that holds to `parsed`. Rollouts found under
 // one key are refreshed in the order they were found, each against the
 // metadata the one before left. A key no source supplies metadata for gets no
 // line. Returns whether a rollout could not be read at rest.
 bool reconcile_rollouts(const fs::path& work, std::optional<Accepted_rollouts>& accepted,
-    const fs::path& seed_path, const fs::path& found_path, bool force, Record_sorter& parsed, Record_sorter& peers,
+    const fs::path& found_path, bool force, Record_sorter& parsed, Record_sorter& peers,
     Record_sorter& unindexed, Usage_scan_progress& progress, const std::function<bool()>& cancelled, bool* changed,
     bool* reparsed,
     bool refresh_missing_temporal)
 {
-    Spool_stream seed(seed_path);
     Spool_stream found(found_path);
     // A parsed rollout's records wait here until its parse is known to hold.
     const auto spool = work / "rollout-records";
@@ -1665,19 +1567,12 @@ bool reconcile_rollouts(const fs::path& work, std::optional<Accepted_rollouts>& 
     for (;;) {
         check_cancel(cancelled);
         std::optional<std::string> key;
-        for (const auto* head : {accepted ? &accepted->key() : &none, &seed.key(), &found.key()}) {
+        for (const auto* head : {accepted ? &accepted->key() : &none, &found.key()}) {
             if (*head && (!key || id_less(**head, *key))) key = *head;
         }
         if (!key) break;
         std::optional<addon::Json_value> metadata;
         if (accepted && accepted->key() == key) metadata = accepted->take();
-        if (seed.key() == key) {
-            *changed = true;
-            auto seeded = seed.take();
-            require(seed.key() != key && (!metadata || member(*metadata, "native_seed") != member(seeded, "native_seed")),
-                "native_usage_cache_duplicate_path");
-            metadata = std::move(seeded);
-        }
         while (found.key() == key) {
             auto rollout = found.take();
             auto refreshed = refresh_rollout(addon::path_from_utf8(string_member(rollout, "path")),
@@ -1939,7 +1834,6 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     // sealing included, so the poll is where the working scan reports.
     const std::function<bool()> working = [&] { progress.poll(); return cancelled(); };
     progress.begin("Preparing the usage cache");
-    auto seeds = addon::Json_value::array();
     // The accepted rollout metadata and records stay on disk and are streamed
     // once into the new snapshot.
     std::optional<Accepted_rollouts> accepted_rollouts;
@@ -1979,8 +1873,6 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         accepted_incomplete = member(*snapshot, "incomplete").as_boolean();
         const auto state = read_json(source / "cache-state");
         require(state.has_value(), "usage_cache_unavailable");
-        seeds = member(*state, "native_seeds");
-        require(seeds.is_array(), "usage_cache_unavailable");
         accepted_rollouts.emplace(*accepted, source);
         if (!incremental && accepted->format == k_piece_cache_format) {
             flatten_record_pieces(*accepted, source, work, limits, working);
@@ -1991,28 +1883,12 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         }
         accepted_version = accepted->format == "codex-rollout-cache@1" ? 2 : 3;
     }
-    // Turns converted from a native seed and turns parsed in this scan, each
-    // sorted by ID for reconciliation with the accepted records.
-    Record_sorter seeded(work, "seeded-run", limits.sort_run_bytes, working, record_id_key(3), false);
+    // Current observations are sorted for reconciliation with accepted records.
     Record_sorter parsed(work, "parsed-run", limits.sort_run_bytes, working, record_id_key(3), false);
-    // The seed's rollout metadata and the rollouts found in native history
-    // directories, each sorted by cache key for reconciliation with the
-    // accepted metadata.
-    Record_sorter seed_rollouts(work, "seed-rollout-run", limits.sort_run_bytes, working, spool_key(), false);
     Record_sorter found_rollouts(work, "found-rollout-run", limits.sort_run_bytes, working, spool_key(), false);
     Record_sorter rollout_peers(work, "rollout-peer-run", limits.sort_run_bytes, working, spool_key(), false);
     Record_sorter unindexed_rollouts(work, "unindexed-run", limits.sort_run_bytes, working, spool_key(), false);
     std::uint64_t ordinal = 0;
-    if (request.native_file_cache) progress.begin("Importing earlier usage history");
-    const auto accepted_seeds = seeds;
-    seed_native_cache(request, storage, selection.accepted.has_value(), &seeds,
-        [&](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
-            seed_rollouts.add(spool_record(key, ordinal++, metadata));
-            for (auto& record : records) {
-                seeded.add(std::move(record));
-            }
-            progress.advance();
-        }, working, 3);
     progress.begin("Reading Codex sessions");
     visit_rollouts(vendor_profile, working, [&](const fs::path& path) {
         const auto source = path_text(fs::absolute(path).lexically_normal());
@@ -2021,16 +1897,13 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         rollout.set("path", addon::Json_value(addon::path_to_utf8(path)));
         found_rollouts.add(spool_record(cache_key(source), ordinal++, rollout));
     });
-    const auto seed_rollouts_path  = work / "seed-rollouts";
     const auto found_rollouts_path = work / "found-rollouts";
-    seed_rollouts.finish(seed_rollouts_path);
     found_rollouts.finish(found_rollouts_path);
-    bool metadata_changed = seeds != accepted_seeds;
+    bool metadata_changed = false;
     bool reparsed = false;
-    bool incomplete = reconcile_rollouts(work, accepted_rollouts, seed_rollouts_path, found_rollouts_path,
+    bool incomplete = reconcile_rollouts(work, accepted_rollouts, found_rollouts_path,
         request.mode != "incremental", parsed, rollout_peers, unindexed_rollouts,
         progress, working, &metadata_changed, &reparsed, !incremental);
-    fs::remove(seed_rollouts_path);
     fs::remove(found_rollouts_path);
     const auto unindexed_path = work / "unindexed-rollouts";
     unindexed_rollouts.finish(unindexed_path);
@@ -2064,26 +1937,23 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     {
         throw Scan_failure{failure.reason_code};
     }
-    const auto seeded_path = work / "seeded-records";
     const auto parsed_path = work / "parsed-records";
     const auto accepted_keys_path = work / "accepted-rollout-keys";
     progress.begin("Sorting usage records");
-    seeded.finish(seeded_path);
     parsed.finish(parsed_path);
     progress.begin("Merging usage history");
     Record_sorter accepted_keys(work, "key-run", limits.sort_run_bytes, working,
         [](const std::string& line) { return line; }, false);
     if (incremental) {
         merge_incremental_records(request, *accepted_manifest, work, accepted_version, accepted_keys,
-            seeded_path, parsed_path, limits, working, authority);
+            parsed_path, limits, working, authority);
     }
     else {
         merge_snapshot_records(work / "records", accepted_records, accepted_version,
-            accepted_keys, seeded_path, parsed_path, working, nullptr, authority);
+            accepted_keys, parsed_path, working, nullptr, authority);
         if (accepted_manifest && accepted_manifest->format == k_piece_cache_format) fs::remove(*accepted_records);
     }
     accepted_keys.finish(accepted_keys_path);
-    fs::remove(seeded_path);
     fs::remove(parsed_path);
     progress.begin("Saving the usage cache");
     require_listed_rollouts(accepted_keys_path, work / "rollouts", working);
@@ -2102,7 +1972,6 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     auto state = addon::Json_value::object();
     state.set("request_sha256", addon::Json_value(request_hash));
     state.set("snapshot_id", addon::Json_value(identifier));
-    state.set("native_seeds", std::move(seeds));
     write_json(work / "cache-state", state);
     auto page = page_at(work, identifier, 0, request.context.account_context, working, 3, &request, incremental);
     page.account_context = request.context.account_context;
@@ -2190,15 +2059,12 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         progress.begin("Preparing the usage cache");
         require(fs::is_directory(vendor_profile), "usage_sessions_unavailable");
         const auto accepted = read_json(root / "accepted");
-        auto seeds = addon::Json_value::array();
         std::string accepted_identifier;
         if (accepted) {
             require(member(*accepted, "account") == account_value(request.context.account_context),
                 "usage_snapshot_account_mismatch");
             accepted_identifier = string_member(*accepted, "snapshot");
             require(digest_name(accepted_identifier), "required_usage_cache_unavailable");
-            seeds = member(*accepted, "native_seeds");
-            require(seeds.is_array(), "required_usage_cache_unavailable");
             // A previous pointer replacement may have reported a directory
             // flush failure. Settle that visible pointer before pruning the
             // generation to which it could otherwise roll back after a crash.
@@ -2213,17 +2079,6 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         if (accepted) {
             copy_accepted_cache(*accepted, snapshots, work, working);
         }
-        if (request.native_file_cache) progress.begin("Importing earlier usage history");
-        seed_native_cache(request, storage, accepted.has_value(), &seeds,
-            [&work, &progress](const std::string& key, addon::Json_value metadata, std::vector<Sort_record> records) {
-                const auto previous = read_json(work / (key + ".meta"));
-                require(!previous || member(*previous, "native_seed") != member(metadata, "native_seed"),
-                    "native_usage_cache_duplicate_path");
-                metadata.set("seed_snapshot", addon::Json_value(work.filename().string()));
-                write_rollout_records(work / (key + ".records"), records);
-                write_json(work / (key + ".meta"), metadata);
-                progress.advance();
-            }, working);
         bool incomplete = false;
         progress.begin("Reading Codex sessions");
         visit_rollouts(vendor_profile, working, [&](const fs::path& path) {
@@ -2244,9 +2099,9 @@ std::optional<addon::Usage_scan_page> scan_usage(const addon::Usage_scan_request
         metadata.set("incomplete", addon::Json_value(incomplete));
         write_json(work / "snapshot", metadata);
         auto page = page_at(work, identifier, 0, request.context.account_context, working);
-        auto next = accepted_generation(work, seeds, request.context.account_context, working);
+        auto next = accepted_generation(work, request.context.account_context, working);
         // Include response construction in the candidate: encoding can still fail
-        // before the one pointer exposes this generation and its seed receipts.
+        // before the one pointer exposes this generation.
         const auto encoded = addon::encode_usage_scan_result(page, 2);
         addon::Contract_failure failure;
         require(addon::decode_usage_scan_result(encoded, &failure, 2).has_value(), "usage_snapshot_invalid");
@@ -2270,8 +2125,7 @@ std::optional<addon::Usage_incremental_result> scan_usage_incremental(
     std::string* error, const Usage_scan_limits& limits, Usage_scan_authority authority)
 {
     try {
-        require(request.mode == "incremental" && request.cache_selection && request.cache_selection->accepted &&
-            !request.native_file_cache,
+        require(request.mode == "incremental" && request.cache_selection && request.cache_selection->accepted,
             "usage_incremental_baseline_required");
         std::unique_lock lock(scan_mutex, std::defer_lock);
         if (!request.snapshot_id) {
@@ -2385,23 +2239,6 @@ void handle_usage_session(addon::Invocation_context& context)
         result.push_back({identity, describe_usage_session(identity)});
     }
     context.succeed(addon::encode_usage_session_result(result));
-}
-
-addon::Legacy_import_result import_usage(const addon::Import_record_request& request)
-{
-    addon::Contract_failure failure;
-    auto legacy = addon::decode_legacy_usage_records(request.record, &failure);
-    if (!legacy || legacy->provider_id != "codex") return {};
-    for (auto& record : legacy->records) {
-        const auto separator = record.record_id.rfind(':');
-        // The native store already keys each completed turn by this exact ID.
-        // Migration changes ownership, never the identity or replay semantics.
-        if (legacy->direction == "to-add-on" && !record.session_key && record.record_id.starts_with("codex:") &&
-            separator > 6 && separator + 1 < record.record_id.size()) record.session_key = record.record_id.substr(6, separator - 6);
-    }
-    const auto conversion = addon::encode_legacy_usage_conversion(legacy->records);
-    auto result = addon::Legacy_import_result::from_conversion(conversion);
-    return result ? std::move(*result) : addon::Legacy_import_result{};
 }
 
 } // namespace codex
