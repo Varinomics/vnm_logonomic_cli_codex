@@ -16,6 +16,9 @@ struct Profile_selection
 };
 
 std::string profile_account_key(std::string_view absolute_path);
+std::optional<Profile_selection> profile_from_environment(
+    const logonomic::cli_addon::Launch_environment& environment,
+    std::string_view default_home_fallback, std::string_view normalization_directory, std::string* error);
 std::optional<Profile_selection> profile_selection(
     const logonomic::cli_addon::Launch_environment& environment,
     const logonomic::cli_addon::Launcher_request& launcher,

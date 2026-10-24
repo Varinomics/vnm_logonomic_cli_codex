@@ -7,7 +7,8 @@
 namespace codex {
 
 // Captures the running CLI's queue support before birth and pins its native
-// state store. An unavailable wake offer never prevents an ordinary launch.
+// state store for wake and conversation export. Preparation also runs when
+// wake was not requested. An unavailable offer never prevents ordinary launch.
 logonomic::cli_addon::Session_wake_preparation prepare_session_wake(
     Verified_launch& launch,
     const std::vector<std::pair<std::string, std::string>>& environment,

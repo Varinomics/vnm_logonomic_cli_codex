@@ -58,6 +58,8 @@ endfunction()
 add_library(codex_provider STATIC
     src/codex_account_refresh.cpp
     src/codex_accounts.cpp
+    src/codex_conversation.cpp
+    src/codex_conversation_source.cpp
     src/codex_current_account.cpp
     src/codex_jsonl.cpp
     src/codex_jsonl_projector.cpp
@@ -76,7 +78,10 @@ codex_target(codex_provider)
 target_include_directories(codex_provider PUBLIC src)
 target_link_libraries(codex_provider PUBLIC logonomic_cli_addon_sdk::sdk)
 if(WIN32)
-    target_link_libraries(codex_provider PRIVATE ws2_32)
+    target_link_libraries(codex_provider PRIVATE ws2_32 winsqlite3)
+else()
+    find_package(SQLite3 REQUIRED)
+    target_link_libraries(codex_provider PRIVATE SQLite::SQLite3)
 endif()
 
 add_executable(codex_adapter src/adapter.cpp)
@@ -112,6 +117,11 @@ if(LOGONOMIC_CLI_ADDON_EMBEDDED)
 endif()
 
 enable_testing()
+add_executable(codex_conversation_tests tests/codex_conversation_tests.cpp)
+target_link_libraries(codex_conversation_tests PRIVATE codex_provider)
+codex_target(codex_conversation_tests)
+add_test(NAME codex_conversation_tests COMMAND codex_conversation_tests)
+set_tests_properties(codex_conversation_tests PROPERTIES TIMEOUT 30)
 add_executable(codex_fake_cli tests/codex_fake_cli.cpp)
 codex_target(codex_fake_cli)
 set_target_properties(codex_fake_cli PROPERTIES OUTPUT_NAME codex)

@@ -1,4 +1,5 @@
 #include "codex_session_wake.h"
+#include "codex_conversation_source.h"
 #include "codex_preparation.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
@@ -238,6 +239,12 @@ addon::Session_wake_preparation prepare_session_wake(
     Verified_launch& launch, const Environment& environment,
     const std::string& working_directory, addon::Invocation_context& context)
 {
+    // Clear an inherited marker even when optional native configuration fails.
+    // Only this launch's resolved and pinned state store may authorize export.
+    std::erase_if(launch.environment, [](const auto& entry) {
+        return same_environment_name(entry.first, k_export_sqlite_home_environment);
+    });
+    launch.environment.emplace_back(k_export_sqlite_home_environment, "");
     const auto unavailable = [](std::string reason) {
         return addon::Session_wake_preparation{false, Json::object(), std::move(reason)};
     };
@@ -285,6 +292,11 @@ addon::Session_wake_preparation prepare_session_wake(
     // Pin the recipient too: later edits to config.toml cannot move the queue
     // writer away from the process-scoped store the recipient opened at birth.
     launch.argv.insert(launch.argv.end(), {"-c", "sqlite_home=" + toml_string(sqlite_home)});
+    for (auto& [name, value] : launch.environment) {
+        if (same_environment_name(name, k_export_sqlite_home_environment)) {
+            value = sqlite_home;
+        }
+    }
     return {true, std::move(binding), {}};
 }
 

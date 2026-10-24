@@ -1,0 +1,7 @@
+{
+  "capability_id": "conversation-export",
+  "version": 1,
+  "payload": {
+    "environment_names": ["CODEX_HOME", "HOME", "USERPROFILE", "VNM_CODEX_EXPORT_SQLITE_HOME"]
+  }
+}
