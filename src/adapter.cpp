@@ -110,10 +110,10 @@ void invoke(addon::Invocation_context& context)
         else
         if (request.capability.capability_id == "structured-session" && request.operation == addon::k_inspect_operation) {
             addon::Contract_failure failure;
-            const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure, 2);
+            const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure);
             if (!inspection) context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
             else if (inspection->purpose != addon::Structured_purpose::IMPLEMENTATION) context.fail(addon::Result_status::UNAVAILABLE, "purpose_unavailable");
-            else context.succeed(addon::encode_structured_inspect_result(codex::inspect_implementation(inspection->inspection), 2));
+            else context.succeed(addon::encode_structured_inspect_result(codex::inspect_implementation(inspection->inspection)));
         }
         else {
             codex::handle_preparation(context);
@@ -134,11 +134,11 @@ int main()
     options.adapter_version = "1.0.0";
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
-        {"launch-preparation", 3}, {"structured-session", 2}, {"delegated-session", 2},
+        {"launch-preparation", 3}, {"structured-session", 3}, {"delegated-session", 3},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},
         {addon::k_session_wake_capability_id, addon::k_session_wake_version},
-        {"interactive-resume", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
+        {"interactive-resume", 2}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 3},
         {"current-account", 1},

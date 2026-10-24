@@ -1024,7 +1024,7 @@ void probe_preparation_preserves_program_environment_and_custody(
         context.input = {"probe", {quota ? "quota" : "auth-status", 2}, "prepare", addon::encode_probe_prepare_request(request, 2)};
         codex::handle_probes(context);
         addon::Contract_failure failure;
-        const auto result = addon::decode_structured_prepare_result(context.output, &failure, 2);
+        const auto result = addon::decode_structured_prepare_result(context.output, &failure);
         check(context.succeeded && result.has_value(), "probe preparation through actual dispatch and public codec");
         check(result->process.executable.kind == addon::Process_executable::Kind::PACKAGE_PATH &&
             result->process.executable.path.starts_with(quota || current_account ? "helpers/codex_quota_helper" : "helpers/codex_launch_bridge"),
@@ -1063,7 +1063,7 @@ void probe_preparation_preserves_program_environment_and_custody(
                 Context legacy;
                 legacy.input = {"legacy", {capability, 2}, "prepare", addon::encode_probe_prepare_request(request, 2)};
                 codex::handle_probes(legacy);
-                const auto separate = addon::decode_structured_prepare_result(legacy.output, nullptr, 2);
+                const auto separate = addon::decode_structured_prepare_result(legacy.output, nullptr);
                 check(legacy.succeeded && separate && !separate->inspection.incremental,
                     "declined shared admission leaves the separate native quota and AUTH routes usable");
                 check(std::string_view(capability) != "auth-status" || separate->process.argv[1] == "login",
@@ -1071,7 +1071,7 @@ void probe_preparation_preserves_program_environment_and_custody(
             }
             continue;
         }
-        const auto result = addon::decode_structured_prepare_result(context.output, nullptr, 2);
+        const auto result = addon::decode_structured_prepare_result(context.output, nullptr);
         check(context.succeeded && result && result->inspection.incremental && result->inspection.protocol_state.empty() &&
             !result->inspection.keep_stdin_open && result->process.stdin_behavior == addon::Stdin_behavior::CLOSED,
             "shared progress uses the established process proposal while the helper owns native stdin");

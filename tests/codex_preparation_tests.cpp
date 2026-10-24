@@ -436,9 +436,9 @@ int main(int argc, char** argv)
         };
         delegated.control.servers.push_back(server);
         Context task;
-        task.input = {"delegated", {"delegated-session", 2}, "prepare", addon::encode_delegated_prepare_request(delegated, 2)};
+        task.input = {"delegated", {"delegated-session", 3}, "prepare", addon::encode_delegated_prepare_request(delegated)};
         codex::handle_preparation(task);
-        const auto task_process = addon::decode_delegated_prepare_result(task.output, &failure, 2);
+        const auto task_process = addon::decode_delegated_prepare_result(task.output, &failure);
         require(task.succeeded && task_process && task_process->private_artifacts.empty() &&
             task_process->acknowledgment.server_ids == std::vector<std::string>{"control"} &&
             task_process->acknowledgment.connection_version == addon::k_delegated_connection_version,
@@ -462,7 +462,7 @@ int main(int argc, char** argv)
         disconnected.control.connection.reset();
         Context refused;
         refused.input = task.input;
-        refused.input.payload = addon::encode_delegated_prepare_request(disconnected, 2);
+        refused.input.payload = addon::encode_delegated_prepare_request(disconnected);
         codex::handle_preparation(refused);
         require(!refused.succeeded, "Missing connection refuses delegation");
         require(addon::validate_structured_process_proposal(task_process->process, &failure),
@@ -490,7 +490,7 @@ int main(int argc, char** argv)
         plain.context.launcher.script_body = "codex";
         plain.context.launcher_argv        = {argv[1]};
         Context outside;
-        outside.input = {"delegated", {"delegated-session", 2}, "prepare", addon::encode_delegated_prepare_request(plain, 2)};
+        outside.input = {"delegated", {"delegated-session", 3}, "prepare", addon::encode_delegated_prepare_request(plain)};
         codex::handle_preparation(outside);
         require(!outside.succeeded && outside.output == addon::Json_value("untrusted_working_directory") &&
             outside.failure_detail.find("Git repository") != std::string::npos,
@@ -499,9 +499,9 @@ int main(int argc, char** argv)
         fs::create_directories(root / "repository" / "src");
         plain.context.working_directory = utf8(root / "repository" / "src");
         Context inside;
-        inside.input = {"delegated", {"delegated-session", 2}, "prepare", addon::encode_delegated_prepare_request(plain, 2)};
+        inside.input = {"delegated", {"delegated-session", 3}, "prepare", addon::encode_delegated_prepare_request(plain)};
         codex::handle_preparation(inside);
-        const auto plain_process = addon::decode_delegated_prepare_result(inside.output, &failure, 2);
+        const auto plain_process = addon::decode_delegated_prepare_result(inside.output, &failure);
         require(inside.succeeded && plain_process &&
             std::find(plain_process->process.argv.begin(), plain_process->process.argv.end(), "--yolo") ==
                 plain_process->process.argv.end() &&

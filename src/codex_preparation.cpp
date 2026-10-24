@@ -337,7 +337,7 @@ void prepare_resume(addon::Invocation_context& context)
 void prepare_delegated(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
-    const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure, 2);
+    const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure);
     if (!request) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
@@ -418,7 +418,7 @@ void prepare_delegated(addon::Invocation_context& context)
     });
     result.inspection.incremental    = true;
     result.inspection.protocol_state = initial_implementation_state();
-    auto payload = addon::encode_delegated_prepare_result(result, 2);
+    auto payload = addon::encode_delegated_prepare_result(result);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
