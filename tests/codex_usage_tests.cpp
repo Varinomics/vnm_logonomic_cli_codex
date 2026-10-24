@@ -968,7 +968,10 @@ void current_cache_replay_and_loss(const fs::path& fixture)
     const auto storage = fixture / "replay-storage";
     fs::create_directories(profile / "sessions"); fs::create_directory(storage);
     const auto source = profile / "sessions" / "rollout-retained.jsonl";
-    write(source, metadata("retained") + start("turn") +
+    // A pre-turn sample proves that a larger reread belongs to this turn.
+    const auto prefix = metadata("retained") +
+        tokens(0, ",\"input_tokens\":0,\"output_tokens\":0,\"cached_input_tokens\":0") + start("turn");
+    write(source, prefix +
         tokens(17, ",\"input_tokens\":12,\"output_tokens\":5,\"cached_input_tokens\":0") + complete("turn"));
     addon::Usage_scan_request request;
     request.context.account_context = addon::Account_context{1, "account"};
@@ -978,16 +981,24 @@ void current_cache_replay_and_loss(const fs::path& fixture)
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17 &&
         page->records[0].input.value == 12 && page->records[0].output.value == 5,
         "current rollout accounting and category evidence are accepted");
+    check(page->records[0].cross_source_event &&
+        page->records[0].cross_source_event->authority_namespace == "openai.codex.completed-turn" &&
+        page->records[0].cross_source_event->event_id == "retained:turn",
+        "the pre-turn baseline proves the completed turn");
     fs::remove(source);
     select_cache(request, storage, "retained", page->cache_candidate);
     page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
     check(page && page->records.size() == 1 && page->records[0].total_tokens == 17 &&
         page->records[0].input.value == 12 && page->records[0].output.value == 5,
         "accepted current cache retains missing-rollout accounting and categories");
-    write(source, metadata("retained") + start("turn") + tokens(23) + complete("turn"));
+    write(source, prefix + tokens(23) + complete("turn"));
     select_cache(request, storage, "updated", page->cache_candidate);
     page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
-    check(page && page->records[0].total_tokens == 23, "live file advances the accepted stable turn");
+    check(page && page->records.size() == 1 && page->records[0].total_tokens == 23 &&
+        page->records[0].record_id == "codex:retained:turn" && page->records[0].cross_source_event &&
+        page->records[0].cross_source_event->authority_namespace == "openai.codex.completed-turn" &&
+        page->records[0].cross_source_event->event_id == "retained:turn",
+        "proved live file advances the accepted stable turn");
     fs::remove(source);
     select_cache(request, storage, "updated-retained", page->cache_candidate);
     page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
@@ -1548,7 +1559,7 @@ void selected_cache_keeps_accepted_turns_when_their_rollout_is_parsed(const fs::
 
     const auto first = scan("first", "incremental", std::nullopt);
     check(first.records.size() == 1 && first.records.front().record_id == "codex:accepted:turn" &&
-        first.records.front().source_counter_semantics == "cumulative_turn_delta" &&
+        first.records.front().counter_field == "total_token_usage.total_tokens" &&
         first.records.front().repository_usage && first.records.front().repository_usage->allocations.size() == 1,
         "the accepted turn is accepted with its native provenance and attribution");
 
@@ -2662,7 +2673,7 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
             for (const auto& record : page->records) {
                 if (record.record_id != "codex:retained:turn") continue;
                 found = true;
-                check(record.source_counter_semantics == "cumulative_turn_delta" &&
+                check(record.counter_field == "total_token_usage.total_tokens" &&
                     record.aggregate_evidence == "partial" && record.total_tokens == 19 &&
                     record.input.value == 14 && record.output.value == 5,
                     "actual adapter preserves retained turn-delta attribution and partial evidence");
