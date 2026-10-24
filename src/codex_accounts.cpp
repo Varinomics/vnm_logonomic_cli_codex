@@ -85,10 +85,9 @@ std::optional<Profile_selection> profile_from_environment(const addon::Launch_en
     // Shell assignments have already been expanded in the host's frozen environment.
     std::string profile = environment_value(environment.effective_environment, "CODEX_HOME", windows).value_or("");
     if (profile.empty()) {
-        std::string home = environment_value(environment.effective_environment, windows ? "USERPROFILE" : "HOME", windows)
-            .value_or(std::string(fallback));
-        if (home.empty()) { *error = "profile_unavailable"; return std::nullopt; }
-        profile = path_text(addon::path_from_utf8(home) / ".codex");
+        const auto home = environment_value(environment.effective_environment, windows ? "USERPROFILE" : "HOME", windows);
+        if (!home && fallback.empty()) { *error = "profile_unavailable"; return std::nullopt; }
+        profile = path_text(addon::path_from_utf8(home.value_or(std::string(fallback))) / ".codex");
     }
     fs::path path = addon::path_from_utf8(profile);
     if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;

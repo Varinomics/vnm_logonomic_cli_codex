@@ -178,6 +178,43 @@ bool paginated_source(const fs::path& root, const fs::path& profile, const fs::p
     return ok;
 }
 
+bool frozen_home_source(const fs::path& root)
+{
+    const auto origin = root / "frozen-origin";
+    const auto source = origin / ".codex/sessions/rollout-2026-10-25-session-home.jsonl";
+    write(source, R"({"type":"session_meta","payload":{"id":"session-home"}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":"Frozen home prompt"}})" "\n");
+    addon::Conversation_export_request request;
+    request.provider_session_id = "session-home";
+    request.working_directory = addon::path_to_utf8(origin);
+    request.launch_environment.platform_id = addon::host_platform_id();
+    request.launch_environment.effective_environment = addon::Json_value::object();
+#if defined(_WIN32)
+    const std::string home_name = "USERPROFILE";
+#else
+    const std::string home_name = "HOME";
+#endif
+    request.launch_environment.effective_environment.set(home_name, addon::Json_value(""));
+    request.output_directory = addon::path_to_utf8(root / "frozen-home");
+    fs::create_directories(addon::path_from_utf8(request.output_directory));
+    addon::Contract_failure failure;
+    const auto result = codex::export_conversation(request, {}, &failure);
+    bool ok = check(result.has_value(), "present empty home exports from the frozen origin");
+    if (result) {
+        const auto text = read(addon::path_from_utf8(request.output_directory) / result->file_name);
+        ok &= check(result->message_count == 1 && text.find("Frozen home prompt") != std::string::npos,
+            "frozen-origin profile retains the exact native conversation");
+    }
+    request.launch_environment.effective_environment = addon::Json_value::object();
+    request.output_directory = addon::path_to_utf8(root / "absent-home");
+    fs::create_directories(addon::path_from_utf8(request.output_directory));
+    ok &= check(!codex::export_conversation(request, {}, &failure) && failure.reason_code == "profile_unavailable",
+        "absent home cannot select a profile from the frozen working directory");
+    ok &= check(fs::is_empty(addon::path_from_utf8(request.output_directory)),
+        "unavailable profile publishes no conversation");
+    return ok;
+}
+
 } // namespace
 
 int main()
@@ -251,6 +288,7 @@ int main()
         failure.reason_code == "cancelled", "cancelled source scan returns no export");
     ok &= encrypted_projection(root, source, request);
     ok &= paginated_source(root, profile, source, request);
+    ok &= frozen_home_source(root);
     write(fs::path(source.string() + ".zst"), "compressed");
     ok &= check(!codex::export_conversation(request, {}, &failure) &&
         failure.reason_code == "conversation_format_unavailable", "compressed source never selects stale JSONL");
