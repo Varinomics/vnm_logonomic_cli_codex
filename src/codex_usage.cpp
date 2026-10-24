@@ -1083,27 +1083,15 @@ addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& iden
     return page;
 }
 
-// A selected cache's rollout metadata in cache-key order: the `rollouts`
-// lines of the current format, which it writes in that order, or the `.meta`
-// files of @1 and @2, which are named by their keys and listed, with the
-// manifest's other files, in the manifest the SDK bounds.
+// A selected cache's rollout metadata, streamed in cache-key order.
 class Accepted_rollouts final
 {
 public:
-    Accepted_rollouts(const addon::Usage_cache_manifest& accepted, fs::path source)
+    explicit Accepted_rollouts(const fs::path& source)
     :
-        m_source(std::move(source))
+        m_lines(source / "rollouts", std::ios::binary)
     {
-        if (accepted.format == k_cache_format || accepted.format == k_piece_cache_format) {
-            m_lines.emplace(m_source / "rollouts", std::ios::binary);
-            require(static_cast<bool>(*m_lines), "usage_cache_unavailable");
-        }
-        else {
-            for (const auto& file : accepted.files) {
-                if (file.path.ends_with(".meta") && cache_file_name(file.path)) m_files.push_back(file.path);
-            }
-            std::sort(m_files.begin(), m_files.end(), id_less);
-        }
+        require(static_cast<bool>(m_lines), "usage_cache_unavailable");
         advance();
     }
 
@@ -1119,36 +1107,21 @@ public:
 private:
     void advance()
     {
-        std::optional<addon::Json_value> metadata;
-        std::string key;
         std::string line;
-        if (m_lines && read_line(*m_lines, &line)) {
-            metadata = addon::parse_json(line, {}, nullptr);
-            require(metadata && metadata->is_object(), "usage_cache_invalid");
-            key = cache_key(string_member(*metadata, "source"));
-        }
-        else
-        if (!m_lines && m_next_file < m_files.size()) {
-            const auto& name = m_files[m_next_file++];
-            metadata = read_json(m_source / name);
-            require(metadata.has_value(), "usage_cache_unavailable");
-            key = name.substr(0, 64);
-            require(cache_key(string_member(*metadata, "source")) == key, "usage_cache_identity_mismatch");
-        }
-        if (!metadata) {
+        if (!read_line(m_lines, &line)) {
             m_key.reset();
             m_metadata.reset();
             return;
         }
+        auto metadata = addon::parse_json(line, {}, nullptr);
+        require(metadata && metadata->is_object(), "usage_cache_invalid");
+        auto key = cache_key(string_member(*metadata, "source"));
         require(!m_key || id_less(*m_key, key), "usage_cache_invalid");
         m_key      = std::move(key);
         m_metadata = std::move(metadata);
     }
 
-    fs::path                         m_source;
-    std::optional<std::ifstream>     m_lines;
-    std::vector<std::string>         m_files;
-    std::size_t                      m_next_file = 0;
+    std::ifstream                   m_lines;
     std::optional<std::string>       m_key;
     std::optional<addon::Json_value> m_metadata;
 };
@@ -1290,12 +1263,12 @@ void reduce_legacy_repository(const Rollout_usage_record& accepted, Rollout_usag
 // and retains the old allocation, with its growth unknown. Differing
 // observations of one turn within this scan fail it.
 bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs::path>& accepted,
-    std::uint16_t accepted_version, Record_sorter& accepted_rollout_keys,
+    Record_sorter& accepted_rollout_keys,
     const fs::path& parsed_path, const std::function<bool()>& cancelled,
     Record_sorter* changes = nullptr, Usage_scan_authority authority = Usage_scan_authority::STANDARD)
 {
     std::optional<Record_stream> retained;
-    if (accepted) retained.emplace(*accepted, accepted_version, "usage_cache_unavailable");
+    if (accepted) retained.emplace(*accepted, 3, "usage_cache_unavailable");
     Record_stream parsed(parsed_path, 3, "usage_storage_read_failed");
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
     require(static_cast<bool>(output), "usage_storage_write_failed");
@@ -1470,7 +1443,7 @@ void flatten_record_pieces(const addon::Usage_cache_manifest& manifest, const fs
 }
 
 void merge_incremental_records(const addon::Usage_scan_request& request,
-    const addon::Usage_cache_manifest& accepted, const fs::path& work, std::uint16_t accepted_version,
+    const addon::Usage_cache_manifest& accepted, const fs::path& work,
     Record_sorter& accepted_keys, const fs::path& parsed_path,
     const Usage_scan_limits& limits, const std::function<bool()>& cancelled, Usage_scan_authority authority)
 {
@@ -1481,7 +1454,7 @@ void merge_incremental_records(const addon::Usage_scan_request& request,
     std::set<std::string> retained;
     const bool adopting = accepted.format != k_piece_cache_format;
     if (adopting) {
-        retained = partition_records(source / "records", work, "accepted-", accepted_version,
+        retained = partition_records(source / "records", work, "accepted-", 3,
             cancelled, &accepted_keys);
     }
     else {
@@ -1507,7 +1480,7 @@ void merge_incremental_records(const addon::Usage_scan_request& request,
                 throw Scan_failure{failure.reason_code};
             }
             changed = merge_snapshot_records(work / piece,
-                have_retained ? std::optional(accepted_path) : std::nullopt, 3, accepted_keys,
+                have_retained ? std::optional(accepted_path) : std::nullopt, accepted_keys,
                 parsed.contains(piece) ? work / ("parsed-" + piece) : empty_path,
                 cancelled, &changes, authority);
             if (!changed) fs::remove(work / piece);
@@ -1640,7 +1613,7 @@ std::optional<std::string> read_native_session(const fs::path& path, const std::
 // observations of that source. Copies absent from the aggregate need only their
 // session metadata read; identifying a peer does not recount its token events.
 bool index_rollout_copies(const addon::Usage_scan_request& request,
-    const std::optional<addon::Usage_cache_manifest>& accepted, std::uint16_t accepted_version,
+    const std::optional<addon::Usage_cache_manifest>& accepted,
     const fs::path& work, const fs::path& unindexed_path,
     Record_sorter& peers, const Usage_scan_limits& limits, const std::function<bool()>& cancelled)
 {
@@ -1661,7 +1634,7 @@ bool index_rollout_copies(const addon::Usage_scan_request& request,
             std::string line;
             while (read_line(input, &line)) {
                 check_cancel(cancelled);
-                const auto record = decode_record(line, accepted_version);
+                const auto record = decode_record(line, 3);
                 if (record.usage.source_path && record.usage.session_key) {
                     auto identity = addon::Json_value::object();
                     identity.set("session", addon::Json_value(*record.usage.session_key));
@@ -1839,7 +1812,6 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     std::optional<Accepted_rollouts> accepted_rollouts;
     std::optional<fs::path> accepted_records;
     std::optional<addon::Usage_cache_manifest> accepted_manifest;
-    std::uint16_t accepted_version = 3;
     bool metadata_only = false;
     bool accepted_incomplete = false;
     if (selection.accepted) {
@@ -1850,11 +1822,10 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
                 *selection.accepted, profile_root, request.context.account_context, working, &failure);
         check_cancel(working);
         const auto& accepted = accepted_manifest;
-        require(accepted && (accepted->format == "codex-rollout-cache@1" ||
-            accepted->format == "codex-rollout-cache@2" || accepted->format == k_cache_format ||
+        require(accepted && (accepted->format == k_cache_format ||
             accepted->format == k_piece_cache_format), "usage_cache_unavailable");
         const auto source = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root));
-        metadata_only = incremental && (accepted->format == k_cache_format || accepted->format == k_piece_cache_format);
+        metadata_only = incremental;
         if (metadata_only) {
             for (const auto* name : {"cache-state", "snapshot", "rollouts"}) {
                 if (!addon::validate_usage_cache_file(*selection.accepted, *accepted, name, working, &failure)) {
@@ -1862,18 +1833,12 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
                 }
             }
         }
-        else
-        if (incremental && !addon::validate_usage_cache_candidate(
-                *selection.accepted, profile_root, request.context.account_context, working, &failure))
-        {
-            throw Scan_failure{failure.reason_code};
-        }
         const auto snapshot = read_json(source / "snapshot");
         require(snapshot && member(*snapshot, "incomplete").is_boolean(), "usage_cache_unavailable");
         accepted_incomplete = member(*snapshot, "incomplete").as_boolean();
         const auto state = read_json(source / "cache-state");
         require(state.has_value(), "usage_cache_unavailable");
-        accepted_rollouts.emplace(*accepted, source);
+        accepted_rollouts.emplace(source);
         if (!incremental && accepted->format == k_piece_cache_format) {
             flatten_record_pieces(*accepted, source, work, limits, working);
             accepted_records = work / "accepted-records";
@@ -1881,7 +1846,6 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         else {
             accepted_records = source / "records";
         }
-        accepted_version = accepted->format == "codex-rollout-cache@1" ? 2 : 3;
     }
     // Current observations are sorted for reconciliation with accepted records.
     Record_sorter parsed(work, "parsed-run", limits.sort_run_bytes, working, record_id_key(3), false);
@@ -1908,7 +1872,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     const auto unindexed_path = work / "unindexed-rollouts";
     unindexed_rollouts.finish(unindexed_path);
     if (reparsed && fs::file_size(unindexed_path) != 0 &&
-        index_rollout_copies(request, accepted_manifest, accepted_version, work,
+        index_rollout_copies(request, accepted_manifest, work,
             unindexed_path, rollout_peers, limits, working))
     {
         incomplete = true;
@@ -1945,11 +1909,11 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     Record_sorter accepted_keys(work, "key-run", limits.sort_run_bytes, working,
         [](const std::string& line) { return line; }, false);
     if (incremental) {
-        merge_incremental_records(request, *accepted_manifest, work, accepted_version, accepted_keys,
+        merge_incremental_records(request, *accepted_manifest, work, accepted_keys,
             parsed_path, limits, working, authority);
     }
     else {
-        merge_snapshot_records(work / "records", accepted_records, accepted_version,
+        merge_snapshot_records(work / "records", accepted_records,
             accepted_keys, parsed_path, working, nullptr, authority);
         if (accepted_manifest && accepted_manifest->format == k_piece_cache_format) fs::remove(*accepted_records);
     }

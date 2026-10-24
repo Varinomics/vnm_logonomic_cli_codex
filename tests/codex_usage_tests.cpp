@@ -2065,53 +2065,6 @@ void selected_cache_requires_the_rollout_of_each_accepted_record(const fs::path&
         "an accepted record whose rollout nothing lists fails the scan");
 }
 
-std::optional<addon::Usage_cache_reference> per_rollout_fixture(const addon::Usage_cache_reference& current,
-    const fs::path& fixture_root, const std::string& profile_root,
-    const std::optional<addon::Account_context>& account, int format)
-{
-    const auto from = addon::usage_cache_io_path(addon::path_from_utf8(current.root));
-    const auto to = addon::usage_cache_io_path(fixture_root);
-    check(fs::create_directory(to), "allocate per-rollout fixture");
-    const auto key_of = [](const std::string& source) {
-        return addon::to_hex(addon::Sha256::digest(codex::profile_account_key(source)));
-    };
-    addon::Contract_failure failure;
-    std::map<std::string, std::string> rollout_records;
-    std::string sorted_records;
-    std::ifstream records(from / "records", std::ios::binary);
-    std::string line;
-    while (std::getline(records, line)) {
-        auto envelope = addon::parse_json(line, {}, nullptr);
-        check(envelope.has_value(), "parse current cache envelope");
-        auto record = addon::decode_usage_record(*envelope->find("usage"), &failure, 3);
-        check(record.has_value() && record->source_path.has_value(), "decode current cache record");
-        if (format == 1) {
-            if (record->source_counter_semantics == "cumulative_turn_delta") {
-                record->source_counter_semantics.reset();
-            }
-            envelope->set("usage", addon::encode_usage_record(*record, 2));
-        }
-        const auto encoded = addon::serialize_json(*envelope) + '\n';
-        sorted_records += encoded;
-        rollout_records[key_of(*record->source_path)] += encoded;
-    }
-    check(records.eof(), "read complete cache fixture");
-    write(to / "records", sorted_records);
-    std::ifstream rollouts(from / "rollouts", std::ios::binary);
-    while (std::getline(rollouts, line)) {
-        const auto rollout = addon::parse_json(line, {}, nullptr);
-        check(rollout && rollout->find("source"), "parse current rollout metadata");
-        const auto key = key_of(rollout->find("source")->as_string());
-        write(to / (key + ".meta"), line + '\n');
-        write(to / (key + ".records"), rollout_records[key]);
-    }
-    for (const auto* name : {"snapshot", "cache-state"}) {
-        check(fs::copy_file(from / name, to / name), "copy preceding-format metadata");
-    }
-    return addon::seal_usage_cache_candidate(addon::path_to_utf8(fixture_root), profile_root, account,
-        current.snapshot_id, "codex-rollout-cache@" + std::to_string(format), [] { return false; }, &failure);
-}
-
 void incremental_adoption_keeps_unexamined_temporal_evidence(const fs::path& fixture)
 {
     const auto profile = fixture / "adoption-profile";
@@ -2163,28 +2116,23 @@ void incremental_adoption_keeps_unexamined_temporal_evidence(const fs::path& fix
     fs::last_write_time(source, unchanged_time);
     write(profile / "sessions" / "rollout-fresh.jsonl",
         metadata("fresh") + start("first") + tokens(7) + complete("first"));
-    for (const int format : {1, 2, 3}) {
-        const auto baseline = format == 3 ? saved : per_rollout_fixture(*saved,
-            storage / ("format-" + std::to_string(format)), utf8(storage), request.context.account_context, format);
-        check(baseline.has_value(), "prepare saved cache format");
-        allocate("adopted-" + std::to_string(format), baseline);
-        const auto adopted = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
-        check(adopted && adopted->changes && !adopted->changes->incomplete_historical_coverage &&
-            adopted->changes->records.size() == 1 && adopted->changes->records.front().record_id == "codex:fresh:first",
-            "adoption processes the new source without rereading unchanged raw history for optional evidence");
-        const auto candidate = addon::path_from_utf8(adopted->changes->cache_candidate->root);
-        std::ifstream rollouts(candidate / "rollouts", std::ios::binary);
-        std::string line;
-        bool retained_absence = false;
-        while (std::getline(rollouts, line)) {
-            const auto row = addon::parse_json(line, {}, nullptr);
-            check(row.has_value(), "read adopted rollout metadata");
-            if (row->find("source")->as_string() == utf8(source)) {
-                retained_absence = !row->find("temporal_parser");
-            }
+    allocate("adopted", saved);
+    const auto adopted = codex::scan_usage_incremental(request, profile, storage, cancelled, quiet_progress, &error);
+    check(adopted && adopted->changes && !adopted->changes->incomplete_historical_coverage &&
+        adopted->changes->records.size() == 1 && adopted->changes->records.front().record_id == "codex:fresh:first",
+        "adoption processes the new source without rereading unchanged raw history for optional evidence");
+    const auto candidate = addon::path_from_utf8(adopted->changes->cache_candidate->root);
+    std::ifstream rollouts(candidate / "rollouts", std::ios::binary);
+    std::string line;
+    bool retained_absence = false;
+    while (std::getline(rollouts, line)) {
+        const auto row = addon::parse_json(line, {}, nullptr);
+        check(row.has_value(), "read adopted rollout metadata");
+        if (row->find("source")->as_string() == utf8(source)) {
+            retained_absence = !row->find("temporal_parser");
         }
-        check(retained_absence, "adoption does not claim that missing temporal evidence was examined");
     }
+    check(retained_absence, "adoption does not claim that missing temporal evidence was examined");
 }
 
 void selected_cache_keeps_turns_a_rescan_cannot_contradict(const fs::path& fixture)
@@ -3055,48 +3003,6 @@ void adapter_cache_selection_contract(const fs::path& package, const fs::path& f
     check_temporal(replay, replay_last);
     check(addon::validate_usage_cache_candidate(*replay_last.cache_candidate, *allocated,
         request.context.account_context, [] { return false; }, &failure).has_value(), "replayed cache seals and reopens");
-    // The preceding provider-owned formats kept files per rollout; @1 records
-    // also used the usage2 grammar, whose missing provenance cannot be guessed.
-    for (const int format : {1, 2}) {
-        const auto name = "preceding-format-" + std::to_string(format);
-        const auto old_reference = per_rollout_fixture(*first.cache_candidate, allocation_parent / name, *allocated,
-            request.context.account_context, format);
-        check(old_reference.has_value(), "seal preceding-format fixture");
-        const auto upgraded_root = allocation_parent / ("upgraded-format-" + std::to_string(format));
-        check(fs::create_directory(addon::usage_cache_io_path(upgraded_root)), "allocate upgraded candidate");
-        request.snapshot_id.reset();
-        request.cursor.reset();
-        request.cache_selection = addon::Usage_cache_selection{old_reference, addon::path_to_utf8(upgraded_root)};
-        const auto upgraded = scan();
-        request.snapshot_id = upgraded.snapshot_id;
-        request.cursor = upgraded.next_cursor;
-        const auto upgraded_last = scan();
-        check(upgraded.records.size() == 256 && upgraded_last.records.size() == 15 && upgraded_last.complete,
-            "preceding selected format retains all source-absent history through upgrade");
-        const auto sum = [](const auto& page) {
-            std::uint64_t total = 0;
-            for (const auto& record : page.records) {
-                total += record.total_tokens;
-            }
-            return total;
-        };
-        check(sum(upgraded) + sum(upgraded_last) == sum(first) + sum(last),
-            "a preceding-format upgrade keeps the exact total");
-        if (format == 1) {
-            for (const auto* page : {&upgraded, &upgraded_last}) {
-                for (const auto& record : page->records) {
-                    check(!record.source_counter_semantics && record.aggregate_evidence == "partial",
-                        "format upgrade does not invent absent provenance or completeness");
-                }
-            }
-        }
-        else {
-            check_retained(upgraded, upgraded_last);
-        }
-        check(addon::validate_usage_cache_candidate(*old_reference, *allocated,
-            request.context.account_context, [] { return false; }, &failure).has_value(),
-            "format upgrade leaves the selected old candidate immutable");
-    }
     check(host.shutdown(1000, nullptr), "actual adapter exits without any model request");
 }
 
