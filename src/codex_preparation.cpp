@@ -209,11 +209,12 @@ void prepare_interactive(addon::Invocation_context& context)
         refuse_initial_prompt(context, "This Codex does not take an initial prompt for an interactive session.");
         return;
     }
+    auto store_preparation = prepare_session_wake(*launch,
+        launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),
+        request->working_directory, context);
     std::optional<addon::Session_wake_preparation> wake;
     if (request->session_wake) {
-        wake = prepare_session_wake(*launch,
-            launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),
-            request->working_directory, context);
+        wake = std::move(store_preparation);
     }
     if (!add_hooks(*launch, context)) return;
     addon::Launch_patch patch;
@@ -278,11 +279,12 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
         return;
     }
+    auto store_preparation = prepare_session_wake(*launch,
+        launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
+        request->context.working_directory, context);
     std::optional<addon::Session_wake_preparation> wake;
     if (request->context.session_wake) {
-        wake = prepare_session_wake(*launch,
-            launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
-            request->context.working_directory, context);
+        wake = std::move(store_preparation);
     }
     if (!add_hooks(*launch, context)) return;
     std::vector<std::string> configuration;

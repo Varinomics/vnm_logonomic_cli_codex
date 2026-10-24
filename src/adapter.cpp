@@ -1,4 +1,5 @@
 #include "codex_accounts.h"
+#include "codex_conversation.h"
 #include "codex_jsonl.h"
 #include "codex_launcher.h"
 #include "codex_lifecycle.h"
@@ -58,6 +59,10 @@ void invoke(addon::Invocation_context& context)
         else
         if (request.capability.capability_id == "launcher-discovery") {
             discovery(context);
+        }
+        else
+        if (request.capability.capability_id == addon::k_conversation_export_capability_id) {
+            addon::handle_conversation_export(context, codex::export_conversation);
         }
         else
         if (request.capability.capability_id == addon::k_session_wake_capability_id) {
@@ -134,6 +139,7 @@ int main()
     options.adapter_version = "1.0.0";
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
+        {addon::k_conversation_export_capability_id, addon::k_conversation_export_version},
         {"launch-preparation", 3}, {"structured-session", 2}, {"delegated-session", 2},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},

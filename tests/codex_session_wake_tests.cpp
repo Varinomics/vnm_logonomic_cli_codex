@@ -1,4 +1,5 @@
 #include "codex_accounts.h"
+#include "codex_conversation_source.h"
 #include "codex_preparation.h"
 #include "codex_session_wake.h"
 
@@ -243,9 +244,14 @@ int main(int argc, char** argv)
 
         auto old = request;
         old.launch_environment->effective_environment.set("CODEX_FIXTURE_VERSION", Json("0.148.0"));
+        old.launch_environment->effective_environment.set(codex::k_export_sqlite_home_environment,
+            Json(utf8(root / "inherited-store")));
         const auto old_patch = prepare(old);
         require(old_patch.session_wake && !old_patch.session_wake->available &&
             old_patch.session_wake->reason == "native_queue_watcher_unavailable", "Unsupported wake must leave an ordinary launch available");
+        require(std::count(old_patch.set.begin(), old_patch.set.end(),
+            std::pair<std::string, std::string>{codex::k_export_sqlite_home_environment, ""}) == 1,
+            "Unavailable native store discovery clears an inherited export binding");
         auto configured = request;
         configured.launch_environment->effective_environment.set("CODEX_FIXTURE_SQLITE_HOME", Json(utf8(root / "configured-store")));
         const auto configured_patch = prepare(configured);
@@ -260,7 +266,14 @@ int main(int argc, char** argv)
         require(!prepare(profiled).session_wake->available,
             "Native app-server rejects profile-v2; dropping the selector would inspect another store");
         request.session_wake.reset();
-        require(!prepare(request).session_wake, "Unnegotiated wake must not modify ordinary launch behavior");
+        const auto export_patch = prepare(request);
+        require(!export_patch.session_wake, "An unrequested wake capability remains absent");
+        require(export_patch.argv && std::count(export_patch.argv->begin(), export_patch.argv->end(),
+            "sqlite_home=" + codex::toml_string(utf8(root / "relative-store"))) == 1 &&
+            std::count(export_patch.set.begin(), export_patch.set.end(),
+                std::pair<std::string, std::string>{codex::k_export_sqlite_home_environment,
+                    utf8(root / "relative-store")}) == 1,
+            "Conversation export pins and records the original native store even without a wake offer");
         return 0;
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

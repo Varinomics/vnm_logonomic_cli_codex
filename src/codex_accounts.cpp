@@ -75,12 +75,19 @@ std::optional<Profile_selection> profile_selection(const addon::Launch_environme
 {
     const auto command = recognize_launcher(launcher.script_body);
     if (!command) { *error = "launcher_unrecognized"; return std::nullopt; }
+    return profile_from_environment(environment, fallback, normalization_directory, error);
+}
+
+std::optional<Profile_selection> profile_from_environment(const addon::Launch_environment& environment,
+    std::string_view fallback, std::string_view normalization_directory, std::string* error)
+{
     const bool windows = environment.platform_id.starts_with("windows-");
     // Shell assignments have already been expanded in the host's frozen environment.
     std::string profile = environment_value(environment.effective_environment, "CODEX_HOME", windows).value_or("");
     if (profile.empty()) {
         std::string home = environment_value(environment.effective_environment, windows ? "USERPROFILE" : "HOME", windows)
             .value_or(std::string(fallback));
+        if (home.empty()) { *error = "profile_unavailable"; return std::nullopt; }
         profile = path_text(addon::path_from_utf8(home) / ".codex");
     }
     fs::path path = addon::path_from_utf8(profile);
