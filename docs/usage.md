@@ -44,8 +44,7 @@ New turns are attributed as their checkout stands at the scan. A contradicting
 observation is presented for the host to accept or reject. If a proved numeric
 increase also changes the observed directory, it keeps prior allocations and
 records only the growth as unknown until the new total is accepted. Aggregate
-evidence remains partial. The usage-scan@2 mutable cache namespace and record grammar are
-unchanged. Legacy numeric reductions retain the prior repository, consuming
+evidence remains partial. Numeric reductions retain the prior repository, consuming
 deferred unknown tokens before reducing the sole known allocation. A mixed
 external allocation can consume unknown tokens, but a reduction that would
 require choosing among known repositories is refused.

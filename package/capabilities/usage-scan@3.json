@@ -1,1 +1,19 @@
-{"capability_id":"usage-scan","version":3,"payload":{}}
+{
+  "capability_id": "usage-scan",
+  "version": 3,
+  "payload": {
+    "environment_names": [
+      "CODEX_HOME",
+      "HOME",
+      "USERPROFILE",
+      "PATH",
+      "PATHEXT",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL"
+    ]
+  }
+}
