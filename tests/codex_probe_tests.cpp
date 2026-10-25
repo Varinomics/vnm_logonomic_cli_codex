@@ -651,7 +651,7 @@ void account_resolution_uses_frozen_origin()
 
 void accounts_are_named_after_their_profile_folders()
 {
-    // Oracle: accounts@1 names an account with a filesystem profile after that
+    // Oracle: accounts@2 names an account with a filesystem profile after that
     // profile's folder, which tells it apart from the provider's other accounts.
 #if defined(_WIN32)
     const std::string platform = "windows-x86_64";
