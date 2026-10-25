@@ -248,13 +248,29 @@ bool frozen_home_source(const fs::path& root)
     request.output_directory = addon::path_to_utf8(root / "frozen-home");
     fs::create_directories(addon::path_from_utf8(request.output_directory));
     addon::Contract_failure failure;
+    bool ok = check(!codex::export_conversation(request, {}, &failure) &&
+        failure.reason_code == "profile_unavailable",
+        "empty home without an original account cannot invent a profile at the working directory");
+    ok &= check(fs::is_empty(addon::path_from_utf8(request.output_directory)),
+        "unavailable native home publishes no conversation");
+    request.account_context = addon::Account_context{2,
+        codex::profile_account_key(addon::path_to_utf8(origin / ".codex")),
+        addon::path_to_utf8(origin / ".codex")};
+    request.launch_environment.effective_environment.set("CODEX_HOME",
+        addon::Json_value(addon::path_to_utf8(root / "other-account")));
+    const auto frozen_environment = addon::serialize_json(request.launch_environment.effective_environment);
+    request.output_directory = addon::path_to_utf8(root / "frozen-account-home");
+    fs::create_directories(addon::path_from_utf8(request.output_directory));
     const auto result = codex::export_conversation(request, {}, &failure);
-    bool ok = check(result.has_value(), "present empty home exports from the frozen origin");
+    ok &= check(result.has_value(), "the original account remains the source with empty home evidence");
     if (result) {
         const auto text = read(addon::path_from_utf8(request.output_directory) / result->file_name);
         ok &= check(result->message_count == 1 && text.find("Frozen home prompt") != std::string::npos,
             "frozen-origin profile retains the exact native conversation");
     }
+    ok &= check(addon::serialize_json(request.launch_environment.effective_environment) == frozen_environment,
+        "export preserves present empty home evidence and the frozen environment map");
+    request.account_context.reset();
     request.launch_environment.effective_environment = addon::Json_value::object();
     request.output_directory = addon::path_to_utf8(root / "absent-home");
     fs::create_directories(addon::path_from_utf8(request.output_directory));

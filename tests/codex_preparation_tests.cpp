@@ -1,7 +1,9 @@
 #include "codex_accounts.h"
+#include "codex_conversation_source.h"
 #include "codex_launcher.h"
 #include "codex_preparation.h"
 
+#include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/launch_preparation.h>
@@ -9,6 +11,14 @@
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/session_contracts.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <shlobj.h>
+#else
+#include <pwd.h>
+#include <unistd.h>
+#endif
 
 #include <cstdlib>
 #include <algorithm>
@@ -22,9 +32,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -57,6 +64,171 @@ void prepare_launch(Context& context, const addon::Prepare_request& request)
 {
     context.input = {"interactive", {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3)};
     codex::handle_preparation(context);
+}
+
+void native_home_selection(const fs::path& executable, const fs::path& root)
+{
+    // Oracle: Codex find_codex_home -> dirs 6.0.0. Windows uses the OS profile;
+    // Unix uses nonempty HOME, then the frozen native home fallback.
+    const auto fallback = root / "native-home";
+    const auto environment_home = root / "environment-home";
+    for (const auto& home : {fallback, environment_home}) {
+        fs::create_directories(home / ".codex");
+        std::ofstream(home / ".codex/auth.json") << "{}";
+    }
+    for (const auto* platform : {"windows-x86_64", "linux-x86_64", "macos-arm64"}) {
+        for (int home_state = 0; home_state < 3; ++home_state) {
+            for (int codex_state = 0; codex_state < 3; ++codex_state) {
+                addon::Accounts_launcher_request request;
+                request.launcher.script_body = "codex";
+                request.launcher.runner_key  = addon::k_runner_direct;
+                request.launch_environment.platform_id = platform;
+                auto& environment = request.launch_environment.effective_environment;
+                environment.set("PATH", addon::Json_value(utf8(executable.parent_path())));
+                if (home_state != 0) {
+                    const auto value = home_state == 1 ? std::string{} : utf8(environment_home);
+                    environment.set("HOME", addon::Json_value(value));
+                    environment.set("USERPROFILE", addon::Json_value(home_state == 1
+                        ? std::string{} : utf8(root / "userprofile-home")));
+                }
+                if (codex_state != 0) {
+                    environment.set("CODEX_HOME", addon::Json_value(
+                        codex_state == 1 ? std::string{} : utf8(environment_home / ".codex")));
+                }
+                request.default_home_fallback   = utf8(fallback);
+                request.normalization_directory = utf8(root);
+                const bool overridden = codex_state == 2 ||
+                    (std::string_view(platform) != "windows-x86_64" && home_state == 2);
+                const auto expected = overridden
+                    ? environment_home / ".codex" : fallback / ".codex";
+                const auto frozen = addon::serialize_json(environment);
+                std::string error;
+                const auto selected = codex::profile_selection(request.launch_environment,
+                    request.launcher, request.default_home_fallback, request.normalization_directory, &error);
+                require(selected && addon::path_from_utf8(selected->profile_path) == expected,
+                    ("Native home selection failed: platform=" + std::string(platform) +
+                        " home_state=" + std::to_string(home_state) +
+                        " codex_state=" + std::to_string(codex_state)).c_str());
+
+                auto selected_request = request;
+                selected_request.launch_environment.effective_environment.set("CODEX_HOME",
+                    addon::Json_value(selected->profile_path));
+                Context accounts;
+                accounts.input.operation = addon::k_accounts_discover_operation;
+                accounts.input.payload   = addon::encode_accounts_launcher_request(selected_request);
+                codex::handle_accounts(accounts);
+                addon::Contract_failure failure;
+                const auto inventory = addon::decode_accounts_result(accounts.output, &failure);
+                require(accounts.succeeded && inventory && inventory->size() == 1 &&
+                    inventory->front().profile_path == selected->profile_path,
+                    "Account discovery must retain the selected native profile");
+
+                addon::Discover_request discovery;
+                discovery.platform_id           = platform;
+                discovery.ambient_environment   = selected_request.launch_environment.effective_environment;
+                discovery.default_home_fallback = request.default_home_fallback;
+                const auto launchers = codex::discover_launchers(discovery);
+                require(launchers.size() == 1 && launchers.front().is_default &&
+                    launchers.front().environment_text.starts_with("CODEX_HOME=") &&
+                    addon::path_from_utf8(launchers.front().environment_text.substr(11)) == expected,
+                    "Launcher discovery and account resolution must select the same native home");
+                require(addon::serialize_json(environment) == frozen,
+                    "Home selection must preserve absent and present empty environment evidence");
+
+                if (std::string_view(platform) != addon::host_platform_id()) {
+                    continue;
+                }
+                addon::Prepare_request prepare;
+                prepare.launcher          = request.launcher;
+                prepare.launcher_argv     = {utf8(executable)};
+                prepare.working_directory = utf8(root);
+                prepare.launch_environment = request.launch_environment;
+                prepare.account_context = addon::Account_context{2,
+                    selected->adapter_account_key, selected->profile_path};
+                const auto log = root / ("prepare-" + std::to_string(home_state) +
+                    '-' + std::to_string(codex_state) + ".jsonl");
+                auto& prepared_environment = prepare.launch_environment->effective_environment;
+                prepared_environment.set("CODEX_FIXTURE_WAKE_LOG", addon::Json_value(utf8(log)));
+                prepared_environment.set("TEMP", addon::Json_value(utf8(root)));
+                if (const char* system_root = std::getenv("SystemRoot")) {
+                    prepared_environment.set("SystemRoot", addon::Json_value(system_root));
+                }
+                Context prepared;
+                prepare_launch(prepared, prepare);
+                const auto patch = addon::decode_launch_patch(prepared.output, &failure, 3);
+                require(prepared.succeeded && patch && patch->account_context &&
+                    patch->account_context->version == prepare.account_context->version &&
+                    patch->account_context->adapter_account_key == selected->adapter_account_key &&
+                    patch->account_context->profile_path == selected->profile_path,
+                    "Preparation must freeze the resolved account context");
+                require(std::count(patch->set.begin(), patch->set.end(),
+                    std::pair<std::string, std::string>{"CODEX_HOME", selected->profile_path}) == 1,
+                    "Preparation must pin the selected native profile exactly once");
+                require(std::count_if(patch->set.begin(), patch->set.end(), [&](const auto& entry) {
+                    return entry.first == codex::k_export_sqlite_home_environment &&
+                        addon::path_from_utf8(entry.second) == expected;
+                }) == 1,
+                    "Export preparation must freeze the selected profile's native state store");
+                std::ifstream observed(log);
+                std::string line;
+                bool read_configuration = false;
+                while (std::getline(observed, line)) {
+                    const auto record = addon::parse_json(line, {}, nullptr);
+                    require(record && record->find("codex_home") &&
+                        record->find("codex_home")->as_string() == selected->profile_path,
+                        "The native configuration probe must receive the selected CODEX_HOME");
+                    read_configuration |= record->find("method")->as_string() == "config/read";
+                }
+                require(read_configuration, "Export preparation must query native configuration");
+            }
+        }
+    }
+}
+
+void native_account_fallback(const fs::path& root)
+{
+    // Read only the OS profile path. Default discovery would enumerate a real
+    // profile, so the live boundary is exercised through accounts/resolve.
+    fs::path native_home;
+#ifdef _WIN32
+    PWSTR path = nullptr;
+    const auto status = SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &path);
+    if (SUCCEEDED(status)) {
+        native_home = path;
+    }
+    CoTaskMemFree(path);
+#else
+    const auto* record = getpwuid(getuid());
+    if (record) {
+        native_home = record->pw_dir;
+    }
+#endif
+    require(!native_home.empty(), "Native home-path oracle is unavailable");
+    for (int home_state = 0; home_state < 3; ++home_state) {
+        addon::Accounts_launcher_request request;
+        request.launcher.script_body = "codex";
+        request.launcher.runner_key  = addon::k_runner_direct;
+        request.launch_environment.platform_id = addon::host_platform_id();
+        auto& environment = request.launch_environment.effective_environment;
+        if (home_state != 0) {
+            const auto value = home_state == 1 ? std::string{} : utf8(root / "override");
+            environment.set("HOME",        addon::Json_value(value));
+            environment.set("USERPROFILE", addon::Json_value(value));
+        }
+        request.default_home_fallback   = utf8(root / "host-fallback");
+        request.normalization_directory = utf8(root);
+        const auto expected_home = std::string_view(addon::host_platform_id()).starts_with("windows-") || home_state != 2
+            ? native_home : root / "override";
+        Context context;
+        context.input.operation = addon::k_accounts_resolve_operation;
+        context.input.payload   = addon::encode_accounts_launcher_request(request);
+        codex::handle_accounts(context);
+        addon::Contract_failure failure;
+        const auto result = addon::decode_account_resolution_result(context.output, &failure);
+        require(context.succeeded && result && result->adapter_account_key ==
+            codex::profile_account_key(utf8(expected_home / ".codex")),
+            "Live account resolution must use the native OS fallback instead of the host's Qt fallback");
+    }
 }
 
 // The literal PowerShell launcher of the same program, found on PATH.
@@ -323,6 +495,8 @@ int main(int argc, char** argv)
         const auto root = fs::temp_directory_path() / ("codex-preparation-" + addon::random_nonce_hex());
         fs::create_directories(root);
         struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{root};
+        native_account_fallback(root);
+        native_home_selection(fs::absolute(argv[1]), root);
         addon::Launch_environment environment;
 #ifdef _WIN32
         environment.platform_id = "windows-x86_64";
