@@ -128,6 +128,56 @@ bool encrypted_projection(const fs::path& root, const fs::path& source,
     return ok;
 }
 
+bool contextual_projection(const fs::path& root, const fs::path& source,
+    addon::Conversation_export_request request)
+{
+    // Codex ContextualUserFragment recognizes paired markers on input_text;
+    // UserInstructions and EnvironmentsState own these two native wrappers.
+    write(source,
+        R"({"type":"session_meta","payload":{"id":"session-a"}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /workspace\n\n<INSTRUCTIONS>\nInjected project rules\n</INSTRUCTIONS>"}]}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":" \n<ENVIRONMENT_CONTEXT>\n<cwd>/injected/workspace</cwd>\n</ENVIRONMENT_CONTEXT>\t"}]}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review the workspace diagram"},{"type":"input_text","text":"<environment_context><cwd>/injected/mixed</cwd></environment_context>"},{"type":"input_image","image_url":"https://example.invalid/workspace.png"}]}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Explain # AGENTS.md instructions and <environment_context> tags."}]}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"<environment_context>Quoted in the answer</environment_context>"}]}})" "\n");
+    bool ok = true;
+    for (const auto format : {addon::Conversation_export_format::MARKDOWN, addon::Conversation_export_format::TEXT,
+             addon::Conversation_export_format::CONVERSATION})
+    {
+        for (const bool compact : {false, true}) {
+            request.format = format;
+            request.compact = compact;
+            request.output_directory = addon::path_to_utf8(root / "context" / (compact ? "compact" : "full") /
+                addon::conversation_export_format_name(format));
+            fs::create_directories(addon::path_from_utf8(request.output_directory));
+            addon::Contract_failure failure;
+            const auto result = codex::export_conversation(request, {}, &failure);
+            ok &= check(result.has_value(), failure.reason_code + " " + failure.detail);
+            if (!result) {
+                continue;
+            }
+            const auto text = read(addon::path_from_utf8(request.output_directory) / result->file_name);
+            ok &= check(result->message_count == (compact ? 3 : 5) && result->attachment_count == 1,
+                "compact excludes contextual messages while retaining discussion and attachments");
+            for (const auto* hidden : {"Injected project rules", "/injected/workspace", "/injected/mixed"}) {
+                ok &= check((text.find(hidden) == std::string::npos) == compact,
+                    "paired native context wrappers are hidden only in compact output");
+            }
+            for (const auto* retained : {"Review the workspace diagram", "Explain # AGENTS.md instructions",
+                     "Quoted in the answer", "https://example.invalid/workspace.png"})
+            {
+                ok &= check(occurrences(text, retained) == 1,
+                    "ordinary discussion and media survive beside contextual fragments");
+            }
+            if (!compact && format == addon::Conversation_export_format::CONVERSATION) {
+                ok &= check(text.find("::: user\n# AGENTS.md instructions for /workspace") != std::string::npos,
+                    "full export preserves canonical context text and its native user role");
+            }
+        }
+    }
+    return ok;
+}
+
 bool paginated_source(const fs::path& root, const fs::path& profile, const fs::path& stale,
     addon::Conversation_export_request request)
 {
@@ -287,6 +337,7 @@ int main()
     ok &= check(!codex::export_conversation(request, [] { return true; }, &failure) &&
         failure.reason_code == "cancelled", "cancelled source scan returns no export");
     ok &= encrypted_projection(root, source, request);
+    ok &= contextual_projection(root, source, request);
     ok &= paginated_source(root, profile, source, request);
     ok &= frozen_home_source(root);
     write(fs::path(source.string() + ".zst"), "compressed");

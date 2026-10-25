@@ -66,9 +66,11 @@ its original position, replacing its routing envelope and opaque payload.
 Consecutive encrypted messages remain separate, including conversations whose
 messages are all encrypted. Plaintext inter-agent messages retain their text.
 
-Compact extraction keeps user content and assistant replies whose native phase
-is `final_answer`, and omits explicit `commentary`, reasoning, tool traffic and
-plaintext inter-agent messages. Assistant text without a recognized phase is
+Compact extraction keeps user discussion and assistant replies whose native phase
+is `final_answer`, and omits injected AGENTS.md and environment context, explicit
+`commentary`, reasoning, tool traffic and plaintext inter-agent messages.
+The native paired context markers identify injected input fragments; full
+extraction preserves their canonical text and user role. Assistant text without a recognized phase is
 retained conservatively; it is not guessed to be progress from its wording or
 position. Every encrypted-message placeholder remains in both modes. Unchecking
 Compact extracts the full retained discussion again from the native source;
@@ -97,6 +99,8 @@ The native interpretation follows these upstream definitions:
 
 - [Rollout payload serialization](https://github.com/openai/codex/blob/main/codex-rs/history/src/rollout_payload.rs)
 - [Response item and content types](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs)
+- [Injected user instructions](https://github.com/openai/codex/blob/main/codex-rs/core/src/context/user_instructions.rs)
+- [Context fragment markers](https://github.com/openai/codex/blob/main/codex-rs/context-fragments/src/fragment.rs)
 - [First-metadata identity and fork replay](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/recorder.rs)
 - [Rollback semantics](https://github.com/openai/codex/blob/main/codex-rs/core/src/thread_rollout_truncation.rs)
 - [Explicit turn replay and rollback](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/thread_history.rs)
