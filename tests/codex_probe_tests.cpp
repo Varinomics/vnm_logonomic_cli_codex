@@ -13,6 +13,7 @@
 #include <logonomic_cli_addon/presentation_record.h>
 
 #include "codex_launcher.h"
+#include "codex_launcher_approval.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -55,6 +56,54 @@ public:
 void check(bool condition, const char* message)
 {
     if (!condition) throw std::runtime_error(message);
+}
+
+void launcher_approval_contract()
+{
+    const auto& rules = codex::launcher_approval_rules();
+    const auto yolo = addon::Launcher_approval_action::YOLOFY;
+    const auto undo = addon::Launcher_approval_action::UNYOLOFY;
+    const auto changed = addon::Launcher_approval_disposition::CHANGED;
+    const auto unchanged = addon::Launcher_approval_disposition::UNCHANGED;
+    const auto unsupported = addon::Launcher_approval_disposition::UNSUPPORTED;
+    const auto windows = addon::transform_launcher_approval({{"codex", "powershell", ""},
+        "windows-x86_64", yolo}, rules);
+    check(windows.disposition == changed && windows.script_body == "codex --yolo",
+        "discovered Windows Codex launcher supports Yolofy");
+    for (const auto* option : {"--dangerously-bypass-approvals-and-sandbox", "--full-auto",
+        "--approve-for-me", "--not-so-yolo"})
+    {
+        const auto result = addon::transform_launcher_approval({
+            {std::string("codex ") + option, "direct", ""}, "linux-x86_64", yolo}, rules);
+        check(result.disposition == changed && result.script_body == "codex --yolo",
+            "Codex aliases and known conflicts converge on one canonical argument");
+    }
+    const std::string settings = R"(--model "custom model" -c "approval_policy='never'")";
+    const auto custom = addon::transform_launcher_approval({
+        {"codex -a on-request -s workspace-write " + settings, "direct", "CODEX_HOME=/profiles/work"},
+        "linux-x86_64", yolo}, rules);
+    check(custom.disposition == changed && custom.script_body.find(settings) != std::string::npos &&
+        custom.script_body.find("-a on-request") == std::string::npos &&
+        custom.script_body.find("-s workspace-write") == std::string::npos,
+        "Codex explicit policies are replaced while model and inline settings survive byte-for-byte");
+    for (const std::string script : {"codex -a never", "codex -s danger-full-access"}) {
+        const auto partial = addon::transform_launcher_approval({
+            {script, "direct", ""}, "linux-x86_64", undo}, rules);
+        check(partial.disposition == unchanged && partial.script_body == script,
+            "Unyolofy does not rewrite independent Codex approval or sandbox policies");
+    }
+    const auto removed = addon::transform_launcher_approval({
+        {"codex --dangerously-bypass-approvals-and-sandbox " + settings, "direct", ""},
+        "linux-x86_64", undo}, rules);
+    check(removed.disposition == changed && removed.script_body == "codex " + settings,
+        "Unyolofy removes the Codex bypass alias without editing configuration");
+    const auto resumed = addon::transform_launcher_approval({
+        {"codex resume --last", "direct", ""}, "linux-x86_64", yolo}, rules);
+    check(resumed.disposition == changed && resumed.script_body == "codex resume --yolo --last",
+        "Codex resume receives its own session argument");
+    const auto login = addon::transform_launcher_approval({
+        {"codex login", "direct", ""}, "linux-x86_64", yolo}, rules);
+    check(login.disposition == unsupported, "Codex management commands remain outside launcher editing");
 }
 
 void auth_output_is_exact_and_never_echoes_credentials()
@@ -1177,6 +1226,7 @@ int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     try {
+        launcher_approval_contract();
         auth_output_is_exact_and_never_echoes_credentials();
         current_account_identity_uses_selected_principal_workspace_and_backend();
         current_account_identity_reobserves_after_account_notifications();

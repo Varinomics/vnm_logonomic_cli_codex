@@ -2,6 +2,7 @@
 #include "codex_conversation.h"
 #include "codex_jsonl.h"
 #include "codex_launcher.h"
+#include "codex_launcher_approval.h"
 #include "codex_lifecycle.h"
 #include "codex_preparation.h"
 #include "codex_probes.h"
@@ -55,6 +56,10 @@ void invoke(addon::Invocation_context& context)
     try {
         if (context.cancel_requested()) {
             context.fail(addon::Result_status::CANCELLED, "cancelled");
+        }
+        else
+        if (request.capability.capability_id == addon::k_launcher_approval_capability_id) {
+            addon::handle_launcher_approval(context, codex::launcher_approval_rules());
         }
         else
         if (request.capability.capability_id == "launcher-discovery") {
@@ -138,6 +143,7 @@ int main()
     options.adapter_name    = "codex-addon";
     options.adapter_version = "1.0.0";
     options.capabilities = {
+        {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {addon::k_conversation_export_capability_id, addon::k_conversation_export_version},
         {"launch-preparation", 3}, {"structured-session", 3}, {"delegated-session", 3},

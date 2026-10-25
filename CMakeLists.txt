@@ -64,6 +64,7 @@ add_library(codex_provider STATIC
     src/codex_jsonl.cpp
     src/codex_jsonl_projector.cpp
     src/codex_launcher.cpp
+    src/codex_launcher_approval.cpp
     src/codex_lifecycle.cpp
     src/codex_preparation.cpp
     src/codex_probes.cpp
