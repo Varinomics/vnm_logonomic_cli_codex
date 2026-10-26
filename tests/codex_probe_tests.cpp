@@ -112,34 +112,100 @@ void launcher_image_operand_contract()
     const auto yolo = addon::Launcher_approval_action::YOLOFY;
     const auto undo = addon::Launcher_approval_action::UNYOLOFY;
 
-    // Codex SharedCliOptions declares -i/--image with num_args = 1..;
-    // removing a separating approval flag can turn the prompt into an image.
-    // The launcher-approval contract requires preserving operand ownership.
-    for (const std::string script : {
-        R"(codex -i shot.png --yolo "describe the screenshot")",
-        R"(codex --image shot.png --dangerously-bypass-approvals-and-sandbox "describe the screenshot")",
-        R"(codex --image=shot.png --yolo "describe the screenshot")",
-        R"(codex -ishot.png --yolo "describe the screenshot")",
-        R"(codex -i first.png second.png --full-auto "describe the screenshots")",
-        "codex --yolo -i shot.png",
-        "codex -i shot.png",
-        R"(codex resume --last --image shot.png --yolo "describe the screenshot")",
+    // Native Codex uses clap's num_args = 1.. and comma delimiter. Attached
+    // values terminate an occurrence; repeated occurrences append images.
+    struct Image_edit {
+        std::string original;
+        std::string without_bypass;
+        std::string powershell_without_bypass = {};
+    };
+    for (const Image_edit edit : {
+        Image_edit{R"(codex -i shot.png --yolo "describe the screenshot")",
+            R"(codex -i=shot.png "describe the screenshot")",
+            R"(codex '-i=shot.png' "describe the screenshot")"},
+        {R"(codex --image "design assets/shot.png" --dangerously-bypass-approvals-and-sandbox "describe it")",
+            R"(codex --image="design assets/shot.png" "describe it")"},
+        {R"(codex --image=shot.png --yolo "describe it")",
+            R"(codex --image=shot.png "describe it")"},
+        {R"(codex "-ishot.png" --yolo "describe it")", R"(codex "-ishot.png" "describe it")"},
+        {R"(codex -i first.png second.png --yolo "describe both")",
+            R"(codex -i first.png -i=second.png "describe both")",
+            R"(codex -i first.png '-i=second.png' "describe both")"},
+        {R"(codex -i first.png "second shot.png" --yolo "describe both")",
+            R"(codex -i first.png -i="second shot.png" "describe both")",
+            R"(codex -i first.png '-i=second shot.png' "describe both")"},
+        {R"(codex -i "owner's shot.png" --yolo "describe it")",
+            R"(codex -i="owner's shot.png" "describe it")",
+            R"(codex '-i=owner''s shot.png' "describe it")"},
+        {R"(codex --image first.png "second.png,third.png" --yolo "describe all")",
+            R"(codex --image first.png --image="second.png,third.png" "describe all")"},
+        {R"(codex -i="first.png" --image second.png --yolo "describe both")",
+            R"(codex -i="first.png" --image=second.png "describe both")"},
+        {R"(codex -i shot.png --yolo "describe it" --model custom)",
+            R"(codex -i=shot.png "describe it" --model custom)",
+            R"(codex '-i=shot.png' "describe it" --model custom)"},
+        {R"(codex "describe it" -i shot.png --yolo)", R"(codex "describe it" -i shot.png)"},
+        {R"(codex -i shot.png --yolo -- "--literal prompt")",
+            R"(codex -i shot.png -- "--literal prompt")"},
+        {"codex --yolo -i shot.png", "codex -i shot.png"},
+        {"codex -i shot.png", "codex -i shot.png"},
+        {R"(codex resume session-a --image shot.png --yolo "describe it")",
+            R"(codex resume session-a --image=shot.png "describe it")"},
+        {R"(codex resume --last --image shot.png --yolo "describe it")",
+            R"(codex resume --last --image=shot.png "describe it")"},
+        {R"(codex fork session-a -i shot.png --yolo "describe it")",
+            R"(codex fork session-a -i=shot.png "describe it")",
+            R"(codex fork session-a '-i=shot.png' "describe it")"},
+        {"codex -i shot.png --yolo resume --last", "codex -i=shot.png resume --last",
+            "codex '-i=shot.png' resume --last"},
     }) {
         for (const auto* runner : {"direct", "bash", "powershell", "cmd"}) {
             const std::string platform = std::string(runner) == "bash" ? "linux-x86_64" : "windows-x86_64";
-            const addon::Launcher_request launcher{script, runner, ""};
+            const addon::Launcher_request original{edit.original, runner, ""};
+            const auto comparison = addon::launcher_approval_comparison_key({original, platform}, rules);
+            check(comparison.supported,
+                ("valid image commands have an approval comparison key: " + edit.original + " (" + runner + ")").c_str());
+            const auto removed = addon::transform_launcher_approval({original, platform, undo}, rules);
+            const auto& expected = std::string(runner) == "powershell" && !edit.powershell_without_bypass.empty() ?
+                edit.powershell_without_bypass : edit.without_bypass;
+            check(removed.disposition != addon::Launcher_approval_disposition::UNSUPPORTED &&
+                removed.script_body == expected,
+                ("Unyolofy preserves native image and prompt ownership: " + edit.original + " -> " +
+                    addon::serialize_json(addon::encode_launcher_approval_transform_result(removed))).c_str());
             for (const auto action : {undo, yolo}) {
-                const auto result = addon::transform_launcher_approval({launcher, platform, action}, rules);
-                check(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
-                    result.script_body.empty(),
-                    ("image argument editing must be refused: " + script + " -> " +
-                        addon::serialize_json(addon::encode_launcher_approval_transform_result(result))).c_str());
+                const auto result = addon::transform_launcher_approval({
+                    {removed.script_body, runner, ""}, platform, action}, rules);
+                check(result.disposition != addon::Launcher_approval_disposition::UNSUPPORTED,
+                    "both approval edits support native image arguments");
+                check((result.script_body.find("--yolo") != std::string::npos) == (action == yolo),
+                    "image edits apply the requested bypass state");
+                const addon::Launcher_request edited{result.script_body, runner, ""};
+                const auto repeated = addon::transform_launcher_approval({edited, platform, action}, rules);
+                check(repeated.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
+                    repeated.script_body == result.script_body, "image approval edits are idempotent");
+                const auto edited_comparison = addon::launcher_approval_comparison_key({edited, platform}, rules);
+                check(edited_comparison.supported && edited_comparison.key == comparison.key,
+                    "image attachment repairs preserve approval comparison identity");
             }
-            const auto comparison = addon::launcher_approval_comparison_key({launcher, platform}, rules);
-            check(!comparison.supported && comparison.key.empty(),
-                "image argument ownership must not produce an approval comparison key");
         }
     }
+
+    for (const std::string script : {"codex -i --yolo prompt", "codex --image= --yolo prompt",
+        "codex --image=first.png,,second.png --yolo prompt"})
+    {
+        for (const auto action : {undo, yolo}) {
+            const auto result = addon::transform_launcher_approval({
+                {script, "direct", ""}, "windows-x86_64", action}, rules);
+            check(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+                result.script_body.empty(), "missing or empty native image values remain unsupported");
+        }
+    }
+    const auto prompt_key = addon::launcher_approval_comparison_key({
+        {"codex -i=shot.png prompt", "direct", ""}, "windows-x86_64"}, rules);
+    const auto image_key = addon::launcher_approval_comparison_key({
+        {"codex -i shot.png prompt", "direct", ""}, "windows-x86_64"}, rules);
+    check(prompt_key.supported && image_key.supported && prompt_key.key != image_key.key,
+        "comparison distinguishes a prompt from an additional image");
 
     for (const std::string arguments : {
         R"(--add-dir "design assets" --add-dir docs "describe the workspace")",

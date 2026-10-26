@@ -15,8 +15,6 @@ const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
             {"--sandbox",         {}, {"read-only", "workspace-write", "danger-full-access"}},
         },
         .conflicting_arguments = {"--full-auto", "--approve-for-me", "--not-so-yolo"},
-        // Variadic -i/--image is omitted: removing an approval flag can make
-        // its values absorb a following prompt.
         .value_arguments = {
             "-c", "--config", "--enable", "--disable", "-m", "--model", "--local-provider",
             "-p", "--profile", "--add-dir", "-C", "--cd",
@@ -32,6 +30,12 @@ const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
             "exec", "e", "review", "login", "logout", "mcp", "mcp-server", "app", "app-server",
             "completion", "sandbox", "debug", "apply", "a", "cloud", "features", "agents",
             "daemon", "help", "version", "update",
+        },
+        .variadic_arguments = {
+            {.argument = "-i", .requires_value = true, .attached_value_terminates = true,
+                .empty_values_allowed = false, .value_separator = ','},
+            {.argument = "--image", .requires_value = true, .attached_value_terminates = true,
+                .empty_values_allowed = false, .value_separator = ','},
         },
     };
     return rules;
