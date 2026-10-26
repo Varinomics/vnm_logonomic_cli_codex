@@ -239,7 +239,7 @@ void incomplete_histories(Packaged_host& host, const fs::path& path)
         check(update.compaction_count == 1 && !update.compaction_count_complete && update.used_tokens == 2400,
             "paginated/replaced/forked history preserves observed count and usage without promising full history");
     }
-    for (const auto suffix : {k_legacy, std::string("{\"type\":\"unknown_native_record\",\"payload\":{}}\n")}) {
+    for (const auto& suffix : {k_legacy, std::string("{\"type\":\"unknown_native_record\",\"payload\":{}}\n")}) {
         write(path, k_legacy + k_compacted + k_usage + suffix);
         check(!host.snapshot(path).compaction_count_complete, "repeated ownership or unknown native history remains incomplete");
     }
@@ -251,7 +251,7 @@ void incomplete_histories(Packaged_host& host, const fs::path& path)
 
 void optional_isolation(Packaged_host& host, const fs::path& path)
 {
-    for (const auto bytes : {
+    for (const auto& bytes : {
             std::string("{\"type\":\"session_meta\",\"payload\":{\"id\":\"other-session\"}}\n") + k_usage,
             k_legacy + "{\"type\":\"compacted\",\"payload\":{\"message\":null}}\n",
             k_legacy + "{\"type\":\"compacted\",\"type\":\"response_item\",\"payload\":{\"message\":\"x\"}}\n",
@@ -275,7 +275,7 @@ void optional_isolation(Packaged_host& host, const fs::path& path)
         "unnegotiated optional telemetry is omitted while lifecycle remains valid");
 
     request = host.request(path);
-    for (const auto invalid : {addon::Json_value(0), addon::Json_value(-1), addon::Json_value(1.5),
+    for (const auto& invalid : {addon::Json_value(0), addon::Json_value(-1), addon::Json_value(1.5),
             addon::Json_value(std::uint64_t{9007199254740992}), addon::Json_value("2")})
     {
         auto wire = addon::encode_classify_event_request(request);

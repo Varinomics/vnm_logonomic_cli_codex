@@ -119,7 +119,7 @@ void launcher_image_operand_contract()
         std::string without_bypass;
         std::string powershell_without_bypass = {};
     };
-    for (const Image_edit edit : {
+    for (const auto& edit : {
         Image_edit{R"(codex -i shot.png --yolo "describe the screenshot")",
             R"(codex -i=shot.png "describe the screenshot")",
             R"(codex '-i=shot.png' "describe the screenshot")"},
