@@ -58,6 +58,7 @@ endfunction()
 add_library(codex_provider STATIC
     src/codex_account_refresh.cpp
     src/codex_accounts.cpp
+    src/codex_context.cpp
     src/codex_conversation.cpp
     src/codex_conversation_source.cpp
     src/codex_current_account.cpp
@@ -79,7 +80,7 @@ codex_target(codex_provider)
 target_include_directories(codex_provider PUBLIC src)
 target_link_libraries(codex_provider PUBLIC logonomic_cli_addon_sdk::sdk)
 if(WIN32)
-    target_link_libraries(codex_provider PRIVATE ws2_32)
+    target_link_libraries(codex_provider PRIVATE ws2_32 shell32 ole32 uuid)
     if(MINGW)
         string(TOLOWER "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" codex_sdk_arch)
         if(codex_sdk_arch MATCHES "^(x64|x86_64|amd64)$")
@@ -207,14 +208,14 @@ codex_target(codex_session_wake_tests)
 add_dependencies(codex_session_wake_tests codex_fake_cli)
 add_test(NAME codex_session_wake_tests COMMAND codex_session_wake_tests "$<TARGET_FILE:codex_fake_cli>")
 set_tests_properties(codex_session_wake_tests PROPERTIES TIMEOUT 90)
-foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup_observation_tests codex_probe_tests codex_usage_tests)
+foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup_observation_tests codex_probe_tests codex_usage_tests codex_context_tests)
     add_executable(${test_name} "tests/${test_name}.cpp")
     target_link_libraries(${test_name} PRIVATE codex_provider)
     codex_target(${test_name})
     if(test_name STREQUAL "codex_probe_tests")
         add_dependencies(${test_name} codex_fake_cli codex_quota_helper)
         add_test(NAME ${test_name} COMMAND ${test_name} "$<TARGET_FILE:codex_fake_cli>" "$<TARGET_FILE:codex_quota_helper>")
-    elseif(test_name STREQUAL "codex_usage_tests" OR test_name STREQUAL "codex_lifecycle_tests")
+    elseif(test_name STREQUAL "codex_usage_tests" OR test_name STREQUAL "codex_lifecycle_tests" OR test_name STREQUAL "codex_context_tests")
         add_dependencies(${test_name} codex_package)
         add_test(NAME ${test_name} COMMAND ${test_name} "${CODEX_PACKAGE_DIRECTORY}")
     else()

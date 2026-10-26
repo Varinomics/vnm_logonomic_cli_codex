@@ -29,6 +29,7 @@ enum class Container_path
     PAYLOAD,
     INFO,
     TOTAL_TOKEN_USAGE,
+    LAST_TOKEN_USAGE,
 };
 
 enum class Container_state
@@ -47,6 +48,7 @@ enum class Projection_target
     ROOT_TYPE,
     ROOT_TIMESTAMP,
     ROOT_PAYLOAD,
+    ROOT_ORDINAL,
     PAYLOAD_ID,
     PAYLOAD_TIMESTAMP,
     PAYLOAD_FORKED_FROM_ID,
@@ -57,7 +59,16 @@ enum class Projection_target
     PAYLOAD_STARTED_AT,
     PAYLOAD_COMPLETED_AT,
     PAYLOAD_INFO,
+    PAYLOAD_HISTORY_MODE,
+    PAYLOAD_HISTORY_BASE,
+    PAYLOAD_FORKED_FROM_ORDINAL,
+    PAYLOAD_SUBAGENT_HISTORY_START,
+    PAYLOAD_MESSAGE,
+    PAYLOAD_REPLACEMENT_HISTORY,
     INFO_TOTAL_TOKEN_USAGE,
+    INFO_LAST_TOKEN_USAGE,
+    INFO_MODEL_CONTEXT_WINDOW,
+    CONTEXT_USED_TOKENS,
     USAGE_TOTAL_TOKENS,
     USAGE_INPUT_TOKENS,
     USAGE_OUTPUT_TOKENS,
@@ -90,6 +101,7 @@ struct Container_frame final
     Container_path path = Container_path::NONE;
     Container_state state = Container_state::KEY_OR_END;
     Projection_target target = Projection_target::NONE;
+    std::uint64_t seen_targets = 0;
 };
 
 bool json_whitespace(char byte)
@@ -114,10 +126,49 @@ bool hex_digit(char byte)
         (byte >= 'A' && byte <= 'F');
 }
 
+Projection_target context_target_for_key(Container_path path, const std::string& key)
+{
+    switch (path) {
+        case Container_path::ROOT:
+            if (key == "type")    { return Projection_target::ROOT_TYPE;    }
+            if (key == "payload") { return Projection_target::ROOT_PAYLOAD; }
+            if (key == "ordinal") { return Projection_target::ROOT_ORDINAL; }
+            break;
+        case Container_path::PAYLOAD:
+            if (key == "id")                             { return Projection_target::PAYLOAD_ID;                    }
+            if (key == "type")                           { return Projection_target::PAYLOAD_TYPE;                  }
+            if (key == "info")                           { return Projection_target::PAYLOAD_INFO;                  }
+            if (key == "history_mode")                   { return Projection_target::PAYLOAD_HISTORY_MODE;          }
+            if (key == "history_base")                   { return Projection_target::PAYLOAD_HISTORY_BASE;          }
+            if (key == "forked_from_id")                 { return Projection_target::PAYLOAD_FORKED_FROM_ID;        }
+            if (key == "forked_from_ordinal_exclusive")   { return Projection_target::PAYLOAD_FORKED_FROM_ORDINAL;   }
+            if (key == "subagent_history_start_ordinal") { return Projection_target::PAYLOAD_SUBAGENT_HISTORY_START; }
+            if (key == "message")                        { return Projection_target::PAYLOAD_MESSAGE;               }
+            if (key == "replacement_history")            { return Projection_target::PAYLOAD_REPLACEMENT_HISTORY;   }
+            break;
+        case Container_path::INFO:
+            if (key == "last_token_usage")     { return Projection_target::INFO_LAST_TOKEN_USAGE;     }
+            if (key == "model_context_window") { return Projection_target::INFO_MODEL_CONTEXT_WINDOW; }
+            break;
+        case Container_path::LAST_TOKEN_USAGE:
+            if (key == "total_tokens") {
+                return Projection_target::CONTEXT_USED_TOKENS;
+            }
+            break;
+        default:
+            break;
+    }
+    return Projection_target::NONE;
+}
+
 Projection_target target_for_key(
     Container_path path,
-    const std::string& key)
+    const std::string& key,
+    Jsonl_projection projection)
 {
+    if (projection == Jsonl_projection::CONTEXT) {
+        return context_target_for_key(path, key);
+    }
     switch (path) {
     case Container_path::ROOT:
         if (key == "type") {
@@ -182,6 +233,7 @@ Projection_target target_for_key(
         }
         break;
     case Container_path::NONE:
+    case Container_path::LAST_TOKEN_USAGE:
         break;
     }
     return Projection_target::NONE;
@@ -196,6 +248,8 @@ Container_path object_path_for_target(Projection_target target)
         return Container_path::INFO;
     case Projection_target::INFO_TOTAL_TOKEN_USAGE:
         return Container_path::TOTAL_TOKEN_USAGE;
+    case Projection_target::INFO_LAST_TOKEN_USAGE:
+        return Container_path::LAST_TOKEN_USAGE;
     default:
         return Container_path::NONE;
     }
@@ -210,6 +264,8 @@ std::string target_key(Projection_target target)
         return "timestamp";
     case Projection_target::ROOT_PAYLOAD:
         return "payload";
+    case Projection_target::ROOT_ORDINAL:
+        return "ordinal";
     case Projection_target::PAYLOAD_ID:
         return "id";
     case Projection_target::PAYLOAD_TIMESTAMP:
@@ -230,8 +286,26 @@ std::string target_key(Projection_target target)
         return "completed_at";
     case Projection_target::PAYLOAD_INFO:
         return "info";
+    case Projection_target::PAYLOAD_HISTORY_MODE:
+        return "history_mode";
+    case Projection_target::PAYLOAD_HISTORY_BASE:
+        return "history_base";
+    case Projection_target::PAYLOAD_FORKED_FROM_ORDINAL:
+        return "forked_from_ordinal_exclusive";
+    case Projection_target::PAYLOAD_SUBAGENT_HISTORY_START:
+        return "subagent_history_start_ordinal";
+    case Projection_target::PAYLOAD_MESSAGE:
+        return "message";
+    case Projection_target::PAYLOAD_REPLACEMENT_HISTORY:
+        return "replacement_history";
     case Projection_target::INFO_TOTAL_TOKEN_USAGE:
         return "total_token_usage";
+    case Projection_target::INFO_LAST_TOKEN_USAGE:
+        return "last_token_usage";
+    case Projection_target::INFO_MODEL_CONTEXT_WINDOW:
+        return "model_context_window";
+    case Projection_target::CONTEXT_USED_TOKENS:
+        return "total_tokens";
     case Projection_target::USAGE_TOTAL_TOKENS:
         return "total_tokens";
     case Projection_target::USAGE_INPUT_TOKENS:
@@ -261,8 +335,10 @@ addon::Json_value object_member(const addon::Json_value& object, std::string_vie
 
 struct Codex_jsonl_projector::Impl final
 {
-    explicit Impl(Record_handler handler)
-        : record_handler(std::move(handler))
+    Impl(Record_handler handler, Jsonl_projection selected_projection)
+    :
+        record_handler(std::move(handler)),
+        projection(selected_projection)
     {
     }
 
@@ -299,6 +375,7 @@ struct Codex_jsonl_projector::Impl final
         case Projection_target::ROOT_TYPE:
         case Projection_target::ROOT_TIMESTAMP:
         case Projection_target::ROOT_PAYLOAD:
+        case Projection_target::ROOT_ORDINAL:
             projected.set(key, value);
             return;
         case Projection_target::PAYLOAD_ID:
@@ -310,13 +387,21 @@ struct Codex_jsonl_projector::Impl final
         case Projection_target::PAYLOAD_TURN_ID:
         case Projection_target::PAYLOAD_STARTED_AT:
         case Projection_target::PAYLOAD_COMPLETED_AT:
-        case Projection_target::PAYLOAD_INFO: {
+        case Projection_target::PAYLOAD_INFO:
+        case Projection_target::PAYLOAD_HISTORY_MODE:
+        case Projection_target::PAYLOAD_HISTORY_BASE:
+        case Projection_target::PAYLOAD_FORKED_FROM_ORDINAL:
+        case Projection_target::PAYLOAD_SUBAGENT_HISTORY_START:
+        case Projection_target::PAYLOAD_MESSAGE:
+        case Projection_target::PAYLOAD_REPLACEMENT_HISTORY: {
             addon::Json_value payload = object_member(projected, "payload");
             payload.set(key, value);
             projected.set("payload", payload);
             return;
         }
-        case Projection_target::INFO_TOTAL_TOKEN_USAGE: {
+        case Projection_target::INFO_TOTAL_TOKEN_USAGE:
+        case Projection_target::INFO_LAST_TOKEN_USAGE:
+        case Projection_target::INFO_MODEL_CONTEXT_WINDOW: {
             addon::Json_value payload = object_member(projected, "payload");
             addon::Json_value info = object_member(payload, "info");
             info.set(key, value);
@@ -324,15 +409,18 @@ struct Codex_jsonl_projector::Impl final
             projected.set("payload", payload);
             return;
         }
+        case Projection_target::CONTEXT_USED_TOKENS:
         case Projection_target::USAGE_TOTAL_TOKENS:
         case Projection_target::USAGE_INPUT_TOKENS:
         case Projection_target::USAGE_OUTPUT_TOKENS:
         case Projection_target::USAGE_CACHED_INPUT_TOKENS: {
             addon::Json_value payload = object_member(projected, "payload");
             addon::Json_value info = object_member(payload, "info");
-            addon::Json_value usage = object_member(info, "total_token_usage");
+            const auto* usage_key = target == Projection_target::CONTEXT_USED_TOKENS
+                ? "last_token_usage" : "total_token_usage";
+            addon::Json_value usage = object_member(info, usage_key);
             usage.set(key, value);
-            info.set("total_token_usage", usage);
+            info.set(usage_key, usage);
             payload.set("info", info);
             projected.set("payload", payload);
             return;
@@ -420,6 +508,11 @@ struct Codex_jsonl_projector::Impl final
             ? !frames.empty() &&
                 frames.back().path != Container_path::NONE
             : target != Projection_target::NONE;
+        if (!key && target == Projection_target::PAYLOAD_MESSAGE) {
+            // A compaction marker needs the message's type, never its summary text.
+            assign(target, addon::Json_value(""));
+            capture_token = false;
+        }
         token_bytes.clear();
         if (capture_token) {
             token_bytes.push_back('"');
@@ -580,7 +673,14 @@ struct Codex_jsonl_projector::Impl final
             }
             if (!frames.empty()) {
                 Container_frame& frame = frames.back();
-                frame.target = target_for_key(frame.path, key);
+                frame.target = target_for_key(frame.path, key, projection);
+                if (projection == Jsonl_projection::CONTEXT && frame.target != Projection_target::NONE) {
+                    const auto bit = std::uint64_t{1} << static_cast<unsigned>(frame.target);
+                    if ((frame.seen_targets & bit) != 0) {
+                        invalid = true;
+                    }
+                    frame.seen_targets |= bit;
+                }
                 frame.state = Container_state::COLON;
             }
         }
@@ -979,6 +1079,7 @@ struct Codex_jsonl_projector::Impl final
     }
 
     Record_handler record_handler;
+    Jsonl_projection projection;
     std::vector<Container_frame> frames;
     addon::Json_value projected = addon::Json_value::object();
     std::string token_bytes;
@@ -1002,8 +1103,9 @@ struct Codex_jsonl_projector::Impl final
     bool line_started = false;
 };
 
-Codex_jsonl_projector::Codex_jsonl_projector(Record_handler record_handler)
-    : m_impl(std::make_unique<Impl>(std::move(record_handler)))
+Codex_jsonl_projector::Codex_jsonl_projector(Record_handler record_handler, Jsonl_projection projection)
+:
+    m_impl(std::make_unique<Impl>(std::move(record_handler), projection))
 {
 }
 

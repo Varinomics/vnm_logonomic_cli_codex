@@ -63,7 +63,10 @@ std::vector<std::string> hook_arguments()
     const std::string command = "sh -c 'if [ -n \"$LOGONOMIC_SESSION_CAPABILITY\" ] && [ -x \"$LOGONOMIC_PROVIDER_HELPERS_DIR/codex_helper\" ]; then \"$LOGONOMIC_PROVIDER_HELPERS_DIR/codex_helper\"; fi; exit 0'";
 #endif
     std::vector<std::string> result;
-    for (const std::string name : {"SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest", "SubagentStart", "SubagentStop"}) {
+    for (const std::string name : {
+            "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest",
+            "SubagentStart", "SubagentStop", "PostCompact"})
+    {
         result.push_back("-c");
         result.push_back("hooks." + name + "=[{hooks=[{type=\"command\",command=" + toml_string(command) +
             ",timeout=" + (name == "SessionEnd" || name == "Interrupt" ? "3" : "10") + "}]}]");

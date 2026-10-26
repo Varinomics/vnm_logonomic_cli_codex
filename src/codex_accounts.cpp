@@ -7,10 +7,15 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <shlobj.h>
+#else
+#include <pwd.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +54,29 @@ std::optional<std::string> environment_value(const addon::Json_value& environmen
 
 } // namespace
 
+std::string native_home_fallback()
+{
+#if defined(_WIN32)
+    // dirs 6 uses the known profile folder, irrespective of HOME/USERPROFILE.
+    PWSTR path = nullptr;
+    const auto status = SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &path);
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> profile(path, CoTaskMemFree);
+    if (FAILED(status)) {
+        return {};
+    }
+    return path_text(fs::path(profile.get()));
+#else
+    const auto size = sysconf(_SC_GETPW_R_SIZE_MAX);
+    std::vector<char> buffer(size < 0 ? 512 : static_cast<std::size_t>(size));
+    passwd entry{};
+    passwd* result = nullptr;
+    if (getpwuid_r(getuid(), &entry, buffer.data(), buffer.size(), &result) != 0 || !result) {
+        return {};
+    }
+    return entry.pw_dir;
+#endif
+}
+
 std::string profile_account_key(std::string_view absolute_path)
 {
     fs::path path = addon::path_from_utf8(absolute_path).lexically_normal();
@@ -85,9 +113,13 @@ std::optional<Profile_selection> profile_from_environment(const addon::Launch_en
     // Shell assignments have already been expanded in the host's frozen environment.
     std::string profile = environment_value(environment.effective_environment, "CODEX_HOME", windows).value_or("");
     if (profile.empty()) {
-        const auto home = environment_value(environment.effective_environment, windows ? "USERPROFILE" : "HOME", windows);
-        if (!home && fallback.empty()) { *error = "profile_unavailable"; return std::nullopt; }
-        profile = path_text(addon::path_from_utf8(home.value_or(std::string(fallback))) / ".codex");
+        std::string home = windows ? std::string{} :
+            environment_value(environment.effective_environment, "HOME", false).value_or("");
+        if (home.empty()) {
+            home = fallback;
+        }
+        if (home.empty()) { *error = "profile_unavailable"; return std::nullopt; }
+        profile = path_text(addon::path_from_utf8(home) / ".codex");
     }
     fs::path path = addon::path_from_utf8(profile);
     if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;
@@ -121,7 +153,7 @@ void handle_accounts(addon::Invocation_context& context)
     if (!request) { context.fail(addon::Result_status::FAILED, failure.reason_code); return; }
     std::string error;
     const auto selected = profile_selection(request->launch_environment, request->launcher,
-        request->default_home_fallback, request->normalization_directory, &error);
+        native_home_fallback(), request->normalization_directory, &error);
     if (!selected) { context.fail(addon::Result_status::FAILED, error); return; }
     if (context.request().operation == addon::k_accounts_discover_operation) {
         std::error_code failure;

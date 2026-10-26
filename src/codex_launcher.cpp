@@ -1,4 +1,5 @@
 #include "codex_launcher.h"
+#include "codex_accounts.h"
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -73,27 +74,17 @@ struct Configured_codex_home
 };
 
 std::optional<Configured_codex_home> configured_codex_home(
-    const addon::Discover_request& request,
-    const Environment& environment)
+    const addon::Discover_request& request)
 {
-    std::string configured = addon::environment_value(environment, "CODEX_HOME");
-    if (configured.empty()) {
-        const bool windows = request.platform_id.starts_with("windows-");
-        std::string home = addon::environment_value(
-            environment, windows ? "USERPROFILE" : "HOME");
-        if (home.empty()) {
-            home = request.default_home_fallback;
-        }
-        if (home.empty()) {
-            return std::nullopt;
-        }
-        configured = path_text(addon::path_from_utf8(home) / ".codex");
-    }
-
-    fs::path path = addon::path_from_utf8(configured);
-    if (!path.is_absolute()) {
+    addon::Launch_environment environment;
+    environment.platform_id           = request.platform_id;
+    environment.effective_environment = request.ambient_environment;
+    std::string profile_error;
+    const auto selected = profile_from_environment(environment, native_home_fallback(), {}, &profile_error);
+    if (!selected) {
         return std::nullopt;
     }
+    const fs::path path = addon::path_from_utf8(selected->profile_path);
     Configured_codex_home home;
     home.scan_path = path.lexically_normal();
     std::error_code error;
@@ -359,7 +350,7 @@ std::vector<addon::Launcher_candidate> discover_launchers(
         return {};
     }
 
-    const auto selected_home = configured_codex_home(request, environment);
+    const auto selected_home = configured_codex_home(request);
     const std::vector<fs::path> profiles = selected_home
         ? authenticated_codex_profiles(*selected_home, out_profile_stats)
         : std::vector<fs::path>{};

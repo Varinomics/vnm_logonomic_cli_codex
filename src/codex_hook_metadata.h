@@ -1,6 +1,8 @@
 #pragma once
 
 #include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/json_utilities.h>
+#include <logonomic_cli_addon/limits.h>
 
 #include <initializer_list>
 
@@ -14,6 +16,11 @@ inline logonomic::cli_addon::Json_value hook_metadata(const logonomic::cli_addon
         if (const auto* value = event.find(field)) {
             result.set(field, *value);
         }
+    }
+    if (const auto* transcript = event.find("transcript_path"); transcript &&
+        logonomic::cli_addon::json::bounded_string(*transcript, addon::limits::k_max_start_absolute_path_bytes))
+    {
+        result.set("transcript_path", *transcript);
     }
     const auto* name = event.find("hook_event_name");
     if (name && name->is_string() && name->as_string() == "Stop" && !event.find("agent_id")) {

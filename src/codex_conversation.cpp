@@ -140,6 +140,19 @@ bool content_blocks(const Json& content, std::vector<Block>& blocks, Kind text_k
     return true;
 }
 
+bool contextual_user_fragment(const Json& part)
+{
+    if (json::text(part, "type") != "input_text") {
+        return false;
+    }
+    // Native context recognition uses paired markers even in histories without
+    // per-part attribution. Ordinary mentions of these tags remain discussion.
+    const auto text = addon::lower(addon::trim(json::text(part, "text")));
+    return
+        (text.starts_with("# agents.md instructions") && text.ends_with("</instructions>")) ||
+        (text.starts_with("<environment_context>") && text.ends_with("</environment_context>"));
+}
+
 bool response_message(const Json& item, Message& message, addon::Contract_failure* failure)
 {
     const auto type = json::text(item, "type");
@@ -185,7 +198,8 @@ bool response_message(const Json& item, Message& message, addon::Contract_failur
         if (message.role.empty()) {
             return fail(failure, "conversation_content_invalid", "A Codex message has no role.");
         }
-        if (!content_blocks(json::member(item, "content"), message.content, Kind::TEXT, {}, failure)) {
+        const auto& content = json::member(item, "content");
+        if (!content_blocks(content, message.content, Kind::TEXT, {}, failure)) {
             return false;
         }
         if (message.role == "assistant") {
@@ -193,8 +207,10 @@ bool response_message(const Json& item, Message& message, addon::Contract_failur
             message.phase = phase == "final_answer" ? Phase::FINAL
                 : phase == "commentary" ? Phase::COMMENTARY : Phase::UNKNOWN;
         }
-        for (auto& block : message.content) {
-            block.compact_visible = message.role == "user" ||
+        for (std::size_t index = 0; index < message.content.size(); ++index) {
+            const bool user_context = message.role == "user" && content.is_array() &&
+                contextual_user_fragment(content.as_array()[index]);
+            message.content[index].compact_visible = (message.role == "user" && !user_context) ||
                 (message.role == "assistant" && message.phase != Phase::COMMENTARY);
         }
         return true;

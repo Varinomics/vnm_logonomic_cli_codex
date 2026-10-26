@@ -10,7 +10,13 @@
 
 namespace codex {
 
-// Projects only usage-bearing metadata while validating every JSON token.
+enum class Jsonl_projection
+{
+    USAGE,
+    CONTEXT,
+};
+
+// Projects selected native metadata while validating every JSON token.
 // Ignored prompts/tool output never accumulate in memory, including on a line
 // much larger than a transport frame. An incomplete final line is not a record.
 class Codex_jsonl_projector final
@@ -18,7 +24,7 @@ class Codex_jsonl_projector final
 public:
     using Record_handler = std::function<bool(const logonomic::cli_addon::Json_value&)>;
 
-    explicit Codex_jsonl_projector(Record_handler handler);
+    explicit Codex_jsonl_projector(Record_handler handler, Jsonl_projection projection = Jsonl_projection::USAGE);
     ~Codex_jsonl_projector();
     Codex_jsonl_projector(const Codex_jsonl_projector&) = delete;
     Codex_jsonl_projector& operator=(const Codex_jsonl_projector&) = delete;

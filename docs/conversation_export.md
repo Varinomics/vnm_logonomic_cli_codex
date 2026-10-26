@@ -32,8 +32,15 @@ and [loaded-thread resume path](https://github.com/openai/codex/blob/rust-v0.160
 
 ## Native history selection and rendering
 
-Source selection uses the original selected account profile, or the frozen
-`CODEX_HOME` / `HOME` / `USERPROFILE` environment when no account was selected.
+Source selection uses the original selected account profile, or a nonempty
+frozen `CODEX_HOME` (then nonempty `HOME` on Unix) when no account was selected.
+Live account and launcher discovery share Codex's native default: the Windows
+known profile folder, or nonempty Unix `HOME` followed by the OS account home.
+Empty `CODEX_HOME` selects that default. `USERPROFILE` does not override the
+Windows known folder. Preparation pins the selected account as `CODEX_HOME`.
+Historical exports never substitute today's OS home or selected account;
+without a usable frozen source they remain unavailable. The retained
+environment keeps absent and present empty values distinct.
 Preparation resolves and pins Codex's native state store through its existing
 configuration reader, including ordinary launches without a wake request.
 The provider's `VNM_CODEX_EXPORT_SQLITE_HOME` environment entry retains that
@@ -66,9 +73,11 @@ its original position, replacing its routing envelope and opaque payload.
 Consecutive encrypted messages remain separate, including conversations whose
 messages are all encrypted. Plaintext inter-agent messages retain their text.
 
-Compact extraction keeps user content and assistant replies whose native phase
-is `final_answer`, and omits explicit `commentary`, reasoning, tool traffic and
-plaintext inter-agent messages. Assistant text without a recognized phase is
+Compact extraction keeps user discussion and assistant replies whose native phase
+is `final_answer`, and omits injected AGENTS.md and environment context, explicit
+`commentary`, reasoning, tool traffic and plaintext inter-agent messages.
+The native paired context markers identify injected input fragments; full
+extraction preserves their canonical text and user role. Assistant text without a recognized phase is
 retained conservatively; it is not guessed to be progress from its wording or
 position. Every encrypted-message placeholder remains in both modes. Unchecking
 Compact extracts the full retained discussion again from the native source;
@@ -93,10 +102,17 @@ unavailable; neighboring or superseded JSONL files are never substitutes.
 
 ## Native schema and test oracle
 
-The native interpretation follows these upstream definitions:
+Home selection follows the
+[native resolver](https://github.com/openai/codex/blob/6ee64d49c29d99a84c3bd9cc7a80a5b20c27f125/codex-rs/utils/home-dir/src/lib.rs), using
+[dirs 6.0.0 on Windows](https://github.com/dirs-dev/dirs-rs/blob/00511bdc252f491a72ac89f6d6a2463406266fb2/src/win.rs) and
+[dirs-sys 0.5.0 OS lookup](https://github.com/dirs-dev/dirs-sys-rs/blob/8bcd4aa2c35990d57a2cff2953793525fc42709c/src/lib.rs).
+
+The rollout interpretation follows these upstream definitions:
 
 - [Rollout payload serialization](https://github.com/openai/codex/blob/main/codex-rs/history/src/rollout_payload.rs)
 - [Response item and content types](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs)
+- [Injected user instructions](https://github.com/openai/codex/blob/main/codex-rs/core/src/context/user_instructions.rs)
+- [Context fragment markers](https://github.com/openai/codex/blob/main/codex-rs/context-fragments/src/fragment.rs)
 - [First-metadata identity and fork replay](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/recorder.rs)
 - [Rollback semantics](https://github.com/openai/codex/blob/main/codex-rs/core/src/thread_rollout_truncation.rs)
 - [Explicit turn replay and rollback](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/thread_history.rs)
