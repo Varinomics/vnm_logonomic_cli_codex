@@ -116,6 +116,17 @@ std::string question_request_id(const std::string& session, const std::string& t
     return "codex-question-" + addon::provider_event_evidence_digest_hex(identity);
 }
 
+std::string permission_request_id(const std::string& session, const std::string& turn)
+{
+    // PermissionRequest has no native call ID. The TUI presents concurrent
+    // approvals in one overlay, so retain one presentation candidate per turn.
+    addon::Provider_event identity;
+    identity.name = "PermissionRequest";
+    identity.body.set("session_id", addon::Json_value(session));
+    identity.body.set("turn_id", addon::Json_value(turn));
+    return "codex-permission-" + addon::provider_event_evidence_digest_hex(identity);
+}
+
 bool exact_members(const addon::Json_value& value, std::initializer_list<std::string_view> names)
 {
     return value.is_object() && value.as_object().size() == names.size() &&
@@ -154,6 +165,24 @@ bool action_required_title(std::string_view title)
     return false;
 }
 
+bool progress_title(std::string_view title)
+{
+    constexpr std::string_view microphone = "\xe2\x97\x8f ";
+    if (title.starts_with(microphone)) {
+        title.remove_prefix(microphone.size());
+    }
+    // Codex suppresses these native activity frames while an approval overlay
+    // requires action. An arbitrary nonmatching or unavailable title proves nothing.
+    for (const std::string_view frame : {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}) {
+        if (title.starts_with(frame) &&
+            (title.size() == frame.size() || title[frame.size()] == ' '))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<addon::Attention_classification_result> classify_native_signal(
     const addon::Attention_classification_request& request)
 {
@@ -168,8 +197,10 @@ std::optional<addon::Attention_classification_result> classify_native_signal(
     }
     const auto& terminal = *body.find("terminal_event");
     const auto& candidate = *body.find("candidate");
+    const bool permission = exact_members(candidate, {"session_id", "turn_id", "attention_kind"}) &&
+        metadata(candidate, "attention_kind") == "permission";
     if (!exact_members(terminal, {"terminal_id", "generation", "source", "stream", "stream_index", "timestamp", "payload"}) ||
-        !exact_members(candidate, {"session_id", "turn_id", "tool_use_id"}) ||
+        (!permission && !exact_members(candidate, {"session_id", "turn_id", "tool_use_id"})) ||
         !positive_decimal(*terminal.find("terminal_id")) || !positive_decimal(*terminal.find("generation")) ||
         *terminal.find("source") != addon::Json_value("logonomic_terminal_worker") ||
         *terminal.find("stream") != addon::Json_value("terminal") ||
@@ -188,7 +219,7 @@ std::optional<addon::Attention_classification_result> classify_native_signal(
     const auto turn    = metadata(candidate, "turn_id");
     const auto call    = metadata(candidate, "tool_use_id");
     const auto& ledger = request.base.ledger;
-    if (!session || !turn || !call || !ledger.current_epoch || !ledger.current_transition ||
+    if (!session || !turn || (!permission && !call) || !ledger.current_epoch || !ledger.current_transition ||
         ledger.current_transition->provider_session_id != *session)
     {
         return std::nullopt;
@@ -198,21 +229,26 @@ std::optional<addon::Attention_classification_result> classify_native_signal(
         return std::nullopt;
     }
     addon::Attention_classification_result result;
-    // Empty, unavailable and nonmatching titles withdraw corroboration only.
-    // They are neither an answer nor a model-readiness observation.
-    if (title.is_null() || !action_required_title(title.as_string())) {
+    const bool required = title.is_string() && action_required_title(title.as_string());
+    const bool resumed  = permission && title.is_string() && progress_title(title.as_string());
+    // Permission status can be absent from a customized title. Only an explicit
+    // native activity frame distinguishes resumption from missing observation.
+    if (!required && !resumed) {
         return result;
     }
     addon::Lifecycle_observation observation;
     observation.provider_event_name   = request.base.event.name;
     observation.provider_session_id   = *session;
     observation.provider_turn_id      = *turn;
-    observation.attention_request_id  = question_request_id(*session, *turn, *call);
-    observation.attention_transition  = addon::Attention_transition::REQUESTED;
+    observation.attention_request_id  = permission
+        ? permission_request_id(*session, *turn)
+        : question_request_id(*session, *turn, *call);
+    observation.attention_transition  = required
+        ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED;
     observation.attention_evidence    = addon::Evidence::INFERRED;
     result.base.classification = addon::Classification::EVENT;
     result.base.observations.push_back(std::move(observation));
-    result.attention_kind = addon::Attention_kind{0, "interactive_question"};
+    result.attention_kind = addon::Attention_kind{0, permission ? "permission" : "interactive_question"};
     return result;
 }
 
@@ -338,7 +374,9 @@ std::optional<addon::Attention_classification_result> classify_attention(
         }
         else
         if (event.name == "PermissionRequest") {
-            result.attention_kind = addon::Attention_kind{0, "permission"};
+            observation.attention_request_id = permission_request_id(
+                observation.provider_session_id, observation.provider_turn_id);
+            result.attention_kind = addon::Attention_kind{0, "permission_candidate"};
         }
         return result;
     }

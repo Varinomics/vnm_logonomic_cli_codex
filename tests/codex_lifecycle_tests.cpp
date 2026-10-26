@@ -24,6 +24,91 @@ bool check(bool condition, const char* message)
     return condition;
 }
 
+bool permission_title_corroboration()
+{
+    // Oracle: the native approval overlay remains Action Required while its
+    // approval queue is nonempty, independently of allow, deny or cancellation.
+    addon::Attention_classification_request request;
+    request.base.event.name = "PermissionRequest";
+    request.base.event.body = *addon::parse_json(R"({
+        "hook_event_name":"PermissionRequest","session_id":"session-a","turn_id":"turn-a"
+    })", {}, nullptr);
+    auto result = codex::classify_attention(request);
+    if (!check(result && result->attention_kind && result->base.observations.size() == 1 &&
+        result->attention_kind->kind == "permission_candidate" &&
+        !result->base.observations.front().attention_request_id.empty(),
+        "Permission attention has no candidate identity for native-title withdrawal"))
+    {
+        return false;
+    }
+    const auto identity = result->base.observations.front().attention_request_id;
+    const auto repeated = codex::classify_attention(request);
+    bool ok = check(repeated && repeated->base.observations.front().attention_request_id == identity,
+        "Concurrent approval requests did not share their native overlay candidate");
+    request.base.event.body.set("turn_id", addon::Json_value("turn-b"));
+    const auto later = codex::classify_attention(request);
+    ok &= check(later && later->base.observations.front().attention_request_id != identity,
+        "Permission candidate identity crossed a turn boundary");
+    request.base.event.name = "NativeSignal";
+    request.base.ledger.current_epoch = 1;
+    request.base.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-a", std::string(64, 'a')};
+    request.base.event.body = *addon::parse_json(R"({
+        "origin":"host_terminal",
+        "terminal_event":{
+            "terminal_id":"17","generation":"2","source":"logonomic_terminal_worker",
+            "stream":"terminal","stream_index":0,"timestamp":1234.5,
+            "payload":{"kind":"terminal_title_changed","title_sequence":"8","title":null}
+        },
+        "candidate":{"session_id":"session-a","turn_id":"turn-a","attention_kind":"permission"}
+    })", {}, nullptr);
+    for (const auto title : {"[ ! ] Action Required", "[ . ] Action Required | project",
+             "[ ! ] Action Required | another approval"})
+    {
+        request.base.event.body.find("terminal_event")->find("payload")->set("title", addon::Json_value(title));
+        result = codex::classify_attention(request);
+        if (!check(result && result->attention_kind && result->base.observations.size() == 1 &&
+            result->attention_kind->kind == "permission",
+            "Native pending approval queue did not corroborate permission attention"))
+        {
+            return false;
+        }
+        const auto& observation = result->base.observations.front();
+        ok &= check(observation.attention_request_id == identity &&
+            observation.attention_transition == addon::Attention_transition::REQUESTED &&
+            observation.attention_evidence == addon::Evidence::INFERRED &&
+            observation.phase_transition == addon::Phase_transition::NONE &&
+            observation.outcome_transition == addon::Outcome_transition::NONE,
+            "Approval presentation changed identity, phase or outcome");
+    }
+    for (const auto& title : {addon::Json_value(), addon::Json_value(""), addon::Json_value("Working"),
+             addon::Json_value("Thinking | project"), addon::Json_value("Ready | project")})
+    {
+        request.base.event.body.find("terminal_event")->find("payload")->set("title", title);
+        result = codex::classify_attention(request);
+        ok &= check(result && result->base.observations.empty() && !result->attention_kind,
+            "Unavailable or customized title settled a pending approval");
+    }
+    for (const auto title : {"⠋", "⠙ thread | project", "⠹ Working | project", "● ⠸ thread"}) {
+        request.base.event.body.find("terminal_event")->find("payload")->set("title", addon::Json_value(title));
+        result = codex::classify_attention(request);
+        if (!check(result && result->attention_kind && result->base.observations.size() == 1,
+            "Native progress did not distinguish permission resumption from unavailable status"))
+        {
+            return false;
+        }
+        const auto& observation = result->base.observations.front();
+        ok &= check(result->attention_kind->kind == "permission" &&
+            observation.attention_request_id == identity &&
+            observation.attention_transition == addon::Attention_transition::RESOLVED &&
+            observation.attention_evidence == addon::Evidence::INFERRED &&
+            observation.phase_transition == addon::Phase_transition::NONE &&
+            observation.outcome_transition == addon::Outcome_transition::NONE,
+            "Native permission resumption invented phase, outcome or answer evidence");
+    }
+    return ok;
+}
+
 bool title_corroboration(const std::string& request_id)
 {
     // Oracle: root-approved host envelope and Codex TUI action-required title
@@ -243,9 +328,10 @@ bool conversational_stop()
     request.base.event.name = "PermissionRequest";
     request.base.event.body.set("hook_event_name", addon::Json_value("PermissionRequest"));
     result = codex::classify_attention(request);
-    ok &= check(result && result->attention_kind && result->attention_kind->kind == "permission" &&
+    ok &= check(result && result->attention_kind && result->attention_kind->kind == "permission_candidate" &&
         result->base.observations.front().attention_transition == addon::Attention_transition::REQUESTED &&
-        result->base.observations.front().attention_request_id.empty(),
+        !result->base.observations.front().attention_request_id.empty() &&
+        result->base.observations.front().attention_request_id != hint.attention_request_id,
         "Permission borrowed the pending conversational identity");
     return ok;
 }
@@ -376,7 +462,7 @@ bool question_hooks()
                 "Turn boundary no longer invalidates pending candidates");
         }
         if (std::string(name) == "PermissionRequest") {
-            ok &= check(result && result->attention_kind && result->attention_kind->kind == "permission",
+            ok &= check(result && result->attention_kind && result->attention_kind->kind == "permission_candidate",
                 "Permission request became a question");
         }
         else {
@@ -522,5 +608,5 @@ int main(int argc, char** argv)
         return 1;
     }
     const bool gated = declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
-    return question_hooks() && conversational_stop() && gated ? 0 : 1;
+    return permission_title_corroboration() && question_hooks() && conversational_stop() && gated ? 0 : 1;
 }
