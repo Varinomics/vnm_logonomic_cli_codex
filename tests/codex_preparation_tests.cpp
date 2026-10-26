@@ -564,7 +564,7 @@ int main(int argc, char** argv)
             throw std::runtime_error(failure.reason_code + ": " + failure.detail);
         }
         for (const std::string event : {"SessionStart", "SessionEnd", "UserPromptSubmit", "Stop",
-                "Interrupt", "PermissionRequest", "SubagentStart", "SubagentStop"})
+                "Interrupt", "PermissionRequest", "SubagentStart", "SubagentStop", "PostCompact"})
         {
             const auto prefix = "hooks." + event + "=";
             require(std::count_if(patch->argv->begin(), patch->argv->end(), [&](const auto& argument) {

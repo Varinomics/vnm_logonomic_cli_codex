@@ -1,5 +1,7 @@
 #include "codex_lifecycle.h"
 
+#include "codex_context.h"
+
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 
@@ -224,8 +226,9 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
         return std::nullopt;
     }
     addon::Classify_event_result result;
-    constexpr std::array<std::string_view, 8> supported{
-        "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest", "SubagentStart", "SubagentStop"};
+    constexpr std::array<std::string_view, 9> supported{
+        "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest",
+        "SubagentStart", "SubagentStop", "PostCompact"};
     if (std::find(supported.begin(), supported.end(), *name) == supported.end()) {
         return result;
     }
@@ -235,6 +238,15 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
     const auto session = metadata(body, "session_id");
     if (!session) {
         return std::nullopt;
+    }
+    if (const auto snapshot = context_snapshot(request)) {
+        result.context_updates.push_back(*snapshot);
+    }
+    if (request.context_failure && !body.find("agent_id")) {
+        result.context_failure = addon::Context_failure{*session, *request.context_failure};
+    }
+    if (*name == "PostCompact") {
+        return result;
     }
     addon::Lifecycle_observation observation;
     observation.provider_event_name = *name;
@@ -346,6 +358,12 @@ std::optional<addon::Attention_classification_result> classify_attention(
         (event.name == "PostToolUse" && !question_response(body, *ids)))
     {
         return std::nullopt;
+    }
+    if (const auto snapshot = context_snapshot(request.base)) {
+        result.base.context_updates.push_back(*snapshot);
+    }
+    if (request.base.context_failure) {
+        result.base.context_failure = addon::Context_failure{*session, *request.base.context_failure};
     }
     addon::Lifecycle_observation observation;
     observation.provider_event_name = event.name;
