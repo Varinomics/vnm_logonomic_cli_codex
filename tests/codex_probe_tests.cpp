@@ -106,6 +106,59 @@ void launcher_approval_contract()
     check(login.disposition == unsupported, "Codex management commands remain outside launcher editing");
 }
 
+void launcher_image_operand_contract()
+{
+    const auto& rules = codex::launcher_approval_rules();
+    const auto yolo = addon::Launcher_approval_action::YOLOFY;
+    const auto undo = addon::Launcher_approval_action::UNYOLOFY;
+
+    // Codex SharedCliOptions declares -i/--image with num_args = 1..;
+    // removing a separating approval flag can turn the prompt into an image.
+    // The launcher-approval contract requires preserving operand ownership.
+    for (const std::string script : {
+        R"(codex -i shot.png --yolo "describe the screenshot")",
+        R"(codex --image shot.png --dangerously-bypass-approvals-and-sandbox "describe the screenshot")",
+        R"(codex --image=shot.png --yolo "describe the screenshot")",
+        R"(codex -ishot.png --yolo "describe the screenshot")",
+        R"(codex -i first.png second.png --full-auto "describe the screenshots")",
+        "codex --yolo -i shot.png",
+        "codex -i shot.png",
+        R"(codex resume --last --image shot.png --yolo "describe the screenshot")",
+    }) {
+        for (const auto* runner : {"direct", "bash", "powershell", "cmd"}) {
+            const std::string platform = std::string(runner) == "bash" ? "linux-x86_64" : "windows-x86_64";
+            const addon::Launcher_request launcher{script, runner, ""};
+            for (const auto action : {undo, yolo}) {
+                const auto result = addon::transform_launcher_approval({launcher, platform, action}, rules);
+                check(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+                    result.script_body.empty(),
+                    ("image argument editing must be refused: " + script + " -> " +
+                        addon::serialize_json(addon::encode_launcher_approval_transform_result(result))).c_str());
+            }
+            const auto comparison = addon::launcher_approval_comparison_key({launcher, platform}, rules);
+            check(!comparison.supported && comparison.key.empty(),
+                "image argument ownership must not produce an approval comparison key");
+        }
+    }
+
+    for (const std::string arguments : {
+        R"(--add-dir "design assets" --add-dir docs "describe the workspace")",
+        R"(--model=--image "describe the workspace")",
+        R"(-- "--image")",
+    }) {
+        const auto removed = addon::transform_launcher_approval({
+            {"codex --yolo " + arguments, "direct", ""}, "windows-x86_64", undo}, rules);
+        check(removed.disposition == addon::Launcher_approval_disposition::CHANGED &&
+            removed.script_body == "codex " + arguments,
+            "single-value options and literal image-looking operands retain supported Unyolofy edits");
+        const auto added = addon::transform_launcher_approval({
+            {removed.script_body, "direct", ""}, "windows-x86_64", yolo}, rules);
+        check(added.disposition == addon::Launcher_approval_disposition::CHANGED &&
+            added.script_body == "codex --yolo " + arguments,
+            "single-value options and literal image-looking operands retain supported Yolofy edits");
+    }
+}
+
 void auth_output_is_exact_and_never_echoes_credentials()
 {
     addon::Probe_inspect_request request;
@@ -1228,6 +1281,7 @@ int main(int argc, char** argv)
     if (argc != 3) return 2;
     try {
         launcher_approval_contract();
+        launcher_image_operand_contract();
         auth_output_is_exact_and_never_echoes_credentials();
         current_account_identity_uses_selected_principal_workspace_and_backend();
         current_account_identity_reobserves_after_account_notifications();
