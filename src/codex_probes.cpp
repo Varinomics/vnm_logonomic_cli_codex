@@ -40,6 +40,18 @@ addon::Observation_scope scope(const addon::Probe_inspect_request& request)
     return result;
 }
 
+addon::Quota_inspect_result failed_quota_inspection(const addon::Probe_inspect_request& request)
+{
+    if (request.inspection.timed_out) {
+        return addon::make_quota_failure(addon::Quota_failure::TIMED_OUT, scope(request));
+    }
+    if (request.inspection.exit_code != 0) {
+        return addon::make_quota_failure(addon::Quota_failure::PROCESS_FAILED, scope(request),
+            addon::Quota_diagnostic{addon::Quota_failure_stage::PROCESS_EXIT, request.inspection.exit_code});
+    }
+    return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE, scope(request));
+}
+
 bool auth_record_valid(const addon::Json_value& value)
 {
     if (!value.is_object() || member(value, "version") != addon::Json_value(1)) return false;
@@ -138,12 +150,11 @@ addon::Quota_inspect_result inspect_quota(const addon::Probe_inspect_request& re
         exchange.consume(request.inspection.stdout_bytes) && exchange.finish())
     {
         result = quota_response(*exchange.response());
-        if (result.failure_reason) *failure_reason = *result.failure_reason;
     }
     else {
-        result.observation = addon::Quota_observation{};
-        result.observation->state = addon::Quota_status::FAILED;
+        result = failed_quota_inspection(request);
     }
+    *failure_reason = result.failure_reason.value_or("");
     result.observation->scope = scope(request);
     return result;
 }
@@ -194,12 +205,7 @@ std::optional<addon::Account_refresh_inspect_result> inspect_account_refresh(con
     if (result.complete) {
         if (!pending.empty()) return {};
         if (!quota_received) {
-            addon::Quota_inspect_result quota;
-            quota.complete = true;
-            quota.observation = addon::Quota_observation{};
-            quota.observation->scope = scope(request);
-            quota.observation->state = addon::Quota_status::FAILED;
-            result.quota = std::move(quota);
+            result.quota = failed_quota_inspection(request);
         }
         auto auth_request = request;
         auth_request.observe_current_account = true;
@@ -286,14 +292,14 @@ void handle_probes(addon::Invocation_context& context)
     if (account_refresh) {
         const auto result = inspect_account_refresh(*request);
         if (!result) { context.fail(addon::Result_status::FAILED, "invalid_account_refresh_output"); return; }
-        context.succeed(addon::encode_account_refresh_inspect_result(*result));
+        context.succeed(addon::encode_account_refresh_inspect_result(*result, request->report_quota_failure));
         return;
     }
     if (!quota) { context.succeed(addon::encode_auth_inspect_result(inspect_auth(*request))); return; }
     std::string reason;
     auto result = inspect_quota(*request, &reason);
     if (!reason.empty()) result.failure_reason = reason;
-    context.succeed(addon::encode_quota_inspect_result(result, 2));
+    context.succeed(addon::encode_quota_inspect_result(result, 2, request->report_quota_failure));
 }
 
 } // namespace codex
