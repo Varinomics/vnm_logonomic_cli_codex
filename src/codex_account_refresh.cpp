@@ -29,7 +29,7 @@ bool Account_refresh_exchange::record(std::string_view line)
     }
     if (m_quota.response()) {
         auto quota = quota_response(*m_quota.response());
-        auto payload = addon::encode_quota_inspect_result(quota, 2);
+        auto payload = addon::encode_quota_inspect_result(quota, 2, true);
         m_output += observation_record("quota", std::move(payload));
         m_auth.emplace(3);
     }

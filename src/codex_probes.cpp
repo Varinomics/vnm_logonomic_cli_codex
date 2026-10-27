@@ -292,14 +292,14 @@ void handle_probes(addon::Invocation_context& context)
     if (account_refresh) {
         const auto result = inspect_account_refresh(*request);
         if (!result) { context.fail(addon::Result_status::FAILED, "invalid_account_refresh_output"); return; }
-        context.succeed(addon::encode_account_refresh_inspect_result(*result));
+        context.succeed(addon::encode_account_refresh_inspect_result(*result, request->report_quota_failure));
         return;
     }
     if (!quota) { context.succeed(addon::encode_auth_inspect_result(inspect_auth(*request))); return; }
     std::string reason;
     auto result = inspect_quota(*request, &reason);
     if (!reason.empty()) result.failure_reason = reason;
-    context.succeed(addon::encode_quota_inspect_result(result, 2));
+    context.succeed(addon::encode_quota_inspect_result(result, 2, request->report_quota_failure));
 }
 
 } // namespace codex

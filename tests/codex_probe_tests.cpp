@@ -520,7 +520,7 @@ void quota_errors_remain_redacted()
     result = codex::inspect_quota(request, &failure);
     check(result.failure_reason && addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
         "malformed native quota values retain their response failure category");
-    const auto payload = addon::encode_quota_inspect_result(result, 2);
+    const auto payload = addon::encode_quota_inspect_result(result, 2, true);
     const auto decoded = addon::decode_quota_inspect_result(payload, true, nullptr, 2);
     check(decoded && decoded->failure_reason == result.failure_reason &&
         addon::serialize_json(payload).find("secret-canary") == std::string::npos,
@@ -533,6 +533,42 @@ void quota_errors_remain_redacted()
     const auto refresh = codex::inspect_account_refresh(combined);
     check(refresh && refresh->quota && refresh->quota->failure_reason == result.failure_reason && !refresh->auth,
         "separate and combined observations preserve the same cause without ending authentication");
+}
+
+// The host asks for the cause of a failed quota; one that did not ask gets a neutral failure.
+void quota_cause_crosses_only_when_asked()
+{
+    for (const bool combined : {false, true}) {
+        for (const bool asked : {false, true}) {
+            addon::Probe_inspect_request request;
+            request.report_quota_failure = asked;
+            request.observe_current_account = true;
+            request.inspection.final = true;
+            request.inspection.exit_code = 19;
+            Context context;
+            context.input = {"inspect", {combined ? addon::k_account_refresh_capability_id : "quota",
+                static_cast<std::uint16_t>(combined ? 1 : 2)},
+                "inspect", combined ? addon::encode_account_refresh_inspect_request(request)
+                                    : addon::encode_probe_inspect_request(request, 2)};
+            codex::handle_probes(context);
+            check(context.succeeded, "a failed native exit still completes the quota inspection");
+            std::optional<addon::Quota_inspect_result> quota;
+            if (combined) {
+                const auto refresh = addon::decode_account_refresh_inspect_result(context.output, true, nullptr);
+                check(refresh && refresh->auth, "the combined result keeps its authentication disposition");
+                quota = refresh->quota;
+            }
+            else {
+                quota = addon::decode_quota_inspect_result(context.output, true, nullptr, 2);
+            }
+            check(quota && quota->observation && quota->observation->state == addon::Quota_status::FAILED,
+                "a failed native exit is a failed quota observation");
+            const bool explained = quota && quota->failure_reason &&
+                addon::parse_quota_failure(*quota->failure_reason) == addon::Quota_failure::PROCESS_FAILED &&
+                quota->diagnostic && quota->diagnostic->code == 19;
+            check(explained == asked, "the process failure and its exit status cross only when the host asked");
+        }
+    }
 }
 
 void quota_requires_a_settled_valid_exchange()
@@ -1389,6 +1425,7 @@ int main(int argc, char** argv)
         current_account_helper_keeps_native_output_private(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         quota_protocol_and_optional_windows();
         quota_errors_remain_redacted();
+        quota_cause_crosses_only_when_asked();
         quota_requires_a_settled_valid_exchange();
         quota_helper_drains_native_completion(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         account_refresh_reuses_native_protocol_and_publishes_quota_first();

@@ -155,6 +155,7 @@ int main()
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 3},
         {"current-account", 1},
+        {addon::k_quota_failure_capability_id, addon::k_quota_failure_version},
         {addon::k_account_refresh_capability_id, addon::k_account_refresh_version},
         {addon::k_usage_cross_source_event_capability_id, addon::k_usage_cross_source_event_version},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
