@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace {
 
@@ -30,6 +32,18 @@ bool asks_for_changes(const logonomic::cli_addon::Json_value& event)
     for (const auto word : {"show", "open", "view", "display", "bring up", "pull up"}) presentation |= prompt.find(word) != std::string::npos;
     for (const auto word : {"changed file", "modified file", "edited file", "my changes", "your changes", "changes you made", "files you changed", "files you modified", "files you edited"}) changes |= prompt.find(word) != std::string::npos;
     return presentation && changes;
+}
+
+bool write_context(std::string_view event, const std::string& instruction)
+{
+    namespace addon = logonomic::cli_addon;
+    auto hook = addon::Json_value::object();
+    hook.set("hookEventName", addon::Json_value(std::string(event)));
+    hook.set("additionalContext", addon::Json_value(instruction));
+    auto output = addon::Json_value::object();
+    output.set("hookSpecificOutput", std::move(hook));
+    const auto bytes = addon::serialize_json(output) + '\n';
+    return std::fwrite(bytes.data(), 1, bytes.size(), stdout) == bytes.size() && std::fflush(stdout) == 0;
 }
 
 } // namespace
@@ -64,6 +78,21 @@ int main()
     const auto deadline = started + std::chrono::milliseconds(short_hook ? 1800 : 8000);
     const auto cancelled = [&] { return std::chrono::steady_clock::now() >= deadline; };
     addon::Helper_client client(*environment, cancelled);
+    const auto* tool = event->find("tool_name");
+    const bool question = tool && tool->is_string() && tool->as_string() == "request_user_input";
+    if (name->as_string() == "PreToolUse" && !question) {
+        // Ordinary tools supply a context checkpoint, not question or lifecycle evidence.
+        if (!event->find("agent_id")) {
+            const auto instruction = client.request_title_instruction("codex", name->as_string(), false,
+                addon::Model_context_delivery{});
+            if (instruction.completed && instruction.accepted && !instruction.instruction.empty() &&
+                !write_context(name->as_string(), instruction.instruction))
+            {
+                return addon::k_helper_exit_transport_failure;
+            }
+        }
+        return addon::k_helper_exit_committed;
+    }
     const auto key   = addon::random_nonce_hex();
     const auto nonce = addon::random_nonce_hex();
     const auto metadata = codex::hook_metadata(*event);
@@ -77,18 +106,14 @@ int main()
         std::fputs("Codex hook delivery was not accepted.\n", stderr);
     }
     bool title_accepted = true;
-    if (name->as_string() == "SessionStart" || name->as_string() == "UserPromptSubmit") {
+    if (!event->find("agent_id") &&
+        (name->as_string() == "SessionStart" || name->as_string() == "UserPromptSubmit"))
+    {
         const auto instruction = client.request_title_instruction("codex", name->as_string(),
-            name->as_string() == "UserPromptSubmit" && asks_for_changes(*event));
+            name->as_string() == "UserPromptSubmit" && asks_for_changes(*event), addon::Model_context_delivery{});
         title_accepted = instruction.completed && instruction.accepted;
         if (title_accepted && !instruction.instruction.empty()) {
-            auto hook = addon::Json_value::object();
-            hook.set("hookEventName", addon::Json_value(name->as_string()));
-            hook.set("additionalContext", addon::Json_value(instruction.instruction));
-            auto output = addon::Json_value::object();
-            output.set("hookSpecificOutput", std::move(hook));
-            const auto bytes = addon::serialize_json(output) + '\n';
-            if (std::fwrite(bytes.data(), 1, bytes.size(), stdout) != bytes.size() || std::fflush(stdout) != 0) {
+            if (!write_context(name->as_string(), instruction.instruction)) {
                 return addon::k_helper_exit_transport_failure;
             }
         }

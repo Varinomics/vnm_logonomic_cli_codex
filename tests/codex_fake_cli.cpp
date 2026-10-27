@@ -262,7 +262,22 @@ int main(int argc, char** argv)
                 std::cout << addon::serialize_json(object({{"id", *id}, {"error", object({{"code", Json(-32601)}, {"message", Json("unsupported")}})}})) << '\n' << std::flush;
                 continue;
             }
-            if (method == "thread/queue/list") result = object({{"data", Json::array()}, {"nextCursor", Json()}});
+            if (method == "thread/queue/list") {
+                auto data = Json::array();
+                const std::string scenario = wake_scenario ? wake_scenario : "";
+                const bool next_page = !text(*params, "cursor").empty();
+                const bool owned = scenario == "owned-pending" || (scenario == "owned-next-page" && next_page);
+                if (owned || scenario == "user-pending" || (scenario == "owned-next-page" && !next_page)) {
+                    data.push_back(object({{"id", Json("019933a1-6e43-7102-a520-b3c8294cc765")},
+                        {"clientUserMessageId", Json(owned ? "logonomic-wake:previous-notification" : "user-follow-up")},
+                        {"input", Json::array()}}));
+                }
+                if (scenario == "invalid-queue") {
+                    data.push_back(object({{"id", Json("missing-client-id")}}));
+                }
+                const bool more = scenario == "repeated-cursor" || (scenario == "owned-next-page" && !next_page);
+                result = object({{"data", std::move(data)}, {"nextCursor", more ? Json("following-page") : Json()}});
+            }
             else {
                 if (wake_scenario && std::string_view(wake_scenario) == "lost-reply") return 29;
                 if (wake_scenario && std::string_view(wake_scenario) == "malformed") {

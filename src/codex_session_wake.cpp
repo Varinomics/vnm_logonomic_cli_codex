@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <optional>
 #include <regex>
+#include <set>
+#include <string_view>
 
 namespace codex {
 namespace {
@@ -192,6 +195,45 @@ struct Bound_queue
     std::string sqlite_home;
 };
 
+constexpr std::string_view k_notification_prefix = "logonomic-wake:";
+
+std::optional<bool> notification_is_queued(
+    const Bound_queue& bound,
+    const addon::Session_wake_target& target,
+    addon::Invocation_context& context)
+{
+    auto parameters = object({{"threadId", Json(target.provider_session_id)}, {"limit", Json(100)}});
+    std::set<std::string> cursors;
+    while (!context.cancel_requested()) {
+        const auto response = call(bound.argv, bound.environment, target.working_directory,
+            "thread/queue/list", parameters, context, bound.sqlite_home);
+        const auto* data = response.result ? response.result->find("data") : nullptr;
+        if (!data || !data->is_array()) {
+            return std::nullopt;
+        }
+        for (const auto& submission : data->as_array()) {
+            const auto* client_id = submission.find("clientUserMessageId");
+            if (!submission.is_object() || !client_id || !client_id->is_string() ||
+                !canonical_uuid(text(submission, "id")))
+            {
+                return std::nullopt;
+            }
+            if (client_id->as_string().starts_with(k_notification_prefix)) {
+                return true;
+            }
+        }
+        const auto* cursor = response.result->find("nextCursor");
+        if (!cursor || cursor->is_null()) {
+            return false;
+        }
+        if (!cursor->is_string() || cursor->as_string().empty() || !cursors.insert(cursor->as_string()).second) {
+            return std::nullopt;
+        }
+        parameters.set("cursor", *cursor);
+    }
+    return std::nullopt;
+}
+
 std::optional<Bound_queue> bound_queue(const addon::Session_wake_target& target)
 {
     const auto& binding = target.binding;
@@ -309,10 +351,9 @@ void handle_session_wake(addon::Invocation_context& context)
         const auto bound = bound_queue(request->target);
         addon::Session_wake_readiness readiness{false, "wake_binding_unavailable"};
         if (bound) {
-            const auto response = call(bound->argv, bound->environment, request->target.working_directory,
-                "thread/queue/list", object({{"threadId", Json(request->target.provider_session_id)}, {"limit", Json(1)}}), context, bound->sqlite_home);
-            const auto* data = response.result ? response.result->find("data") : nullptr;
-            readiness = data && data->is_array() ? addon::Session_wake_readiness{true, {}}
+            const auto pending = notification_is_queued(*bound, request->target, context);
+            readiness = pending
+                ? addon::Session_wake_readiness{!*pending, *pending ? "native_notification_pending" : ""}
                 : addon::Session_wake_readiness{false, "native_queue_unavailable"};
         }
         context.succeed(addon::encode_session_wake_readiness(readiness));
@@ -327,16 +368,27 @@ void handle_session_wake(addon::Invocation_context& context)
     const auto bound = bound_queue(request->target);
     addon::Session_wake_notify_result result{addon::Session_wake_disposition::UNAVAILABLE, "wake_binding_unavailable", std::nullopt};
     if (bound) {
+        // Mailbox reads cannot retract a prompt already retained by the native queue.
+        // Check the queue again at submission, independently of earlier readiness.
+        const auto pending = notification_is_queued(*bound, request->target, context);
+        if (!pending || *pending) {
+            result.disposition = pending ? addon::Session_wake_disposition::DEFERRED
+                                         : addon::Session_wake_disposition::UNAVAILABLE;
+            result.reason = pending ? "native_notification_pending" : "native_queue_unavailable";
+            context.succeed(addon::encode_session_wake_notify_result(result));
+            return;
+        }
+        const auto client_id = std::string(k_notification_prefix) + request->notification_id;
         const auto input = Json(Json::Array{object({{"type", Json("text")}, {"text", Json(request->instruction)}, {"text_elements", Json::array()}})});
         const auto response = call(bound->argv, bound->environment, request->target.working_directory, "thread/queue/add",
             object({{"threadId", Json(request->target.provider_session_id)}, {"input", input},
-                {"clientUserMessageId", Json(request->notification_id)}}), context, bound->sqlite_home);
+                {"clientUserMessageId", Json(client_id)}}), context, bound->sqlite_home);
         result.reason = response.request_sent ? "native_queue_acceptance_unknown" : "native_queue_unavailable";
         result.disposition = response.request_sent ? addon::Session_wake_disposition::UNCERTAIN : addon::Session_wake_disposition::UNAVAILABLE;
         const auto* submission = response.result ? response.result->find("queuedSubmission") : nullptr;
         const auto* echo = submission ? submission->find("input") : nullptr;
         if (submission && canonical_uuid(text(*submission, "id")) &&
-            text(*submission, "clientUserMessageId") == request->notification_id && echo && *echo == input)
+            text(*submission, "clientUserMessageId") == client_id && echo && *echo == input)
         {
             result = {addon::Session_wake_disposition::ACCEPTED, {}, text(*submission, "id")};
         }

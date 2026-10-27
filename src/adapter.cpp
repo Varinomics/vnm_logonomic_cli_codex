@@ -150,6 +150,7 @@ int main()
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},
         {addon::k_session_wake_capability_id, addon::k_session_wake_version},
+        {addon::k_model_context_delivery_capability_id, addon::k_model_context_delivery_version},
         {"interactive-resume", 2}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},

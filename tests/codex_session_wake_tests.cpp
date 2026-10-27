@@ -200,13 +200,41 @@ int main(int argc, char** argv)
         auto sent = records(log, "thread/queue/add");
         require(sent.size() == 1 && text(sent.back(), "codex_home") == utf8(root) &&
             text(sent.back(), "sqlite_home") == utf8(root / "relative-store"), "Queue writer used another account/store");
+        require(text(*sent.back().find("request")->find("params"), "clientUserMessageId") ==
+            "logonomic-wake:wake-notification-1", "Native notification identity must retain its Logonomic ownership");
         require(records(log, "thread/resume").empty() && records(log, "turn/start").empty(), "Wake must never load or run another conversation");
+
+        for (const std::string scenario : {"owned-pending", "owned-next-page"}) {
+            auto pending = target;
+            pending.launch_environment.effective_environment.set("CODEX_FIXTURE_WAKE", Json(scenario));
+            const auto before = records(log, "thread/queue/add").size();
+            const auto readiness = inspect(pending);
+            const auto deferred = notify(pending);
+            require(!readiness.available && readiness.reason == "native_notification_pending" &&
+                deferred.disposition == addon::Session_wake_disposition::DEFERRED &&
+                deferred.reason == "native_notification_pending" && records(log, "thread/queue/add").size() == before,
+                "An owned native notification must suppress another wake, including after pagination");
+        }
+        for (const std::string scenario : {"invalid-queue", "repeated-cursor", "unsupported"}) {
+            auto unavailable_queue = target;
+            unavailable_queue.launch_environment.effective_environment.set("CODEX_FIXTURE_WAKE", Json(scenario));
+            const auto before = records(log, "thread/queue/add").size();
+            require(!inspect(unavailable_queue).available &&
+                notify(unavailable_queue).disposition == addon::Session_wake_disposition::UNAVAILABLE &&
+                records(log, "thread/queue/add").size() == before,
+                "An incomplete queue inspection must not submit native input");
+        }
+        auto user_pending = target;
+        user_pending.launch_environment.effective_environment.set("CODEX_FIXTURE_WAKE", Json("user-pending"));
+        require(inspect(user_pending).available &&
+            notify(user_pending).disposition == addon::Session_wake_disposition::ACCEPTED,
+            "Unrelated user input must retain its own queue semantics");
 
         target.launch_environment.effective_environment.set("CODEX_SQLITE_HOME", Json(utf8(root / "changed-store")));
         require(notify(target).disposition == addon::Session_wake_disposition::ACCEPTED, "Frozen store binding should survive environment/config drift");
         sent = records(log, "thread/queue/add");
         require(text(sent.back(), "sqlite_home") == utf8(root / "relative-store"), "New disk configuration moved an existing queue");
-        for (const std::string scenario : {"lost-reply", "malformed", "wrong-echo", "unsupported"}) {
+        for (const std::string scenario : {"lost-reply", "malformed", "wrong-echo"}) {
             const auto before = records(log, "thread/queue/add").size();
             auto uncertain = target;
             uncertain.launch_environment.effective_environment.set("CODEX_FIXTURE_WAKE", Json(scenario));

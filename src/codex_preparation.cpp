@@ -69,13 +69,15 @@ std::vector<std::string> hook_arguments()
     {
         result.push_back("-c");
         result.push_back("hooks." + name + "=[{hooks=[{type=\"command\",command=" + toml_string(command) +
-            ",timeout=" + (name == "SessionEnd" || name == "Interrupt" ? "3" : "10") + "}]}]");
+            ",timeout=" + (name == "SessionEnd" || name == "Interrupt" ? "3" : "10") +
+            (name == "SessionStart" || name == "UserPromptSubmit" ? ",additionalContextLimit=12000" : "") + "}]}]");
     }
-    for (const std::string name : {"PreToolUse", "PostToolUse"}) {
-        result.push_back("-c");
-        result.push_back("hooks." + name + "=[{matcher=\"^request_user_input$\",hooks=[{type=\"command\",command=" +
-            toml_string(command) + ",timeout=10}]}]");
-    }
+    result.push_back("-c");
+    result.push_back("hooks.PreToolUse=[{hooks=[{type=\"command\",command=" + toml_string(command) +
+        ",timeout=10,additionalContextLimit=12000}]}]");
+    result.push_back("-c");
+    result.push_back("hooks.PostToolUse=[{matcher=\"^request_user_input$\",hooks=[{type=\"command\",command=" +
+        toml_string(command) + ",timeout=10}]}]");
     return result;
 }
 

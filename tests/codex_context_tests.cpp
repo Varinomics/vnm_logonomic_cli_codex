@@ -1,4 +1,5 @@
 #include "codex_hook_metadata.h"
+#include "codex_launcher.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/context_state.h>
@@ -8,14 +9,21 @@
 #include <logonomic_cli_addon/package_source.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -86,6 +94,8 @@ public:
         const auto live = m_host.live_capabilities();
         check(std::find(live.begin(), live.end(), addon::Capability_pair{"context-state", 2}) != live.end(),
             "context-state@2 is declared and negotiated by the actual package");
+        check(std::find(live.begin(), live.end(), addon::Capability_pair{"model-context-delivery", 1}) != live.end(),
+            "quiet model context is declared and negotiated by the actual package");
         check(std::find(live.begin(), live.end(), addon::Capability_pair{"context-state", 1}) == live.end(),
             "the package does not promise the superseded context contract");
     }
@@ -316,6 +326,91 @@ void optional_isolation(Packaged_host& host, const fs::path& path)
         "large unrelated transcript payload is streamed without losing context evidence");
 }
 
+class Helper_context final : public addon::Invocation_context
+{
+public:
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override { return false; }
+    bool wait_for_cancel(int timeout) override
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+        return false;
+    }
+    void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
+    void succeed(addon::Json_value) override {}
+    void fail(addon::Result_status, std::string, std::string) override {}
+    bool finished() const override { return false; }
+
+private:
+    addon::Invoke_request m_request;
+};
+
+void helper_context(const fs::path& executable, const fs::path& package, const fs::path& fixture)
+{
+    const auto capture = fixture / "helper-requests.jsonl";
+    std::vector<std::pair<std::string, std::string>> environment;
+    for (const char* name : {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME"}) {
+        if (const char* value = std::getenv(name)) {
+            environment.emplace_back(name, value);
+        }
+    }
+    environment.emplace_back("LOGONOMIC_VNMCTL_PATH", addon::path_to_utf8(executable));
+    environment.emplace_back("LOGONOMIC_SESSION_CAPABILITY", std::string(64, 'a'));
+    environment.emplace_back("LOGONOMIC_PROVIDER_PACKAGE_ID", "logonomic.cli.codex");
+    environment.emplace_back("LOGONOMIC_PROVIDER_GENERATION_DIGEST", std::string(64, 'b'));
+    environment.emplace_back("LOGONOMIC_PROVIDER_GENERATION_NONCE", std::string(32, 'c'));
+    environment.emplace_back("LOGONOMIC_PROVIDER_HELPERS_DIR", addon::path_to_utf8(package / "helpers"));
+    environment.emplace_back("CODEX_CONTEXT_TEST_CAPTURE", addon::path_to_utf8(capture));
+#ifdef _WIN32
+    const auto helper = package / "helpers/codex_helper.exe";
+#else
+    const auto helper = package / "helpers/codex_helper";
+#endif
+    const auto run = [&](const addon::Json_value& event) {
+        write(capture, "");
+        Helper_context context;
+        addon::Probe_exchange exchange;
+        exchange.initial_input = addon::serialize_json(event);
+        exchange.complete = true;
+        const auto result = codex::run_probe({addon::path_to_utf8(helper)}, environment,
+            addon::path_to_utf8(fixture), 8000, context, &exchange);
+        check(result.has_value(), "the actual packaged context helper completes");
+        std::ifstream input(capture);
+        std::vector<addon::Json_value> records;
+        for (std::string line; std::getline(input, line);) {
+            records.push_back(json(line));
+        }
+        return std::pair{result->output, records};
+    };
+    auto event = json(R"({"hook_event_name":"PreToolUse","session_id":"session-a","turn_id":"turn-a","tool_name":"Bash","tool_input":{"command":"private tool input"}})");
+    auto [output, records] = run(event);
+    check(records.size() == 1 && addon::json::text(records.front(), "operation") == "request-title-instruction",
+        "an ordinary tool checkpoint requests context without manufacturing lifecycle evidence");
+    const auto& request = addon::json::member(records.front(), "request");
+    check(addon::json::text(request, "hook_event_name") == "PreToolUse" &&
+        addon::json::text(addon::json::member(request, "delivery"), "kind") == "model-context" &&
+        !request.find("tool_input"), "quiet delivery keeps its real hook and bounded authenticated context request");
+    const auto response = json(output);
+    check(addon::json::text(addon::json::member(response, "hookSpecificOutput"), "additionalContext") ==
+        "Peer session parser-review: the requested parser result is ready.",
+        "the host's actual peer information reaches the native context output unchanged");
+    event.set("agent_id", addon::Json_value("child"));
+    std::tie(output, records) = run(event);
+    check(output.empty() && records.empty(), "child tool checkpoints cannot consume the root mailbox");
+    event.erase("agent_id");
+    event.set("tool_name", addon::Json_value("request_user_input"));
+    std::tie(output, records) = run(event);
+    check(output.empty() && records.size() == 2 &&
+        addon::json::text(records.front(), "operation") == "provider-event",
+        "native questions preserve their independent lifecycle and attention path");
+    for (const char* hook : {"Stop", "Interrupt", "PermissionRequest", "SubagentStop"}) {
+        event.set("hook_event_name", addon::Json_value(hook));
+        std::tie(output, records) = run(event);
+        check(output.empty() && records.size() == 2,
+            "completion, interruption and attention observations do not continue the turn with mailbox context");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -323,16 +418,29 @@ int main(int argc, char** argv)
     try {
         // A local transport fixture for exercising the packaged helper itself.
         // It records only the synthetic event selected by the focused gate.
-        if (argc == 4 && std::string_view(argv[1]) == "provider-event") {
+        if (argc >= 2 && (std::string_view(argv[1]) == "provider-event" ||
+            std::string_view(argv[1]) == "request-title-instruction"))
+        {
             const char* capture = std::getenv("CODEX_CONTEXT_TEST_CAPTURE");
             check(capture != nullptr, "helper transport fixture requires an isolated capture path");
-            if (std::string_view(argv[2]) == "deliver" && std::string_view(argv[3]) == "--args-stdin") {
+            const bool title = std::string_view(argv[1]) == "request-title-instruction";
+            if ((title && argc == 3 && std::string_view(argv[2]) == "--args-stdin") ||
+                (!title && argc == 4 && std::string_view(argv[2]) == "deliver" &&
+                    std::string_view(argv[3]) == "--args-stdin"))
+            {
                 const std::string bytes{std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>()};
-                write(addon::path_from_utf8(capture), bytes);
-                std::cout << "{\"accepted\":true,\"epoch\":1}";
+                auto record = addon::Json_value::object();
+                record.set("operation", addon::Json_value(std::string(argv[1])));
+                record.set("request", json(bytes));
+                std::ofstream(addon::path_from_utf8(capture), std::ios::app) << addon::serialize_json(record) << '\n';
+                std::cout << (title
+                    ? "{\"accepted\":true,\"instruction_required\":false,"
+                      "\"instruction\":\"Peer session parser-review: the requested parser result is ready.\"}"
+                    : "{\"accepted\":true,\"epoch\":1}");
                 return 0;
             }
-            if (std::string_view(argv[2]) == "acknowledge") {
+            if (!title && argc == 4 && std::string_view(argv[2]) == "acknowledge") {
+                std::ofstream(addon::path_from_utf8(capture), std::ios::app) << "{\"operation\":\"acknowledge\"}\n";
                 return 0;
             }
             return 2;
@@ -345,6 +453,7 @@ int main(int argc, char** argv)
         incomplete_histories(host, rollout);
         optional_isolation(host, rollout);
         host.finish();
+        helper_context(fs::absolute(argv[0]), addon::path_from_utf8(argv[1]), fixture.path());
         return 0;
     }
     catch (const std::exception& error) {
