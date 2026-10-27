@@ -62,7 +62,7 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
 std::string parse_version_output(std::string_view output, std::string_view errors);
 
-// Probes only a native image or a verified stock npm installation. Delegated
+// Probes only a native image or a verified Codex npm installation. Delegated
 // probes execute the selected shim, preserving its behavior and version evidence.
 std::optional<Verified_launch> verified_launch(
     const logonomic::cli_addon::Launcher_request&  launcher,

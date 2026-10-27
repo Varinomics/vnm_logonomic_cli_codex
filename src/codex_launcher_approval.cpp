@@ -5,7 +5,10 @@ namespace codex {
 const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
 {
     static const logonomic::cli_addon::Launcher_approval_rules rules{
-        .program_names = {"codex", "codex.exe", "codex.cmd", "codex.bat", "codex.ps1"},
+        .program_names = {
+            "codex", "codex.exe", "codex.cmd", "codex.bat", "codex.ps1",
+            "codex-pet", "codex-pet.exe", "codex-pet.cmd", "codex-pet.bat", "codex-pet.ps1",
+        },
         .canonical_argument = "--yolo",
         .bypass_arguments = {"--yolo", "--dangerously-bypass-approvals-and-sandbox"},
         .approval_modes = {

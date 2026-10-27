@@ -37,6 +37,12 @@ using addon::Environment;
 using addon::Launcher_whitespace;
 namespace fs = std::filesystem;
 
+bool is_codex_program(std::string_view program)
+{
+    const auto base = addon::base_name(program, Launcher_whitespace::ASCII);
+    return base == "codex" || base == "codex-pet" || base.starts_with("codex@");
+}
+
 std::string path_text(const fs::path& path)
 {
     const auto bytes = path.generic_u8string();
@@ -206,10 +212,11 @@ std::vector<fs::path> authenticated_codex_profiles(
     return profiles;
 }
 
-addon::Launcher_candidate generic_codex_candidate(const addon::Discover_request& request)
+addon::Launcher_candidate generic_codex_candidate(
+    const addon::Discover_request& request, const std::string& program)
 {
     return {
-        "interactive", "Codex", "codex",
+        "interactive", "Codex", program,
         request.platform_id == "windows-x86_64"
             ? addon::k_runner_powershell
             : addon::k_runner_direct,
@@ -275,7 +282,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
             if (index == words.size()) continue;
             const std::string program = addon::unquote(words[index], Launcher_whitespace::ASCII);
             const std::string base = addon::base_name(program, Launcher_whitespace::ASCII);
-            if (base == "codex" || base.starts_with("codex@")) return Launcher_command{program, {}, environment};
+            if (is_codex_program(program)) return Launcher_command{program, {}, environment};
             if (base == "npx" || base == "bunx") {
                 std::vector<std::string> arguments;
                 for (++index; index < words.size(); ++index) {
@@ -346,8 +353,12 @@ std::vector<addon::Launcher_candidate> discover_launchers(
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    if (!resolve_program("codex", environment, {}, Launcher_whitespace::ASCII)) {
-        return {};
+    std::string program = "codex-pet";
+    if (!resolve_program(program, environment, {}, Launcher_whitespace::ASCII)) {
+        program = "codex";
+        if (!resolve_program(program, environment, {}, Launcher_whitespace::ASCII)) {
+            return {};
+        }
     }
 
     const auto selected_home = configured_codex_home(request);
@@ -355,7 +366,7 @@ std::vector<addon::Launcher_candidate> discover_launchers(
         ? authenticated_codex_profiles(*selected_home, out_profile_stats)
         : std::vector<fs::path>{};
     if (profiles.empty()) {
-        return {generic_codex_candidate(request)};
+        return {generic_codex_candidate(request, program)};
     }
 
     std::vector<addon::Launcher_candidate> candidates;
@@ -377,7 +388,7 @@ std::vector<addon::Launcher_candidate> discover_launchers(
         candidates.push_back({
             "codex_profile_" + std::to_string(index + 1),
             profile_display_name(profiles[index]),
-            "codex",
+            program,
             request.platform_id == "windows-x86_64"
                 ? addon::k_runner_powershell
                 : addon::k_runner_direct,
@@ -476,7 +487,7 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
 
 bool supported_session_arguments(const std::vector<std::string>& argv, bool resume)
 {
-    if (argv.empty() || (addon::base_name(argv.front(), Launcher_whitespace::ASCII) != "codex" && !addon::base_name(argv.front(), Launcher_whitespace::ASCII).starts_with("codex@"))) {
+    if (argv.empty() || !is_codex_program(argv.front())) {
         return false;
     }
     std::vector<std::string> values{
@@ -532,7 +543,6 @@ bool supported_session_arguments(const std::vector<std::string>& argv, bool resu
 
 namespace {
 
-#ifdef _WIN32
 std::optional<addon::Json_value> object_file(const fs::path& file)
 {
     std::error_code error;
@@ -554,6 +564,7 @@ std::string member_text(const addon::Json_value& object, std::string_view key)
 std::optional<std::pair<std::string, std::string>> native_target(const fs::path& file)
 {
     std::ifstream input(file, std::ios::binary);
+#ifdef _WIN32
     std::array<unsigned char, 64> dos{};
     input.read(reinterpret_cast<char*>(dos.data()), dos.size());
     if (!input || dos[0] != 'M' || dos[1] != 'Z') {
@@ -577,9 +588,24 @@ std::optional<std::pair<std::string, std::string>> native_target(const fs::path&
     if (machine == 0xaa64) {
         return std::pair{"win32-arm64", "aarch64-pc-windows-msvc"};
     }
+#elif defined(__linux__)
+    std::array<unsigned char, 20> elf{};
+    input.read(reinterpret_cast<char*>(elf.data()), elf.size());
+    if (!input || elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F' ||
+        elf[4] != 2 || elf[5] != 1)
+    {
+        return std::nullopt;
+    }
+    const unsigned machine = elf[18] | (unsigned(elf[19]) << 8);
+    if (machine == 0x3e) {
+        return std::pair{"linux-x64", "x86_64-unknown-linux-musl"};
+    }
+    if (machine == 0xb7) {
+        return std::pair{"linux-arm64", "aarch64-unknown-linux-musl"};
+    }
+#endif
     return std::nullopt;
 }
-#endif
 
 } // namespace
 
@@ -613,7 +639,7 @@ std::optional<Verified_launch> verified_launch(
     else {
         return std::nullopt;
     }
-    if (literal.empty() || (addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "codex" && !addon::base_name(literal.front(), Launcher_whitespace::ASCII).starts_with("codex@")) ||
+    if (literal.empty() || !is_codex_program(literal.front()) ||
         (delegated && !supported_session_arguments(literal, false)) || !effective_environment.is_object())
     {
         return std::nullopt;
@@ -634,15 +660,26 @@ std::optional<Verified_launch> verified_launch(
     std::vector<std::string> prefix{path_to_utf8(*selected)};
     Environment updates;
     std::string package_version;
-    if (lower(selected->extension().string()) == ".cmd") {
+    const bool pet = addon::base_name(literal.front(), Launcher_whitespace::ASCII) == "codex-pet";
 #ifdef _WIN32
+    const bool npm = lower(selected->extension().string()) == ".cmd";
+#else
+    const bool npm = pet && selected->filename() == "codex.js";
+#endif
+    if (npm) {
         const auto directory = selected->parent_path();
-        const auto root = directory / "node_modules" / "@openai" / "codex";
+        const auto package_name = pet ? "@imakris/codex-pet" : "@openai/codex";
+#ifdef _WIN32
+        const auto root = directory / "node_modules" / package_name;
+#else
+        const auto root = directory.parent_path();
+#endif
         const auto javascript = regular_file(root / "bin" / "codex.js");
         const auto manifest   = regular_file(root / "package.json");
         if (!javascript || !manifest) {
             return std::nullopt;
         }
+#ifdef _WIN32
         auto node = regular_file(directory / "node.exe");
         if (!fs::exists(directory / "node.exe")) {
             std::string extensions;
@@ -664,44 +701,68 @@ std::optional<Verified_launch> verified_launch(
             updates.emplace_back("PATHEXT", extensions);
             node = resolve_program("node", environment, working_directory, Launcher_whitespace::ASCII);
         }
+#else
+        const auto node = resolve_program("node", environment, working_directory, Launcher_whitespace::ASCII);
+#endif
         const auto target = node ? native_target(*node) : std::nullopt;
         const auto package = object_file(*manifest);
-        if (!target || !package || lower(node->extension().string()) != ".exe") {
+        if (!target || !package) {
             return std::nullopt;
         }
+#ifdef _WIN32
+        if (lower(node->extension().string()) != ".exe") {
+            return std::nullopt;
+        }
+#endif
         package_version = member_text(*package, "version");
         const auto* bin = package->find("bin");
-        const std::string bin_path = bin && bin->is_object() ? member_text(*bin, "codex") : member_text(*package, "bin");
-        const std::string platform_name = "@openai/codex-" + target->first;
-        const std::string native_version = package_version + "-" + target->first;
-        const auto* dependencies = package->find("optionalDependencies");
-        if (!addon::is_semantic_version(package_version) || member_text(*package, "name") != "@openai/codex" ||
-            addon::path_from_utf8(bin_path).lexically_normal() != fs::path("bin/codex.js") ||
-            !dependencies || member_text(*dependencies, platform_name) != "npm:@openai/codex@" + native_version)
+        const std::string bin_path = bin && bin->is_object()
+            ? member_text(*bin, pet ? "codex-pet" : "codex")
+            : member_text(*package, "bin");
+        if (!addon::is_semantic_version(package_version) || member_text(*package, "name") != package_name ||
+            addon::path_from_utf8(bin_path).lexically_normal() != fs::path("bin/codex.js"))
         {
             return std::nullopt;
         }
-        std::optional<fs::path> platform_manifest;
-        for (auto cursor = javascript->parent_path(); !cursor.empty();) {
-            platform_manifest = regular_file(cursor / "node_modules" / addon::path_from_utf8(platform_name) / "package.json");
-            if (platform_manifest || cursor == cursor.parent_path()) {
-                break;
+        fs::path native_root = root;
+        if (pet) {
+            // The fork bundles the native payload and gives only its npm
+            // package a pet build suffix; the CLI reports the native release.
+            package_version = package_version.substr(0, package_version.find('-'));
+        }
+        else {
+            const std::string platform_name = "@openai/codex-" + target->first;
+            const std::string native_version = package_version + "-" + target->first;
+            const auto* dependencies = package->find("optionalDependencies");
+            if (!dependencies || member_text(*dependencies, platform_name) != "npm:@openai/codex@" + native_version) {
+                return std::nullopt;
             }
-            cursor = cursor.parent_path();
+            std::optional<fs::path> platform_manifest;
+            for (auto cursor = javascript->parent_path(); !cursor.empty();) {
+                platform_manifest = regular_file(cursor / "node_modules" / addon::path_from_utf8(platform_name) / "package.json");
+                if (platform_manifest || cursor == cursor.parent_path()) {
+                    break;
+                }
+                cursor = cursor.parent_path();
+            }
+            const auto platform = platform_manifest ? object_file(*platform_manifest) : std::nullopt;
+            if (!platform || member_text(*platform, "name") != "@openai/codex" || member_text(*platform, "version") != native_version) {
+                return std::nullopt;
+            }
+            native_root = platform_manifest->parent_path();
+            files.push_back(*platform_manifest);
         }
-        const auto platform = platform_manifest ? object_file(*platform_manifest) : std::nullopt;
-        if (!platform || member_text(*platform, "name") != "@openai/codex" || member_text(*platform, "version") != native_version) {
-            return std::nullopt;
-        }
-        const auto image = regular_file(platform_manifest->parent_path() / "vendor" / target->second / "bin" / "codex.exe");
+#ifdef _WIN32
+        constexpr auto image_name = "codex.exe";
+#else
+        constexpr auto image_name = "codex";
+#endif
+        const auto image = regular_file(native_root / "vendor" / target->second / "bin" / image_name);
         if (!image || native_target(*image) != target) {
             return std::nullopt;
         }
         prefix = {path_to_utf8(*node), path_to_utf8(*javascript)};
-        files.insert(files.end(), {*node, *javascript, *manifest, *platform_manifest, *image});
-#else
-        return std::nullopt;
-#endif
+        files.insert(files.end(), {*node, *javascript, *manifest, *image});
     }
     else
     if (!native_image(*selected)) {

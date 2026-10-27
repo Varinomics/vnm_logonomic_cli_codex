@@ -104,6 +104,15 @@ void launcher_approval_contract()
     const auto login = addon::transform_launcher_approval({
         {"codex login", "direct", ""}, "linux-x86_64", yolo}, rules);
     check(login.disposition == unsupported, "Codex management commands remain outside launcher editing");
+    for (const auto* program : {"codex-pet", "codex-pet.exe", "codex-pet.cmd", "codex-pet.bat", "codex-pet.ps1"}) {
+        const auto added = addon::transform_launcher_approval({
+            {program, "direct", ""}, "windows-x86_64", yolo}, rules);
+        const auto pet_removed = addon::transform_launcher_approval({
+            {added.script_body, "direct", ""}, "windows-x86_64", undo}, rules);
+        check(added.disposition == changed && added.script_body == std::string(program) + " --yolo" &&
+            pet_removed.disposition == changed && pet_removed.script_body == program,
+            "Codex pet launchers retain the same approval edits and selected program");
+    }
 }
 
 void launcher_image_operand_contract()
@@ -917,6 +926,44 @@ void launcher_discovery_returns_authenticated_codex_profiles(
         candidates[1].candidate_id != candidates[2].candidate_id,
         "discovered profile candidate IDs are unique");
 
+    // The owner prefers the pet executable even when ordinary Codex appears
+    // first on PATH; account/profile discovery must retain its identity.
+    const fs::path pet_bin = root / "pet bin";
+    fs::create_directories(pet_bin);
+#ifdef _WIN32
+    const fs::path pet_program = pet_bin / "codex-pet.exe";
+    const std::string both_paths = path_text(bin) + ';' + path_text(pet_bin);
+#else
+    const fs::path pet_program = pet_bin / "codex-pet";
+    const std::string both_paths = path_text(bin) + ':' + path_text(pet_bin);
+#endif
+    fs::copy_file(executable, pet_program);
+    auto pet_request = request;
+    pet_request.ambient_environment.set("PATH", addon::Json_value(both_paths));
+    auto expected_pet = candidates;
+    for (auto& candidate : expected_pet) {
+        check(candidate.script_body == "codex", "Codex alone keeps ordinary discovery");
+        candidate.script_body = "codex-pet";
+    }
+    const auto expected_pet_json = addon::encode_candidates(expected_pet);
+    check(addon::encode_candidates(codex::discover_launchers(pet_request)) == expected_pet_json,
+        "Codex pet is preferred without changing profile names, IDs, defaults or environments");
+    pet_request.ambient_environment.set("PATH", addon::Json_value(path_text(pet_bin)));
+    check(addon::encode_candidates(codex::discover_launchers(pet_request)) == expected_pet_json,
+        "Codex pet alone discovers the same Codex profiles");
+    for (const auto* script : {"codex", "codex-pet", "codex-pet --model custom", "codex-pet.exe --yolo"}) {
+        const auto recognized = codex::recognize_launcher(script);
+        check(recognized && std::string_view(script).starts_with(recognized->program),
+            "Explicit launcher recognition preserves the selected Codex program");
+    }
+    const auto explicit_codex = codex::recognize_launcher("codex");
+    auto both_environment = request.ambient_environment;
+    both_environment.set("PATH", addon::Json_value(both_paths));
+    const auto explicit_probe = codex::resolve_probe_launcher(
+        *explicit_codex, {"--version"}, both_environment, path_text(root), false);
+    check(explicit_probe && explicit_probe->front() == addon::path_to_utf8(fs::canonical(codex_program)),
+        "An explicitly configured Codex probe keeps ordinary Codex when pet is installed");
+
     fs::create_directories(long_profile);
     {
         std::ofstream auth(long_profile / "auth.json", std::ios::binary);
@@ -1106,6 +1153,16 @@ void launcher_discovery_returns_authenticated_codex_profiles(
     check(fallback.size() == 1 && fallback.front().candidate_id == "interactive" &&
         fallback.front().environment_text.empty() && fallback.front().is_default,
         "an installation without authenticated profiles retains generic discovery");
+    empty_request.ambient_environment.set("PATH", addon::Json_value(both_paths));
+    const auto pet_fallback = codex::discover_launchers(empty_request);
+    check(pet_fallback.size() == 1 && pet_fallback.front().script_body == "codex-pet" &&
+        pet_fallback.front().candidate_id == fallback.front().candidate_id &&
+        pet_fallback.front().display_name == fallback.front().display_name &&
+        pet_fallback.front().environment_text.empty() && pet_fallback.front().is_default,
+        "Generic discovery prefers pet while retaining ordinary Codex identity");
+    empty_request.ambient_environment.set("PATH", addon::Json_value(path_text(empty_home)));
+    check(codex::discover_launchers(empty_request).empty(),
+        "Discovery remains empty when neither Codex program is installed");
 }
 
 void probe_preparation_preserves_program_environment_and_custody(

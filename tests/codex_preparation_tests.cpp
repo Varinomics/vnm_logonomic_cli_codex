@@ -236,8 +236,8 @@ addon::Prepare_request through_powershell(addon::Prepare_request request)
 {
     const auto program = addon::path_from_utf8(request.launcher_argv.front());
     request.launcher.runner_key  = addon::k_runner_powershell;
-    request.launcher.script_body = "codex --yolo";
-    request.launcher_argv        = {"powershell", "-NoLogo", "-Command", "codex --yolo"};
+    request.launcher.script_body = addon::base_name(utf8(program), addon::Launcher_whitespace::ASCII) + " --yolo";
+    request.launcher_argv        = {"powershell", "-NoLogo", "-Command", request.launcher.script_body};
     request.launch_environment->effective_environment.set("PATH", addon::Json_value(utf8(program.parent_path())));
     return request;
 }
@@ -245,7 +245,7 @@ addon::Prepare_request through_powershell(addon::Prepare_request request)
 // The same launcher record with other arguments after the program.
 addon::Prepare_request with_arguments(addon::Prepare_request request, const std::vector<std::string>& arguments)
 {
-    request.launcher.script_body = "codex";
+    request.launcher.script_body = addon::base_name(request.launcher_argv.front(), addon::Launcher_whitespace::ASCII);
     request.launcher_argv.resize(1);
     for (const auto& argument : arguments) {
         request.launcher.script_body += ' ' + argument;
@@ -286,20 +286,28 @@ std::vector<std::string> delivered_arguments(
 void initial_prompt_launches(
     const addon::Prepare_request&                           direct,
     const std::vector<std::pair<std::string, std::string>>& probe_environment,
-    const fs::path&                                         root)
+    const fs::path&                                         root,
+    bool                                                   full_argument_matrix)
 {
     // A brief path with spaces and non-ASCII characters, and a text made of
     // what a shell or the command-line quoting rules could reinterpret.
     const auto brief = utf8(root / u8"continuation briefs" / u8"Zoë Ångström 概要 🧭" / "brief.md");
-    const std::vector<std::string> texts{
+    std::vector<std::string> texts{
         "Logonomic continuation: read the brief at " + brief +
             " before anything else and follow it; do not modify the project until the user confirms.",
         "-- \"quoted \\\"inner\\\"\" 'single' $HOME %PATH% ^& | < > ` \\\" trailing backslashes \\\\",
     };
     const auto powershell = through_powershell(direct);
     const auto modelled   = with_arguments(direct, {"--model", "gpt-5"});
+    std::vector<const addon::Prepare_request*> launchers{&direct, &powershell};
+    if (full_argument_matrix) {
+        launchers.push_back(&modelled);
+    }
+    else {
+        texts.erase(texts.begin());
+    }
     addon::Contract_failure failure;
-    for (const auto* launcher : {&direct, &powershell, &modelled}) {
+    for (const auto* launcher : launchers) {
         Context unprompted;
         prepare_launch(unprompted, *launcher);
         require(unprompted.succeeded && !unprompted.output.find(addon::k_initial_prompt_member),
@@ -331,6 +339,9 @@ void initial_prompt_launches(
         }
     }
 
+    if (!full_argument_matrix) {
+        return;
+    }
     const auto& text = texts.front();
     require_refusal(direct, "!" + text, brief, "Codex would run a text starting with ! as a shell command");
     require_refusal(with_arguments(direct, {"resume", "--last"}), text, brief,
@@ -387,7 +398,8 @@ void codex_invocation_launches(
     const addon::Prepare_request&                           direct,
     const std::vector<std::string>&                         prefix,
     const std::vector<std::pair<std::string, std::string>>& probe_environment,
-    const fs::path&                                         root)
+    const fs::path&                                         root,
+    bool                                                   full_argument_matrix = true)
 {
     // Oracle: the approved direct launch keeps its verified argv and obtains
     // terminal adaptation only through the host's explicit capability offer.
@@ -411,7 +423,7 @@ void codex_invocation_launches(
     patch->codex_invocation.reset();
     require(addon::serialize_json(addon::encode_launch_patch(*patch, 3)) == addon::serialize_json(baseline.output),
         "The capability offer must preserve every verified argument, hook and account field");
-    initial_prompt_launches(offered, probe_environment, root);
+    initial_prompt_launches(offered, probe_environment, root, full_argument_matrix);
 }
 
 void codex_invocation_resume(
@@ -445,34 +457,60 @@ void codex_invocation_resume(
         "Resume adaptation must preserve the bridge, exact session, hooks, account and private observer");
 }
 
-#ifdef _WIN32
-addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const fs::path& root)
+#if defined(_WIN32) || defined(__linux__)
+addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const fs::path& root, bool pet = false)
 {
-    const auto directory = root / "npm installation";
-    const auto package = directory / "node_modules" / "@openai" / "codex";
-    const auto platform = directory / "node_modules" / "@openai" / "codex-win32-x64";
+    const auto directory = root / (pet ? "npm pet installation" : "npm installation");
+    const auto package_name = pet ? "@imakris/codex-pet" : "@openai/codex";
+    const auto package = directory / "node_modules" / package_name;
+    const auto platform = pet ? package : directory / "node_modules" / "@openai" / "codex-win32-x64";
+#ifdef _WIN32
     const auto image = platform / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe";
+    const auto node = directory / "node.exe";
+#elif defined(__aarch64__)
+    const auto image = platform / "vendor" / "aarch64-unknown-linux-musl" / "bin" / "codex";
+    const auto node = directory / "node";
+#else
+    const auto image = platform / "vendor" / "x86_64-unknown-linux-musl" / "bin" / "codex";
+    const auto node = directory / "node";
+#endif
     fs::create_directories(package / "bin");
     fs::create_directories(image.parent_path());
-    fs::copy_file(addon::path_from_utf8(native.launcher_argv.front()), directory / "node.exe");
+    fs::copy_file(addon::path_from_utf8(native.launcher_argv.front()), node);
     fs::copy_file(addon::path_from_utf8(native.launcher_argv.front()), image);
     // The copied native fixture accepts the verified JavaScript prefix before
     // Codex arguments; the preparation still checks the real npm file layout.
     const auto write = [](const fs::path& path, std::string_view content) {
         std::ofstream stream(path, std::ios::binary);
         stream << content;
-        require(stream.good(), "Could not write the stock npm launch fixture");
+        require(stream.good(), "Could not write the Codex npm launch fixture");
     };
-    write(directory / "codex.cmd",
+#ifdef _WIN32
+    const std::string command_name = pet ? "codex-pet.cmd" : "codex.cmd";
+    write(directory / command_name, pet
+        ? "@echo off\r\n\"%~dp0node.exe\" \"%~dp0node_modules\\@imakris\\codex-pet\\bin\\codex.js\" %*\r\n"
+        :
         "@echo off\r\n\"%~dp0node.exe\" \"%~dp0node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n");
-    write(package / "bin" / "codex.js", "// Verified npm entry point fixture.\n");
-    write(package / "package.json",
+#else
+    const std::string command_name = "codex-pet";
+    fs::create_symlink(package / "bin" / "codex.js", directory / command_name);
+#endif
+    write(package / "bin" / "codex.js", "#!/usr/bin/env node\n// Verified npm entry point fixture.\n");
+#ifndef _WIN32
+    fs::permissions(package / "bin" / "codex.js", fs::perms::owner_exec, fs::perm_options::add);
+#endif
+    write(package / "package.json", pet
+        ? "{\"name\":\"@imakris/codex-pet\",\"version\":\"0.150.1-pet.46.1\",\"bin\":{\"codex-pet\":\"bin/codex.js\"}}"
+        :
         "{\"name\":\"@openai/codex\",\"version\":\"0.150.1\",\"bin\":{\"codex\":\"bin/codex.js\"},"
-        "\"optionalDependencies\":{\"@openai/codex-win32-x64\":\"npm:@openai/codex@0.150.1-win32-x64\"}}");
-    write(platform / "package.json", "{\"name\":\"@openai/codex\",\"version\":\"0.150.1-win32-x64\"}");
+            "\"optionalDependencies\":{\"@openai/codex-win32-x64\":\"npm:@openai/codex@0.150.1-win32-x64\"}}");
+    if (!pet) {
+        write(platform / "package.json", "{\"name\":\"@openai/codex\",\"version\":\"0.150.1-win32-x64\"}");
+    }
 
     auto request = native;
-    request.launcher_argv.front() = utf8(directory / "codex.cmd");
+    request.launcher_argv.front() = utf8(directory / command_name);
+    request.launch_environment->effective_environment.set("PATH", addon::Json_value(utf8(directory)));
     return request;
 }
 #endif
@@ -579,6 +617,15 @@ int main(int argc, char** argv)
         }
         const std::vector<std::string> native_prefix{utf8(fs::canonical(addon::path_from_utf8(argv[1])))};
         codex_invocation_launches(prepare, native_prefix, probe_environment, root);
+        const auto pet_directory = root / "pet";
+        fs::create_directories(pet_directory);
+        const auto pet_program = pet_directory / (std::string("codex-pet") + fs::path(argv[1]).extension().string());
+        fs::copy_file(addon::path_from_utf8(argv[1]), pet_program);
+        auto pet = prepare;
+        pet.launcher.script_body = "codex-pet --yolo -c features.plugins=true";
+        pet.launcher_argv.front() = utf8(pet_program);
+        const std::vector<std::string> pet_prefix{utf8(pet_program)};
+        codex_invocation_launches(pet, pet_prefix, probe_environment, root, false);
 #ifdef _WIN32
         const auto npm = npm_launcher(prepare, root);
         const std::vector<std::string> npm_prefix{
@@ -586,6 +633,18 @@ int main(int argc, char** argv)
             utf8(root / "npm installation" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"),
         };
         codex_invocation_launches(npm, npm_prefix, probe_environment, root);
+#endif
+#if defined(_WIN32) || defined(__linux__)
+        const auto npm_pet = npm_launcher(pet, root, true);
+        const std::vector<std::string> npm_pet_prefix{
+#ifdef _WIN32
+            utf8(root / "npm pet installation" / "node.exe"),
+#else
+            utf8(root / "npm pet installation" / "node"),
+#endif
+            utf8(root / "npm pet installation" / "node_modules" / "@imakris" / "codex-pet" / "bin" / "codex.js"),
+        };
+        codex_invocation_launches(npm_pet, npm_pet_prefix, probe_environment, root, false);
 #endif
         addon::Delegated_prepare_request delegated;
         delegated.context.launcher           = prepare.launcher;
@@ -646,6 +705,31 @@ int main(int argc, char** argv)
         require(std::count(task_process->process.environment.begin(), task_process->process.environment.end(),
             std::pair<std::string, std::string>{"CODEX_HOME", utf8(root)}) == 1, "Selected profile must be assigned exactly once");
         require(task_process->process.stdin_payload == delegated.prompt && task_process->process.argv.back() == "-", "Delegated prompt stdin changed");
+        const auto verify_pet_delegation = [&](
+                const addon::Prepare_request& launcher,
+                const std::vector<std::string>& prefix)
+            {
+                auto request = delegated;
+                request.context.launcher      = launcher.launcher;
+                request.context.launcher_argv = launcher.launcher_argv;
+                request.context.launch_environment = launcher.launch_environment;
+                Context prepared;
+                prepared.input = task.input;
+                prepared.input.payload = addon::encode_delegated_prepare_request(request);
+                codex::handle_preparation(prepared);
+                const auto result = addon::decode_delegated_prepare_result(prepared.output, &failure);
+                require(prepared.succeeded && result && result->process.argv.size() >= prefix.size() &&
+                    std::equal(prefix.begin(), prefix.end(), result->process.argv.begin()) &&
+                    result->process.stdin_payload == delegated.prompt && result->process.argv.back() == "-" &&
+                    result->account_context && task_process->account_context &&
+                    addon::encode_account_context(*result->account_context) ==
+                        addon::encode_account_context(*task_process->account_context),
+                    "Codex pet delegation preserves the verified launcher, prompt and account");
+            };
+        verify_pet_delegation(pet, pet_prefix);
+#if defined(_WIN32) || defined(__linux__)
+        verify_pet_delegation(npm_pet, npm_pet_prefix);
+#endif
         require(std::any_of(task_process->process.argv.begin(), task_process->process.argv.end(), [](const auto& argument) {
             return argument.starts_with("mcp_servers.logonomic_") && argument.ends_with("required=true");
         }), "Task control MCP server was not required");
@@ -750,11 +834,22 @@ int main(int argc, char** argv)
             "Interactive resume keeps the user's plugin configuration");
         for (const auto& argument : proposal->process.argv) require(argument.find(std::string(64, 'd')) == std::string::npos, "Startup secret escaped into argv");
         codex_invocation_resume(resume, native_prefix);
+        auto pet_resume = resume;
+        pet_resume.context.launcher      = pet.launcher;
+        pet_resume.context.launcher_argv = pet.launcher_argv;
+        codex_invocation_resume(pet_resume, pet_prefix);
 #ifdef _WIN32
         auto npm_resume = resume;
         npm_resume.context.launcher      = npm.launcher;
         npm_resume.context.launcher_argv = npm.launcher_argv;
         codex_invocation_resume(npm_resume, npm_prefix);
+#endif
+#if defined(_WIN32) || defined(__linux__)
+        auto npm_pet_resume = resume;
+        npm_pet_resume.context.launcher      = npm_pet.launcher;
+        npm_pet_resume.context.launcher_argv = npm_pet.launcher_argv;
+        npm_pet_resume.context.launch_environment = npm_pet.launch_environment;
+        codex_invocation_resume(npm_pet_resume, npm_pet_prefix);
 #endif
         resume.context.launcher.script_body = "codex -c fixture_exporter=true";
         resume.context.launcher_argv = {argv[1], "-c", "fixture_exporter=true"};
