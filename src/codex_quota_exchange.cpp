@@ -79,7 +79,9 @@ addon::Quota_inspect_result quota_response(const addon::Json_value& response)
     const auto& payload = member(response, "result");
     const auto& limits = member(payload, "rateLimits");
     if (response.find("error")) {
-        if (authentication_required(error)) result.failure_reason = "authentication_required";
+        return addon::make_quota_failure(authentication_required(error)
+            ? addon::Quota_failure::AUTHENTICATION_REQUIRED
+            : addon::Quota_failure::REQUEST_FAILED);
     }
     else
     if (limits.is_object() && quota_window(member(limits, "primary"), &observation.primary) &&
@@ -94,7 +96,13 @@ addon::Quota_inspect_result quota_response(const addon::Json_value& response)
             observation.reset_credits = static_cast<std::int64_t>(count);
         }
     }
+    else {
+        return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+    }
     result.observation = std::move(observation);
+    if (!addon::decode_quota_inspect_result(addon::encode_quota_inspect_result(result, 2), true, nullptr, 2)) {
+        return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+    }
     return result;
 }
 

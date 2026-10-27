@@ -504,11 +504,35 @@ void quota_errors_remain_redacted()
     request.inspection.stdout_bytes = "{\"id\":1,\"result\":{}}\n"
         "{\"id\":2,\"error\":{\"code\":-32000,\"message\":\"token is near expiry\"}}\n";
     failure.clear();
-    codex::inspect_quota(request, &failure);
-    check(failure.empty(), "credential mention alone is not rejection");
+    result = codex::inspect_quota(request, &failure);
+    check(result.failure_reason && addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::REQUEST_FAILED,
+        "credential mention alone does not establish an authentication failure");
     request.inspection.stdout_bytes.clear();
     request.inspection.final = true;
-    check(codex::inspect_quota(request, &failure).complete, "final missing response cannot remain pending");
+    result = codex::inspect_quota(request, &failure);
+    check(result.complete, "final missing response cannot remain pending");
+    check(result.failure_reason && *result.failure_reason != "authentication_required",
+        "a missing quota response retains a safe non-authentication cause");
+    check(addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
+        "missing native output is an invalid response");
+    request.inspection.stdout_bytes = "{\"id\":1,\"result\":{}}\n"
+        "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":\"secret-canary\"}}}}\n";
+    result = codex::inspect_quota(request, &failure);
+    check(result.failure_reason && addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
+        "malformed native quota values retain their response failure category");
+    const auto payload = addon::encode_quota_inspect_result(result, 2);
+    const auto decoded = addon::decode_quota_inspect_result(payload, true, nullptr, 2);
+    check(decoded && decoded->failure_reason == result.failure_reason &&
+        addon::serialize_json(payload).find("secret-canary") == std::string::npos,
+        "the quota envelope preserves the safe cause without native data");
+    codex::Account_refresh_exchange shared;
+    shared.take_input();
+    check(shared.consume(request.inspection.stdout_bytes), "combined refresh accepts a failed quota observation");
+    addon::Probe_inspect_request combined;
+    combined.inspection.stdout_bytes = shared.take_output();
+    const auto refresh = codex::inspect_account_refresh(combined);
+    check(refresh && refresh->quota && refresh->quota->failure_reason == result.failure_reason && !refresh->auth,
+        "separate and combined observations preserve the same cause without ending authentication");
 }
 
 void quota_requires_a_settled_valid_exchange()
@@ -526,18 +550,26 @@ void quota_requires_a_settled_valid_exchange()
     check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::READY,
         "valid notifications after the response survive final inspection, including a complete EOF record");
     request.inspection.timed_out = true;
-    check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::FAILED,
+    auto result = codex::inspect_quota(request, &failure);
+    check(result.observation->state == addon::Quota_status::FAILED && result.failure_reason &&
+        addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::TIMED_OUT,
         "a valid reply cannot hide a native timeout");
     request.inspection.timed_out = false;
     request.inspection.exit_code = 19;
-    check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::FAILED,
+    result = codex::inspect_quota(request, &failure);
+    check(result.observation->state == addon::Quota_status::FAILED && result.failure_reason &&
+        addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::PROCESS_FAILED,
         "a valid reply cannot hide a failed native exit");
+    check(result.diagnostic && result.diagnostic->stage == addon::Quota_failure_stage::PROCESS_EXIT &&
+        result.diagnostic->code == 19, "the native exit code remains available for developer diagnostics");
     request.inspection.exit_code = 0;
     for (const std::string tail : {"{", "{\"id\":2,\"result\":{}}",
         "{\"id\":17,\"method\":\"account/refresh\",\"params\":{}}"})
     {
         request.inspection.stdout_bytes = transcript + tail;
-        check(codex::inspect_quota(request, &failure).observation->state == addon::Quota_status::FAILED,
+        result = codex::inspect_quota(request, &failure);
+        check(result.observation->state == addon::Quota_status::FAILED && result.failure_reason &&
+            addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
             "malformed records, duplicate responses and unanswered server requests remain failures");
     }
 }
@@ -647,6 +679,9 @@ void account_refresh_reuses_native_protocol_and_publishes_quota_first()
     final = codex::inspect_account_refresh(missing);
     check(final && final->quota->observation->state == addon::Quota_status::FAILED &&
         final->auth->observation->state == addon::Auth_status::UNKNOWN, "missing observations settle explicitly without a second native child");
+    check(final->quota->failure_reason &&
+        addon::parse_quota_failure(*final->quota->failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
+        "combined refresh preserves the missing native response outcome");
     missing.inspection.stdout_bytes = progress + "{";
     check(!codex::inspect_account_refresh(missing), "truncated helper output is rejected at EOF");
 
