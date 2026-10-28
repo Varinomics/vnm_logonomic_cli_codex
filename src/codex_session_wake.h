@@ -4,12 +4,20 @@
 
 #include <logonomic_cli_addon/session_wake.h>
 
+#include <optional>
+
 namespace codex {
 
-// Captures the running CLI's queue support before birth and pins its native
+struct Native_launch_preparation
+{
+    logonomic::cli_addon::Session_wake_preparation  session_wake;
+    std::optional<std::vector<std::string>>        terminal_title;
+};
+
+// Uses one native configuration read to retain title activity and pin the
 // state store for wake and conversation export. Preparation also runs when
 // wake was not requested. An unavailable offer never prevents ordinary launch.
-logonomic::cli_addon::Session_wake_preparation prepare_session_wake(
+Native_launch_preparation prepare_native_launch(
     Verified_launch& launch,
     const std::vector<std::pair<std::string, std::string>>& environment,
     const std::string& working_directory,

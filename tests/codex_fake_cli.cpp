@@ -253,6 +253,11 @@ int main(int argc, char** argv)
             result = object({{"config", object({{"fixture_observer", Json(defect)}, {"otel", object({{"exporter", Json(configured_exporter ? "existing" : "none")}})}})}});
             if (!sqlite_home.empty()) result.find("config")->set("sqlite_home", Json(sqlite_home));
             if (const char* managed = std::getenv("CODEX_FIXTURE_MANAGED_STORE")) result.find("config")->set("sqlite_home", Json(managed));
+            if (const char* configured = std::getenv("CODEX_FIXTURE_TUI")) {
+                const auto tui = addon::parse_json(configured, {}, nullptr);
+                if (!tui) return 31;
+                result.find("config")->set("tui", *tui);
+            }
         }
         else if (method == "thread/queue/list" || method == "thread/queue/add") {
             if (!initialized) return 27;
