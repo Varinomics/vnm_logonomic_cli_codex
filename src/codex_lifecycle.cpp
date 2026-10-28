@@ -169,20 +169,22 @@ bool action_required_title(std::string_view title)
 
 bool progress_title(std::string_view title)
 {
-    constexpr std::string_view microphone = "\xe2\x97\x8f ";
-    if (title.starts_with(microphone)) {
-        title.remove_prefix(microphone.size());
-    }
     // Codex suppresses these native activity frames while an approval overlay
-    // requires action. An arbitrary nonmatching or unavailable title proves nothing.
-    for (const std::string_view frame : {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}) {
-        if (title.starts_with(frame) &&
-            (title.size() == frame.size() || title[frame.size()] == ' '))
-        {
+    // requires action. Activity can sit anywhere in the configured title and
+    // is separated from neighboring fields by spaces after native sanitization.
+    constexpr std::array<std::string_view, 10> frames{
+        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+    for (;;) {
+        const auto separator = title.find(' ');
+        const auto item      = title.substr(0, separator);
+        if (std::find(frames.begin(), frames.end(), item) != frames.end()) {
             return true;
         }
+        if (separator == std::string_view::npos) {
+            return false;
+        }
+        title.remove_prefix(separator + 1);
     }
-    return false;
 }
 
 std::optional<addon::Attention_classification_result> classify_native_signal(

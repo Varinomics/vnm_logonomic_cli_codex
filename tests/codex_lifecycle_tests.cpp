@@ -83,14 +83,19 @@ bool permission_title_corroboration()
             "Approval presentation changed identity, phase or outcome");
     }
     for (const auto& title : {addon::Json_value(), addon::Json_value(""), addon::Json_value("Working"),
-             addon::Json_value("Thinking | project"), addon::Json_value("Ready | project")})
+             addon::Json_value("Thinking | project"), addon::Json_value("Ready | project"),
+             addon::Json_value("project⠋"), addon::Json_value("project ⠋suffix")})
     {
         request.base.event.body.find("terminal_event")->find("payload")->set("title", title);
         result = codex::classify_attention(request);
         ok &= check(result && result->base.observations.empty() && !result->attention_kind,
             "Unavailable or customized title settled a pending approval");
     }
-    for (const auto title : {"⠋", "⠙ thread | project", "⠹ Working | project", "● ⠸ thread"}) {
+    // Native title_setup.rs joins activity to either neighbor with a space,
+    // including when users place project or thread fields before activity.
+    for (const auto title : {"⠋", "⠙ thread | project", "⠹ Working | project", "● ⠸ thread",
+             "project ⠋", "project ● ⠙ Working | thread", "project | thread ⠹ Working"})
+    {
         request.base.event.body.find("terminal_event")->find("payload")->set("title", addon::Json_value(title));
         result = codex::classify_attention(request);
         if (!check(result && result->attention_kind && result->base.observations.size() == 1,
@@ -423,7 +428,7 @@ bool async_question_hooks()
         "terminal_id":"17","generation":"2","source":"logonomic_terminal_worker","stream":"terminal",
         "stream_index":0,"timestamp":1234.5,"payload":{"kind":"terminal_title_changed","title_sequence":"8","title":null}},
         "candidate":{"session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a","attention_kind":"async_question"}})", {}, nullptr);
-    for (const auto title : {"[ ! ] Action Required", "⠋ thread", "customized title"}) {
+    for (const auto title : {"[ ! ] Action Required", "⠋ thread", "project ⠙ Working", "customized title"}) {
         request.base.event.body.find("terminal_event")->find("payload")->set("title", addon::Json_value(title));
         const auto presentation = codex::classify_async_attention(request);
         if (!check(presentation.has_value(), "Valid scoped async native presentation was rejected")) {
