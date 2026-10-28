@@ -76,7 +76,7 @@ std::vector<std::string> hook_arguments()
     result.push_back("hooks.PreToolUse=[{hooks=[{type=\"command\",command=" + toml_string(command) +
         ",timeout=10,additionalContextLimit=12000}]}]");
     result.push_back("-c");
-    result.push_back("hooks.PostToolUse=[{matcher=\"^request_user_input$\",hooks=[{type=\"command\",command=" +
+    result.push_back("hooks.PostToolUse=[{matcher=\"^request_user_input(_async)?$\",hooks=[{type=\"command\",command=" +
         toml_string(command) + ",timeout=10}]}]");
     return result;
 }

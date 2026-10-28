@@ -11,6 +11,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -336,6 +337,113 @@ bool conversational_stop()
     return ok;
 }
 
+bool async_question_hooks()
+{
+    // Captured producer contract: title/options input, text {accepted:true}
+    // output, and per-question JSON identities in the native reply envelope.
+    auto native = *addon::parse_json(R"({"hook_event_name":"PreToolUse",
+        "session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+        "tool_name":"request_user_input_async","tool_input":{"questions":[
+            {"title":"First?","options":["Yes","No"]},{"title":"Second?"}]}})", {}, nullptr);
+    addon::Attention_classification_request request;
+    const auto classify = [&]() {
+        request.base.event.name = native.find("hook_event_name")->as_string();
+        request.base.event.body = codex::hook_metadata(native);
+        return codex::classify_async_attention(request);
+    };
+    const auto started = classify();
+    if (!check(started && started->async_questions && started->async_questions->question_ids.size() == 2 &&
+        started->base.base.observations.size() == 1 &&
+        started->async_questions->kind == addon::Async_question_update_kind::STARTED,
+        "Native async call admission was lost before UI presentation"))
+    {
+        return false;
+    }
+    const auto ids = started->async_questions->question_ids;
+    const auto identity = started->base.base.observations.front().attention_request_id;
+    bool ok = check(ids.front() == R"(["request_user_input_async","call-a",0])" &&
+        ids.back() == R"(["request_user_input_async","call-a",1])",
+        "Async question identities differ from the native TUI's call/index identities");
+    const auto old_peer = codex::classify_attention(request);
+    ok &= check(old_peer && old_peer->base.observations.empty(),
+        "The existing optional capability adopted unsupported async semantics");
+    ok &= check(!request.base.event.body.find("tool_input") && !request.base.event.body.find("tool_response"),
+        "Async correlation forwarded raw question or response bodies");
+    native.set("hook_event_name", addon::Json_value("PostToolUse"));
+    for (const auto& response : {addon::Json_value(R"({"accepted":true})"),
+             *addon::parse_json(R"([{"type":"input_text","text":"{\"accepted\":true}"}])", {}, nullptr)})
+    {
+        native.set("tool_response", response);
+        const auto accepted = classify();
+        ok &= check(accepted && accepted->async_questions &&
+            accepted->base.base.observations.size() == 1 &&
+            accepted->async_questions->kind == addon::Async_question_update_kind::ACCEPTED &&
+            accepted->async_questions->question_ids == ids &&
+            accepted->base.base.observations.front().attention_request_id == identity &&
+            accepted->base.base.observations.front().attention_transition == addon::Attention_transition::REQUESTED,
+            "Successful async Post resolved the question or changed its admission identity");
+    }
+    for (const auto& response : {addon::Json_value(R"({"accepted":false})"), addon::Json_value("tool failed"), addon::Json_value()}) {
+        native.set("tool_response", response);
+        const auto failed = classify();
+        ok &= check(failed && !failed->async_questions && failed->base.base.observations.empty(),
+            "Failed or absent native acceptance promoted an async question");
+    }
+    const std::string reply = R"(<send_user_message_question_reply>
+        [{"answer":"Yes","question":"First?","questionItemId":"[\"request_user_input_async\",\"call-a\",0]"}]
+        </send_user_message_question_reply>)";
+    native = *addon::parse_json(R"({"hook_event_name":"UserPromptSubmit","session_id":"session-a","turn_id":"turn-a"})", {}, nullptr);
+    for (const auto& text : {reply, "# Context from my IDE setup:\ncontext\n## My request for Codex:\n" + reply}) {
+        native.set("prompt", addon::Json_value(text));
+        const auto answered = classify();
+        ok &= check(answered && answered->async_questions &&
+            answered->base.base.observations.size() == 1 &&
+            answered->async_questions->kind == addon::Async_question_update_kind::ANSWERED &&
+            answered->async_questions->question_ids == std::vector<std::string>{ids.front()} &&
+            answered->base.base.observations.front().phase_transition == addon::Phase_transition::WORKING &&
+            !request.base.event.body.find("prompt"),
+            "A partial native reply lost its exact identity, changed Working, or forwarded answer text");
+    }
+    native.set("prompt", addon::Json_value("Quoted: " + reply));
+    const auto unrelated = classify();
+    ok &= check(unrelated && !unrelated->async_questions,
+        "Quoted reply text became an async answer");
+    for (const std::string event : {"Stop", "Interrupt", "SessionEnd"}) {
+        native.set("hook_event_name", addon::Json_value(event));
+        const auto boundary = classify();
+        ok &= check(boundary && (event == "Stop" ? !boundary->async_questions :
+            boundary->async_questions && boundary->async_questions->kind == addon::Async_question_update_kind::RESET),
+            "An attempted Stop became a reset or an actual native reset was lost");
+    }
+    request.base.event.name = "NativeSignal";
+    request.base.ledger.current_epoch = 1;
+    request.base.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-a", std::string(64, 'a')};
+    request.base.event.body = *addon::parse_json(R"({"origin":"host_terminal","terminal_event":{
+        "terminal_id":"17","generation":"2","source":"logonomic_terminal_worker","stream":"terminal",
+        "stream_index":0,"timestamp":1234.5,"payload":{"kind":"terminal_title_changed","title_sequence":"8","title":null}},
+        "candidate":{"session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a","attention_kind":"async_question"}})", {}, nullptr);
+    for (const auto title : {"[ ! ] Action Required", "⠋ thread", "customized title"}) {
+        request.base.event.body.find("terminal_event")->find("payload")->set("title", addon::Json_value(title));
+        const auto presentation = codex::classify_async_attention(request);
+        if (!check(presentation.has_value(), "Valid scoped async native presentation was rejected")) {
+            return false;
+        }
+        const auto& observations = presentation->base.base.observations;
+        if (std::string(title) == "customized title") {
+            ok &= check(observations.empty(), "An unavailable activity marker settled an async question");
+        }
+        else {
+            ok &= check(observations.size() == 1 && observations.front().attention_request_id == identity &&
+                observations.front().attention_transition == (std::string(title).starts_with("[")
+                    ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED) &&
+                observations.front().phase_transition == addon::Phase_transition::NONE,
+                "Native aggregate presentation lost call correlation or invented a blocked phase");
+        }
+    }
+    return ok;
+}
+
 bool question_hooks()
 {
     // Oracle: Codex native Pre/PostToolUse fields and the adopted inferred-candidate contract.
@@ -608,5 +716,5 @@ int main(int argc, char** argv)
         return 1;
     }
     const bool gated = declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
-    return permission_title_corroboration() && question_hooks() && conversational_stop() && gated ? 0 : 1;
+    return permission_title_corroboration() && question_hooks() && async_question_hooks() && conversational_stop() && gated ? 0 : 1;
 }

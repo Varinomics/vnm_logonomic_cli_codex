@@ -106,14 +106,16 @@ bool question_response(const addon::Json_value& body, const std::vector<std::str
     return true;
 }
 
-std::string question_request_id(const std::string& session, const std::string& turn, const std::string& call)
+std::string question_request_id(const std::string& session, const std::string& turn, const std::string& call,
+    bool asynchronous = false)
 {
     addon::Provider_event identity;
-    identity.name = "request_user_input";
+    identity.name = asynchronous ? "request_user_input_async" : "request_user_input";
     identity.body.set("session_id", addon::Json_value(session));
     identity.body.set("turn_id", addon::Json_value(turn));
     identity.body.set("tool_use_id", addon::Json_value(call));
-    return "codex-question-" + addon::provider_event_evidence_digest_hex(identity);
+    return (asynchronous ? "codex-async-question-" : "codex-question-") +
+        addon::provider_event_evidence_digest_hex(identity);
 }
 
 std::string permission_request_id(const std::string& session, const std::string& turn)
@@ -184,7 +186,7 @@ bool progress_title(std::string_view title)
 }
 
 std::optional<addon::Attention_classification_result> classify_native_signal(
-    const addon::Attention_classification_request& request)
+    const addon::Attention_classification_request& request, bool asynchronous = false)
 {
     // This envelope is supplied only by the host terminal lane, never helper
     // ingress. The host owns authentication, generation/epoch/sequence freshness,
@@ -199,8 +201,11 @@ std::optional<addon::Attention_classification_result> classify_native_signal(
     const auto& candidate = *body.find("candidate");
     const bool permission = exact_members(candidate, {"session_id", "turn_id", "attention_kind"}) &&
         metadata(candidate, "attention_kind") == "permission";
+    const bool async_question = asynchronous &&
+        exact_members(candidate, {"session_id", "turn_id", "tool_use_id", "attention_kind"}) &&
+        metadata(candidate, "attention_kind") == "async_question";
     if (!exact_members(terminal, {"terminal_id", "generation", "source", "stream", "stream_index", "timestamp", "payload"}) ||
-        (!permission && !exact_members(candidate, {"session_id", "turn_id", "tool_use_id"})) ||
+        (!permission && !async_question && !exact_members(candidate, {"session_id", "turn_id", "tool_use_id"})) ||
         !positive_decimal(*terminal.find("terminal_id")) || !positive_decimal(*terminal.find("generation")) ||
         *terminal.find("source") != addon::Json_value("logonomic_terminal_worker") ||
         *terminal.find("stream") != addon::Json_value("terminal") ||
@@ -230,9 +235,9 @@ std::optional<addon::Attention_classification_result> classify_native_signal(
     }
     addon::Attention_classification_result result;
     const bool required = title.is_string() && action_required_title(title.as_string());
-    const bool resumed  = permission && title.is_string() && progress_title(title.as_string());
-    // Permission status can be absent from a customized title. Only an explicit
-    // native activity frame distinguishes resumption from missing observation.
+    const bool resumed  = (permission || async_question) && title.is_string() && progress_title(title.as_string());
+    // Native status can be absent from a customized title. Only an explicit
+    // activity frame distinguishes resumption from missing observation.
     if (!required && !resumed) {
         return result;
     }
@@ -242,7 +247,7 @@ std::optional<addon::Attention_classification_result> classify_native_signal(
     observation.provider_turn_id      = *turn;
     observation.attention_request_id  = permission
         ? permission_request_id(*session, *turn)
-        : question_request_id(*session, *turn, *call);
+        : question_request_id(*session, *turn, *call, async_question);
     observation.attention_transition  = required
         ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED;
     observation.attention_evidence    = addon::Evidence::INFERRED;
@@ -421,6 +426,87 @@ std::optional<addon::Attention_classification_result> classify_attention(
     return result;
 }
 
+std::optional<addon::Async_question_classification_result> classify_async_attention(
+    const addon::Attention_classification_request& request)
+{
+    const auto& event = request.base.event;
+    auto base = event.name == "NativeSignal" ? classify_native_signal(request, true) : classify_attention(request);
+    if (!base) {
+        return std::nullopt;
+    }
+    addon::Async_question_classification_result result{std::move(*base), std::nullopt};
+    const auto& body = event.body;
+    if (body.find("agent_id") || metadata(body, "hook_event_name") != event.name) {
+        return result;
+    }
+    const auto session = metadata(body, "session_id");
+    const auto turn = metadata(body, "turn_id");
+    if (!session || !turn) {
+        return result;
+    }
+    if (event.name == "Interrupt" || event.name == "SessionEnd") {
+        if (!result.base.base.observations.empty()) {
+            result.async_questions = addon::Async_question_update{0, addon::Async_question_update_kind::RESET, {}};
+        }
+        return result;
+    }
+    const bool question = (event.name == "PreToolUse" || event.name == "PostToolUse") &&
+        metadata(body, "tool_name") == "request_user_input_async";
+    const auto* ids = body.find(question ? "async_question_ids" : "async_answer_ids");
+    if ((!question && event.name != "UserPromptSubmit") || !ids || !ids->is_array() ||
+        ids->as_array().empty() || ids->as_array().size() > addon::k_max_async_question_ids)
+    {
+        return result;
+    }
+    addon::Async_question_update update;
+    update.kind = question ? (event.name == "PostToolUse" ? addon::Async_question_update_kind::ACCEPTED
+        : addon::Async_question_update_kind::STARTED) : addon::Async_question_update_kind::ANSWERED;
+    const auto call = metadata(body, "tool_use_id");
+    for (const auto& id : ids->as_array()) {
+        if (!id.is_string() || id.as_string().empty() || id.as_string().size() > addon::k_max_async_question_id_bytes ||
+            id.as_string().find('\0') != std::string::npos ||
+            std::find(update.question_ids.begin(), update.question_ids.end(), id.as_string()) != update.question_ids.end())
+        {
+            return result;
+        }
+        if (question) {
+            if (!call) {
+                return result;
+            }
+            auto identity = addon::Json_value::array();
+            identity.push_back(addon::Json_value("request_user_input_async"));
+            identity.push_back(addon::Json_value(*call));
+            identity.push_back(addon::Json_value(static_cast<std::int64_t>(update.question_ids.size())));
+            if (addon::serialize_json(identity) != id.as_string()) {
+                return result;
+            }
+        }
+        update.question_ids.push_back(id.as_string());
+    }
+    if (question) {
+        addon::Lifecycle_observation observation;
+        observation.provider_event_name = event.name;
+        observation.provider_session_id = *session;
+        observation.provider_turn_id = *turn;
+        observation.attention_request_id = question_request_id(*session, *turn, *call, true);
+        observation.attention_transition = addon::Attention_transition::REQUESTED;
+        observation.attention_evidence = addon::Evidence::INFERRED;
+        result.base.base.classification = addon::Classification::EVENT;
+        result.base.base.observations.push_back(std::move(observation));
+        result.base.attention_kind = addon::Attention_kind{0, "interactive_question_candidate"};
+        if (const auto snapshot = context_snapshot(request.base)) {
+            result.base.base.context_updates.push_back(*snapshot);
+        }
+        if (request.base.context_failure) {
+            result.base.base.context_failure = addon::Context_failure{*session, *request.base.context_failure};
+        }
+    }
+    if (!result.base.base.observations.empty()) {
+        result.async_questions = std::move(update);
+    }
+    return result;
+}
+
 void handle_lifecycle(addon::Invocation_context& context)
 {
     if (context.request().operation != addon::k_classify_event_operation) {
@@ -428,6 +514,20 @@ void handle_lifecycle(addon::Invocation_context& context)
         return;
     }
     addon::Contract_failure failure;
+    if (context.request().capability.capability_id == addon::k_async_question_attention_capability_id) {
+        const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
+        if (!request) {
+            context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+            return;
+        }
+        const auto result = classify_async_attention(*request);
+        if (!result) {
+            context.fail(addon::Result_status::FAILED, "invalid_provider_event");
+            return;
+        }
+        context.succeed(addon::encode_async_question_classification_result(*result));
+        return;
+    }
     if (context.request().capability.capability_id == addon::k_attention_kind_capability_id) {
         const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
         if (!request) {
