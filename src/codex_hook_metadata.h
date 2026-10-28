@@ -3,6 +3,7 @@
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/json_utilities.h>
+#include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 
 #include <algorithm>
@@ -134,10 +135,13 @@ inline logonomic::cli_addon::Json_value hook_metadata(const logonomic::cli_addon
     }
     const auto* name = event.find("hook_event_name");
     if (name && name->is_string() && name->as_string() == "Stop" && !event.find("agent_id")) {
-        // The existing local inference feed retains only complete bounded root replies.
+        // Infer from bounded final-paragraph evidence after scanning the complete reply.
         const auto* reply = event.find("last_assistant_message");
-        if (reply && reply->is_string() && reply->as_string().size() <= 2048) {
-            result.set("last_assistant_message", *reply);
+        if (reply && reply->is_string()) {
+            auto evidence = addon::assistant_reply_evidence(reply->as_string());
+            if (!evidence.is_null()) {
+                result.set("assistant_reply_evidence", std::move(evidence));
+            }
         }
     }
     const auto* tool = event.find("tool_name");

@@ -235,7 +235,7 @@ bool title_corroboration(const std::string& request_id)
 
 bool conversational_stop()
 {
-    // Oracle: native StopCommandInput and the adopted bounded local hint contract.
+    // Oracle: native StopCommandInput and the adopted final-prose evidence contract.
     // Exercise the same metadata producer used by codex_helper before classification.
     auto native = *addon::parse_json(R"({
         "session_id":"session-a","turn_id":"turn-a","transcript_path":null,
@@ -277,11 +277,49 @@ bool conversational_stop()
     ok &= check(base && base->observations.front().attention_transition == addon::Attention_transition::NONE,
         "Unnegotiated lifecycle classification emitted a hint");
 
-    native.set("last_assistant_message", addon::Json_value(std::string(2032, ' ') + "Which directory?"));
-    request.base.event.body = codex::hook_metadata(native);
-    result = codex::classify_attention(request);
-    ok &= check(request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
-        result->attention_kind->kind == "conversational_hint", "Complete reply at the byte bound lost its hint");
+    std::string long_prose;
+    for (int index = 0; index < 120; ++index) {
+        long_prose += "The implementation preserves the selected configuration and its launch arguments. ";
+    }
+    std::string unicode_prose = "Plan ";
+    for (int index = 0; index < 500; ++index) {
+        unicode_prose += "界🧭";
+    }
+    for (const auto& reply : {
+            long_prose + "PRIVATE_REPLY_MIDDLE_CANARY.\n\nWhich directory?",
+            long_prose + "PRIVATE_REPLY_MIDDLE_CANARY. " + long_prose + "Which directory?",
+            "Please tell me " + long_prose + "the destination directory.",
+            "Please provide " + long_prose + "the destination directory.",
+            "Let me know which " + long_prose + "destination you prefer.",
+            unicode_prose + "Which directory？",
+            "```text\n" + long_prose + "\n```\n\nWhich directory?"})
+    {
+        native.set("last_assistant_message", addon::Json_value(reply));
+        request.base.event.body = codex::hook_metadata(native);
+        result = codex::classify_attention(request);
+        ok &= check(result && result->attention_kind && result->attention_kind->kind == "conversational_hint" &&
+            result->base.observations.size() == 1 &&
+            result->base.observations.front().attention_transition == addon::Attention_transition::REQUESTED &&
+            result->base.observations.front().attention_evidence == addon::Evidence::INFERRED,
+            "Long native prose reply lost its inferred question hint through helper metadata");
+        const auto* evidence = request.base.event.body.find("assistant_reply_evidence");
+        const auto* prefix   = evidence ? evidence->find("prefix") : nullptr;
+        const auto* suffix   = evidence ? evidence->find("suffix") : nullptr;
+        ok &= check(evidence && prefix && suffix && prefix->is_string() && suffix->is_string() &&
+            prefix->as_string().size() <= addon::k_assistant_reply_edge_bytes &&
+            suffix->as_string().size() <= addon::k_assistant_reply_edge_bytes &&
+            addon::is_valid_utf8(prefix->as_string()) && addon::is_valid_utf8(suffix->as_string()),
+            "Long native reply did not produce bounded UTF-8 paragraph edges");
+        const auto metadata = addon::serialize_json(request.base.event.body);
+        ok &= check(!request.base.event.body.find("last_assistant_message") &&
+            metadata.find("PRIVATE_REPLY_MIDDLE_CANARY") == std::string::npos && metadata.size() < 1024,
+            "Helper metadata exposed the full reply or its omitted middle");
+        if (result) {
+            ok &= check(addon::serialize_json(addon::encode_attention_classification_result(*result)).find(
+                "assistant_reply_evidence") == std::string::npos,
+                "Paragraph evidence escaped into lifecycle classification output");
+        }
+    }
     // Codex renders replies as Markdown, so the closing question may be emphasised.
     native.set("last_assistant_message",
         addon::Json_value("The build is configured.\n\n**Which target should I build?**"));
@@ -289,28 +327,33 @@ bool conversational_stop()
     result = codex::classify_attention(request);
     ok &= check(result && result->attention_kind && result->attention_kind->kind == "conversational_hint",
         "A reply ending in an emphasised question lost its hint");
-    for (const auto& reply : {std::string("The changes are complete."), std::string{}, std::string(2049, '?')}) {
+    for (const auto& reply : {std::string("The changes are complete."), std::string{}, long_prose,
+            "```text\n" + long_prose + "\n\nWhich directory?",
+            "> " + long_prose + "\nWhich directory?",
+            "    " + long_prose + "\n\n    Which directory?"})
+    {
         native.set("last_assistant_message", addon::Json_value(reply));
         request.base.event.body = codex::hook_metadata(native);
         result = codex::classify_attention(request);
         ok &= check(result && !result->attention_kind && result->base.observations.size() == 1,
-            "Missing, ordinary or oversized reply became a hint");
-        if (reply.size() > 2048) {
-            ok &= check(!request.base.event.body.find("last_assistant_message"), "Oversized reply was forwarded");
-            request.base.event.body = native;
-            result = codex::classify_attention(request);
-            ok &= check(result && !result->attention_kind, "Direct classifier input bypassed the reply bound");
-        }
+            "Missing, ordinary, code or quoted reply became a hint");
+        ok &= check(!request.base.event.body.find("last_assistant_message"), "Raw native reply was forwarded");
     }
     native.set("last_assistant_message", addon::Json_value());
     request.base.event.body = codex::hook_metadata(native);
     result = codex::classify_attention(request);
     ok &= check(result && !result->attention_kind, "Nullable native Stop reply became a hint");
     native.set("last_assistant_message", addon::Json_value("Which directory?"));
+    request.base.event.body = native;
+    result = codex::classify_attention(request);
+    ok &= check(result && !result->attention_kind, "Raw reply bypassed the bounded evidence contract");
+    request.base.event.body.set("assistant_reply_evidence", addon::Json_value("Which directory?"));
+    result = codex::classify_attention(request);
+    ok &= check(result && !result->attention_kind, "Malformed paragraph evidence became a hint");
     native.set("agent_id", addon::Json_value("child-a"));
     request.base.event.body = codex::hook_metadata(native);
     result = codex::classify_attention(request);
-    ok &= check(!request.base.event.body.find("last_assistant_message") && result &&
+    ok &= check(!request.base.event.body.find("assistant_reply_evidence") && result &&
         result->base.observations.empty(), "Child reply became a root hint");
     native.erase("agent_id");
     native.set("hook_event_name", addon::Json_value("UserPromptSubmit"));
@@ -318,7 +361,7 @@ bool conversational_stop()
     request.base.event.body = codex::hook_metadata(native);
     request.pending_conversational_request_id = hint.attention_request_id;
     result = codex::classify_attention(request);
-    ok &= check(!request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
+    ok &= check(!request.base.event.body.find("assistant_reply_evidence") && result && result->attention_kind &&
         result->attention_kind->kind == "conversational_hint" && result->base.observations.size() == 1 &&
         result->base.observations.front().attention_request_id == hint.attention_request_id &&
         result->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED &&
@@ -624,6 +667,9 @@ bool declared_profile_admits_every_shape(const std::filesystem::path& package)
         {
             request.base.event.name = name;
             request.base.event.body = *addon::parse_json(body, {}, nullptr);
+            if (name != "NativeSignal") {
+                request.base.event.body = codex::hook_metadata(request.base.event.body);
+            }
             const auto result = codex::classify_attention(request);
             ok &= check(result && !result->base.observations.empty(), shape);
             if (result) {
@@ -649,6 +695,8 @@ bool declared_profile_admits_every_shape(const std::filesystem::path& package)
         "Stop",
         hook("Stop", R"(,"turn_id":"turn-a","last_assistant_message":"Which directory?")"),
         "The declaration refuses a completion that ends in a question");
+    ok &= check(hint && hint->attention_kind && hint->attention_kind->kind == "conversational_hint",
+        "The declaration test did not exercise a real helper-produced conversational hint");
     if (hint && hint->attention_kind) {
         request.pending_conversational_request_id = hint->base.observations.front().attention_request_id;
     }

@@ -235,6 +235,15 @@ add_test(NAME codex_usage_host_tests COMMAND codex_usage_host_tests "${CODEX_PAC
 set_tests_properties(codex_usage_host_tests PROPERTIES TIMEOUT 120)
 add_test(NAME codex_package_validation COMMAND logonomic_cli_addon_validate "${CODEX_PACKAGE_DIRECTORY}" --platform "${CODEX_PLATFORM}")
 add_test(NAME codex_package_conformance COMMAND logonomic_cli_addon_conformance "${CODEX_PACKAGE_DIRECTORY}")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_executable(codex_fake_vnmctl tests/codex_fake_vnmctl.cpp)
+codex_target(codex_fake_vnmctl)
+add_test(NAME codex_reply_helper_tests COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/codex_reply_tests.py"
+    "${CODEX_PACKAGE_DIRECTORY}/helpers/codex_helper${CODEX_EXECUTABLE_SUFFIX}"
+    "$<TARGET_FILE:codex_fake_vnmctl>"
+    "${CODEX_PACKAGE_DIRECTORY}/adapter/codex_adapter${CODEX_EXECUTABLE_SUFFIX}")
+set_tests_properties(codex_reply_helper_tests PROPERTIES TIMEOUT 120)
 
 # Exercise this repository's actual producer, never a substitute packaging
 # implementation. The isolated nested configure uses this same SDK source;
@@ -242,7 +251,6 @@ add_test(NAME codex_package_conformance COMMAND logonomic_cli_addon_conformance 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS
     "Register isolated package rebuild regressions (requires Python 3)" OFF)
 if(LOGONOMIC_CLI_ADDON_RECIPE_TESTS)
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     get_target_property(_membership_sdk_source logonomic_cli_addon_sdk::sdk SOURCE_DIR)
     add_test(NAME codex_package_membership
         COMMAND "${Python3_EXECUTABLE}" "${_membership_sdk_source}/cmake/package_membership_tests.py"
