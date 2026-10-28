@@ -105,6 +105,7 @@ void invoke(addon::Invocation_context& context)
         else
         if (request.capability.capability_id == "lifecycle-events" ||
             request.capability.capability_id == "helper-ingress" ||
+            request.capability.capability_id == addon::k_async_question_attention_capability_id ||
             request.capability.capability_id == addon::k_attention_kind_capability_id)
         {
             codex::handle_lifecycle(context);
@@ -153,6 +154,7 @@ int main()
         {addon::k_model_context_delivery_capability_id, addon::k_model_context_delivery_version},
         {"interactive-resume", 2}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
+        {addon::k_async_question_attention_capability_id, addon::k_async_question_attention_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 3},
         {"current-account", 1},

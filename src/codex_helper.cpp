@@ -79,7 +79,8 @@ int main()
     const auto cancelled = [&] { return std::chrono::steady_clock::now() >= deadline; };
     addon::Helper_client client(*environment, cancelled);
     const auto* tool = event->find("tool_name");
-    const bool question = tool && tool->is_string() && tool->as_string() == "request_user_input";
+    const bool question = tool && tool->is_string() &&
+        (tool->as_string() == "request_user_input" || tool->as_string() == "request_user_input_async");
     if (name->as_string() == "PreToolUse" && !question) {
         // Ordinary tools supply a context checkpoint, not question or lifecycle evidence.
         if (!event->find("agent_id")) {

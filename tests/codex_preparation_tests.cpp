@@ -614,8 +614,8 @@ int main(int argc, char** argv)
                 argument.find("additionalContextLimit=12000") != std::string::npos;
         }) == 1, "Every tool checkpoint must admit bounded quiet context exactly once");
         require(std::count_if(patch->argv->begin(), patch->argv->end(), [](const auto& argument) {
-            return argument.starts_with("hooks.PostToolUse=[{matcher=\"^request_user_input$\",hooks=[");
-        }) == 1, "Native question completion must remain narrowly matched and configured exactly once");
+            return argument.starts_with("hooks.PostToolUse=[{matcher=\"^request_user_input(_async)?$\",hooks=[");
+        }) == 1, "Both native question completion hooks must be narrowly matched and configured exactly once");
         const std::vector<std::string> native_prefix{utf8(fs::canonical(addon::path_from_utf8(argv[1])))};
         codex_invocation_launches(prepare, native_prefix, probe_environment, root);
         const auto pet_directory = root / "pet";
