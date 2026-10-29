@@ -188,6 +188,31 @@ std::optional<std::vector<std::string>> configuration_arguments(const Verified_l
     return result;
 }
 
+std::optional<std::vector<std::string>> title_activity(const Json& config)
+{
+    const auto* tui      = config.find("tui");
+    const auto* selected = tui ? tui->find("terminal_title") : nullptr;
+    // Missing or null uses Codex's own default, which already includes activity.
+    // Preserve explicit fields and their order, including future native names.
+    if (!selected || !selected->is_array()) {
+        return std::nullopt;
+    }
+    std::vector<std::string> items{"spinner"};
+    for (const auto& item : selected->as_array()) {
+        if (!item.is_string()) {
+            return std::nullopt;
+        }
+        const auto& name = item.as_string();
+        if (name == "activity" || name == "spinner") {
+            return std::nullopt;
+        }
+        items.push_back(name);
+    }
+    // Native Action Required titles require activity to be selected. Retain its
+    // persisted spinner alias for the process-local preparation override.
+    return items;
+}
+
 struct Bound_queue
 {
     std::vector<std::string> argv;
@@ -277,7 +302,7 @@ std::optional<Bound_queue> bound_queue(const addon::Session_wake_target& target)
 
 } // namespace
 
-addon::Session_wake_preparation prepare_session_wake(
+Native_launch_preparation prepare_native_launch(
     Verified_launch& launch, const Environment& environment,
     const std::string& working_directory, addon::Invocation_context& context)
 {
@@ -287,8 +312,10 @@ addon::Session_wake_preparation prepare_session_wake(
         return same_environment_name(entry.first, k_export_sqlite_home_environment);
     });
     launch.environment.emplace_back(k_export_sqlite_home_environment, "");
-    const auto unavailable = [](std::string reason) {
-        return addon::Session_wake_preparation{false, Json::object(), std::move(reason)};
+    std::optional<std::vector<std::string>> terminal_title;
+    const auto unavailable = [&](std::string reason) {
+        return Native_launch_preparation{
+            {false, Json::object(), std::move(reason)}, std::move(terminal_title)};
     };
     // 0.149 introduced both the writer and the external queue watcher. A new
     // executable found later cannot retroactively add the watcher to an old TUI.
@@ -305,6 +332,9 @@ addon::Session_wake_preparation prepare_session_wake(
         object({{"cwd", Json(working_directory)}, {"includeLayers", Json(false)}}), context);
     const auto* config = response.result ? response.result->find("config") : nullptr;
     if (!config || !config->is_object()) return unavailable("wake_configuration_unavailable");
+    const auto after = file_evidence(launch.files);
+    if (!after || *after != *evidence) return unavailable("wake_executable_changed");
+    terminal_title = title_activity(*config);
     // A nondefault persistence backend needs its own native queue contract.
     if (const auto* store = config->find("experimental_thread_store"); store && !store->is_null())
         return unavailable("wake_store_unsupported");
@@ -323,8 +353,6 @@ addon::Session_wake_preparation prepare_session_wake(
         sqlite_home = normalized_absolute(std::string(name.begin(), name.end()));
     }
     if (sqlite_home.empty()) return unavailable("wake_store_unsupported");
-    const auto after = file_evidence(launch.files);
-    if (!after || *after != *evidence) return unavailable("wake_executable_changed");
     auto prefix = Json::array();
     for (std::size_t index = 0; index < launch.prefix_size; ++index) prefix.push_back(Json(launch.argv[index]));
     auto binding = object({{"schema", Json(1)}, {"version", Json(launch.version)}, {"prefix", std::move(prefix)},
@@ -339,7 +367,7 @@ addon::Session_wake_preparation prepare_session_wake(
             value = sqlite_home;
         }
     }
-    return {true, std::move(binding), {}};
+    return {{true, std::move(binding), {}}, std::move(terminal_title)};
 }
 
 void handle_session_wake(addon::Invocation_context& context)

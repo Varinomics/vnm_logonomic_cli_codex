@@ -254,6 +254,156 @@ addon::Prepare_request with_arguments(addon::Prepare_request request, const std:
     return request;
 }
 
+void title_configuration_launches(const addon::Prepare_request& direct, const fs::path& root)
+{
+    // Native config/read returns resolved tui fields. In Codex 0.160, selecting
+    // activity (also named spinner) enables Action Required title evidence.
+    // An absent list uses the native default; an explicit empty list disables it.
+    struct Title_case
+    {
+        const char* tui;
+        const char* overlay;
+        bool        disabled = false;
+    };
+    const Title_case cases[] = {
+        {nullptr, nullptr},
+        {"{}", nullptr},
+        {R"({"terminal_title":null})", nullptr},
+        {R"({"terminal_title":[]})", R"(tui.terminal_title=["spinner"])"},
+        {R"({"terminal_title":["project-name","run-state"]})",
+            R"(tui.terminal_title=["spinner","project-name","run-state"])"},
+        {R"({"terminal_title":["project-name","activity","thread-name"]})", nullptr},
+        {R"({"terminal_title":["project-name","spinner"]})", nullptr},
+        {R"({"terminal_title":["project-name","future\"\\\u0001\u007f"]})",
+            R"(tui.terminal_title=["spinner","project-name","future\"\\\u0001\u007f"])"},
+        {R"({"terminal_title":[],"animations":false,"effects":{"progress":false},"notifications":false})",
+            R"(tui.terminal_title=["spinner"])", true},
+    };
+    const auto log = root / "title-configuration.jsonl";
+    addon::Contract_failure failure;
+    for (const auto& example : cases) {
+        fs::remove(log);
+        auto request = direct;
+        auto& environment = request.launch_environment->effective_environment;
+        environment.set("CODEX_FIXTURE_WAKE_LOG", addon::Json_value(utf8(log)));
+        if (example.tui) {
+            environment.set("CODEX_FIXTURE_TUI", addon::Json_value(example.tui));
+        }
+        if (example.disabled) {
+            const std::string settings = "tui={terminal_title=[],animations=false,effects={progress=false},notifications=false}";
+            request.launcher_argv.insert(request.launcher_argv.end(), {"-c", settings});
+            request.launcher.script_body += " -c " + settings;
+        }
+        Context context;
+        prepare_launch(context, request);
+        const auto patch = addon::decode_launch_patch(context.output, &failure, 3);
+        require(context.succeeded && patch && patch->argv,
+            "Native title configuration must leave ordinary preparation available");
+        const auto& arguments = *patch->argv;
+        require(std::search(arguments.begin(), arguments.end(),
+            request.launcher_argv.begin() + 1, request.launcher_argv.end()) != arguments.end(),
+            "Title preparation must preserve every original launcher argument in order");
+        std::vector<std::string> title_overlays;
+        for (const auto& argument : arguments) {
+            if (argument.starts_with("tui.terminal_title=")) {
+                title_overlays.push_back(argument);
+            }
+            require(!argument.starts_with("tui.") || argument.starts_with("tui.terminal_title="),
+                "Title preparation must not enable disabled animations or progress effects");
+        }
+        const auto expected = example.overlay
+            ? std::vector<std::string>{example.overlay} : std::vector<std::string>{};
+        require(title_overlays == expected,
+            "Resolved title fields must retain their order and gain activity only when absent");
+        std::ifstream observed(log);
+        std::vector<std::string> methods;
+        for (std::string line; std::getline(observed, line);) {
+            const auto record = addon::parse_json(line, {}, nullptr);
+            require(record && record->find("method") && record->find("method")->is_string(),
+                "Native title configuration probe did not record its method");
+            methods.push_back(record->find("method")->as_string());
+        }
+        require(methods == std::vector<std::string>{"initialize", "config/read"},
+            "Title preparation must reuse the one existing native configuration probe");
+    }
+    auto prompted = direct;
+    prompted.launch_environment->effective_environment.set("CODEX_FIXTURE_TUI",
+        addon::Json_value(R"({"terminal_title":[]})"));
+    prompted.initial_prompt = addon::Initial_prompt_request{
+        "-- preserve this first message", utf8(root / "brief.md")};
+    Context prompt_context;
+    prepare_launch(prompt_context, prompted);
+    const auto prompt_patch = addon::decode_launch_patch(prompt_context.output, &failure, 3);
+    require(prompt_context.succeeded && prompt_patch && prompt_patch->argv &&
+        addon::validate_initial_prompt_acknowledgment(prompted.initial_prompt, *prompt_patch, &failure) &&
+        prompt_patch->argv->at(prompt_patch->argv->size() - 2) == "--" &&
+        prompt_patch->argv->back() == prompted.initial_prompt->text &&
+        std::count(prompt_patch->argv->begin(), prompt_patch->argv->end(),
+            R"(tui.terminal_title=["spinner"])") == 1,
+        "Title configuration must precede and preserve the acknowledged positional prompt");
+    for (const bool named_profile : {true, false}) {
+        fs::remove(log);
+        auto request = named_profile ? with_arguments(direct, {"--profile", "coding"}) : direct;
+        auto& environment = request.launch_environment->effective_environment;
+        environment.set("CODEX_FIXTURE_TUI", addon::Json_value(R"({"terminal_title":[]})"));
+        environment.set("CODEX_FIXTURE_WAKE_LOG", addon::Json_value(utf8(log)));
+        if (!named_profile) {
+            environment.set("CODEX_FIXTURE_WAKE", addon::Json_value("init-failure"));
+        }
+        Context context;
+        prepare_launch(context, request);
+        const auto patch = addon::decode_launch_patch(context.output, &failure, 3);
+        require(context.succeeded && patch && patch->argv &&
+            std::none_of(patch->argv->begin(), patch->argv->end(), [](const auto& argument) {
+                return argument.starts_with("tui.terminal_title=");
+            }),
+            "Unavailable native configuration must not invent a resolved title list");
+        if (named_profile) {
+            require(std::count(patch->argv->begin(), patch->argv->end(), "--profile") == 1 &&
+                std::count(patch->argv->begin(), patch->argv->end(), "coding") == 1 && !fs::exists(log),
+                "An unsupported profile probe must preserve the named native profile without reading another one");
+        }
+    }
+}
+
+void title_configuration_bounds(const addon::Prepare_request& direct)
+{
+    auto long_title = direct;
+    auto fields = addon::Json_value::array();
+    for (int index = 0; index < 400; ++index) {
+        fields.push_back(addon::Json_value("project-name"));
+    }
+    auto tui = addon::Json_value::object();
+    tui.set("terminal_title", std::move(fields));
+    long_title.launch_environment->effective_environment.set("CODEX_FIXTURE_TUI",
+        addon::Json_value(addon::serialize_json(tui)));
+
+    Context bare;
+    prepare_launch(bare, with_arguments(direct, {}));
+    addon::Contract_failure failure;
+    const auto baseline = addon::decode_launch_patch(bare.output, &failure, 3);
+    require(bare.succeeded && baseline && baseline->argv, "Title boundary baseline did not prepare");
+    std::vector<std::string> options;
+    while (baseline->argv->size() + options.size() + 2 <= addon::limits::k_max_argv_entries) {
+        options.push_back("-c");
+        options.push_back("p" + std::to_string(options.size() / 2) + "=1");
+    }
+    auto crowded = with_arguments(direct, options);
+    crowded.launch_environment->effective_environment.set("CODEX_FIXTURE_TUI",
+        addon::Json_value(R"({"terminal_title":[]})"));
+    for (const auto& request : {long_title, crowded}) {
+        Context context;
+        prepare_launch(context, request);
+        const auto patch = addon::decode_launch_patch(context.output, &failure, 3);
+        require(context.succeeded && patch && patch->argv &&
+            addon::validate_launch_patch(*patch, {}, {}, &failure),
+            "Optional title activity must not invalidate an otherwise valid launch at argv bounds");
+        require(std::none_of(patch->argv->begin(), patch->argv->end(), [](const auto& argument) {
+            return argument.starts_with("tui.terminal_title=");
+        }), "A title override that exceeds the launch contract must leave the original title intact");
+    }
+}
+
 void require_refusal(addon::Prepare_request request, std::string text, std::string brief, const char* detail)
 {
     request.initial_prompt = addon::Initial_prompt_request{std::move(text), std::move(brief)};
@@ -589,6 +739,8 @@ int main(int argc, char** argv)
         account.adapter_account_key = codex::profile_account_key(utf8(root));
         account.profile_path        = utf8(root);
         prepare.account_context     = account;
+        title_configuration_launches(prepare, root);
+        title_configuration_bounds(prepare);
         Context interactive;
         interactive.input = {"interactive", {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(prepare, 3)};
         codex::handle_preparation(interactive);
@@ -808,14 +960,20 @@ int main(int argc, char** argv)
             malformed_observer.output.as_string() == "frame_violation",
             "Malformed startup observer offer must remain rejected");
         resume.context.session_wake = addon::Session_wake_offer{};
+        auto title_resume = resume;
+        title_resume.context.launch_environment->effective_environment.set("CODEX_FIXTURE_TUI",
+            addon::Json_value(R"({"terminal_title":[],"animations":false,"effects":{"progress":false}})"));
         Context exact;
-        exact.input = {"resume", {"interactive-resume", 2}, "prepare_resume", addon::encode_resume_prepare_request(resume, 2), 15000};
+        exact.input = {"resume", {"interactive-resume", 2}, "prepare_resume", addon::encode_resume_prepare_request(title_resume, 2), 15000};
         codex::handle_preparation(exact);
         const auto proposal = addon::decode_resume_prepare_result(exact.output, &failure, 2);
         if (!exact.succeeded) std::cerr << "Resume prepare refusal: " << addon::serialize_json(exact.output) << "; " << exact.failure_detail << '\n';
         require(exact.succeeded && proposal && proposal->startup_observer && proposal->startup_observer->authorization == ("Bearer " + std::string(64, 'd')), "Isolated startup proof or exact observer echo missing");
         require(proposal->patch.session_wake && proposal->patch.session_wake->available,
             "Exact resume must retain the native wake binding for its new process");
+        require(std::count(proposal->process.argv.begin(), proposal->process.argv.end(),
+            R"(tui.terminal_title=["spinner"])") == 1,
+            "Exact resume must retain activity in an explicitly empty native title");
         if (!addon::validate_resume_process_proposal(proposal->process, &failure)) {
             throw std::runtime_error(failure.reason_code + ": " + failure.detail);
         }

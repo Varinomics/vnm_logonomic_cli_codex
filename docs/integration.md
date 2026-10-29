@@ -16,6 +16,50 @@ from the host's one-shot admission service and returned using Codex's
 content through the lifecycle ledger or fabricate instructions after admission
 fails.
 
+Interactive launch and resume reuse the native configuration read described
+below to keep the terminal title's activity field available. If an explicit
+`tui.terminal_title` list omits both `activity` and its `spinner` alias, preparation
+prepends `spinner` through a process-local `-c` override. Every configured field
+and its relative order is preserved; an explicit empty list becomes activity
+alone. An absent or null list keeps Codex's native default. Configuration files
+and unrelated TUI settings are unchanged. This preparation requires the existing
+native configuration probe (Codex 0.149.0 or newer); unsupported named profiles
+or a failed probe retain their original title configuration. Preparation also
+keeps the original title when the override would exceed the host's launch
+argument contract.
+
+In Codex 0.160.0, native Action Required titles require the activity field even
+for a static title. These titles confirm a retained permission or question
+candidate; unrelated terminal text does not create attention. Resumed activity
+can resolve an inferred permission or asynchronous-question wait. The provider
+preserves disabled `tui.animations`, `tui.effects.progress`, and native
+accessibility settings, so those settings can withhold the activity evidence
+used for resumption. A later native completion or stop remains authoritative.
+The [native title implementation](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/tui/src/chatwidget/status_surfaces.rs)
+defines these signals. Native
+[`request_permissions`](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/core/src/session/mod.rs)
+and [MCP elicitation](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/core/src/session/mcp.rs)
+bypass the hooks used to retain these candidates at their actual wait, so their
+exact per-request attention lifetimes still require a typed native
+pending/resolved integration.
+
+Source inspection of Codex 0.165.0 also shows
+[OSC 7501 program status](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/tui/src/terminal_program_status.rs)
+on terminal stdout, independent of terminal-title selections. Its
+[status calculation](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/tui/src/chatwidget/status_surfaces.rs)
+represents the displayed thread. Blocked frames carry `state=blocked:app=codex`
+and `kind=permission`, `question` or `auth`, providing a potential foreground
+attention signal where hook candidates are unavailable. Logonomic's
+[terminal parser](https://github.com/Varinomics/vnm_terminal_surface/blob/886349b663aabec9f4ab8640ae23511a2661897c/src/terminal_byte_stream_parser.cpp)
+currently lacks OSC 7501 handling, so transport and displayed-thread ownership
+need an explicit integration.
+
+Frames contain no session, turn or request IDs, and `state=clear` also occurs
+during [handoff to another program](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/tui/src/tui.rs).
+Clear, nonblocked state or a displayed-thread switch cannot retire exact root,
+child or background requests; those lifetimes still require their owning
+pending/resolved events.
+
 ## Live-session wake
 
 `session-wake@1` queues a host-authored mailbox notification for the exact live

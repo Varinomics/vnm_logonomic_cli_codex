@@ -15,7 +15,6 @@
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
-#include <stdexcept>
 #include <regex>
 #include <system_error>
 #include <utility>
@@ -49,6 +48,24 @@ std::string toml_array(const std::vector<std::string>& values)
         result += toml_string(value);
     }
     return result + ']';
+}
+
+void add_title_activity(
+    std::vector<std::string>& argv, std::size_t configuration_end,
+    const std::optional<std::vector<std::string>>& selected)
+{
+    if (!selected) {
+        return;
+    }
+    addon::Launch_patch candidate;
+    candidate.argv = argv;
+    candidate.argv->insert(candidate.argv->begin() + configuration_end,
+        {"-c", "tui.terminal_title=" + toml_array(*selected)});
+    // Native title lists can exceed the host's argv contract. Optional title
+    // evidence must not invalidate a launch, including its prompt or resume ID.
+    if (addon::validate_launch_patch(candidate, {}, {}, nullptr)) {
+        argv = std::move(*candidate.argv);
+    }
 }
 
 std::vector<std::string> hook_arguments()
@@ -214,12 +231,12 @@ void prepare_interactive(addon::Invocation_context& context)
         refuse_initial_prompt(context, "This Codex does not take an initial prompt for an interactive session.");
         return;
     }
-    auto store_preparation = prepare_session_wake(*launch,
+    auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),
         request->working_directory, context);
     std::optional<addon::Session_wake_preparation> wake;
     if (request->session_wake) {
-        wake = std::move(store_preparation);
+        wake = std::move(native_preparation.session_wake);
     }
     if (!add_hooks(*launch, context)) return;
     addon::Launch_patch patch;
@@ -233,6 +250,7 @@ void prepare_interactive(addon::Invocation_context& context)
     if (request->codex_invocation) {
         patch.codex_invocation = addon::Codex_invocation{launch->prefix_size};
     }
+    const auto configuration_end = patch.argv->size();
     if (prompt) {
         // "--" ends option parsing, so the text is the positional PROMPT
         // whatever its first character. The replacement invocation runs the
@@ -240,11 +258,12 @@ void prepare_interactive(addon::Invocation_context& context)
         patch.argv->insert(patch.argv->end(), {"--", prompt->text});
         patch.initial_prompt = addon::Initial_prompt_acknowledgment{
             addon::initial_prompt_text_digest_hex(prompt->text)};
-        if (!addon::validate_launch_patch(patch, {}, {}, &failure)) {
-            refuse_initial_prompt(context,
-                "The launch with the initial prompt is not a valid replacement: " + failure.detail);
-            return;
-        }
+    }
+    add_title_activity(*patch.argv, configuration_end, native_preparation.terminal_title);
+    if (prompt && !addon::validate_launch_patch(patch, {}, {}, &failure)) {
+        refuse_initial_prompt(context,
+            "The launch with the initial prompt is not a valid replacement: " + failure.detail);
+        return;
     }
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
@@ -284,12 +303,12 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
         return;
     }
-    auto store_preparation = prepare_session_wake(*launch,
+    auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
         request->context.working_directory, context);
     std::optional<addon::Session_wake_preparation> wake;
     if (request->context.session_wake) {
-        wake = std::move(store_preparation);
+        wake = std::move(native_preparation.session_wake);
     }
     if (!add_hooks(*launch, context)) return;
     std::vector<std::string> configuration;
@@ -311,9 +330,11 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "startup_observer_unavailable", error);
         return;
     }
+    const auto configuration_end = launch->argv.size();
     launch->argv.insert(launch->argv.end(), {"-c", "otel.exporter={otlp-http={endpoint=" +
         toml_string(request->startup_observer->endpoint) + ",protocol=\"json\"}}", "-c", "otel.log_user_prompt=false",
         "resume", "-C", request->context.working_directory, id->as_string()});
+    add_title_activity(launch->argv, configuration_end, native_preparation.terminal_title);
     addon::Resume_prepare_result result;
 #ifdef _WIN32
     result.process.executable = "helpers/codex_launch_bridge.exe";
@@ -447,9 +468,14 @@ std::string toml_string(std::string_view value)
         case '\t': result += "\\t";  break;
         default:
             if (character < 0x20 || character == 0x7f) {
-                throw std::invalid_argument("TOML string contains unsupported control bytes");
+                constexpr char hex[] = "0123456789abcdef";
+                result += "\\u00";
+                result += hex[character >> 4];
+                result += hex[character & 0x0f];
             }
-            result += static_cast<char>(character);
+            else {
+                result += static_cast<char>(character);
+            }
         }
     }
     return result + '"';
