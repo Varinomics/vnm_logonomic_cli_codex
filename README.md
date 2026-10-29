@@ -1,5 +1,7 @@
 # Logonomic Codex add-on
 
+[![CI](https://github.com/Varinomics/vnm_logonomic_cli_codex/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_logonomic_cli_codex/actions/workflows/ci.yml)
+
 Standalone C++20 provider package `logonomic.cli.codex` for Logonomic. It uses
 the public CLI add-on SDK without Qt or desktop-private headers. Codex itself
 is installed separately.
