@@ -320,6 +320,27 @@ bool conversational_stop()
                 "Paragraph evidence escaped into lifecycle classification output");
         }
     }
+    // Keep same- and final-paragraph questions distinct from indented code.
+    const std::string sentence = "The build is ready. ";
+    for (const std::string ending : {"Which directory?", "\n\nWhich directory?"}) {
+        std::string reply;
+        while (reply.size() + sentence.size() + ending.size() <= 2048) {
+            reply += sentence;
+        }
+        reply.append(2048 - reply.size() - ending.size(), ' ');
+        reply += ending;
+        ok &= check(reply.size() == 2048, "Prose reply fixture has the wrong byte size");
+        native.set("last_assistant_message", addon::Json_value(reply));
+        request.base.event.body = codex::hook_metadata(native);
+        result = codex::classify_attention(request);
+        ok &= check(request.base.event.body.find("assistant_reply_evidence") && result && result->attention_kind &&
+            result->attention_kind->kind == "conversational_hint", "Complete 2048-byte prose reply lost its hint");
+    }
+    native.set("last_assistant_message", addon::Json_value(std::string(2032, ' ') + "Which directory?"));
+    request.base.event.body = codex::hook_metadata(native);
+    result = codex::classify_attention(request);
+    ok &= check(!request.base.event.body.find("assistant_reply_evidence") && result && !result->attention_kind &&
+        result->base.observations.size() == 1, "Indented 2048-byte code became a conversational hint");
     // Codex renders replies as Markdown, so the closing question may be emphasised.
     native.set("last_assistant_message",
         addon::Json_value("The build is configured.\n\n**Which target should I build?**"));
