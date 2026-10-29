@@ -287,7 +287,7 @@ int main()
 {
     // Oracle: Codex RolloutItemWire, ResponseItem and ThreadRolledBackEvent;
     // source paths and the fork/replay rules are documented in docs/conversation_export.md.
-    const auto root = fs::temp_directory_path() / ("codex-conversation-" + addon::random_nonce_hex());
+    const auto root = fs::canonical(fs::temp_directory_path()) / ("codex-conversation-" + addon::random_nonce_hex());
     const auto profile = root / "profile";
     const auto source = profile / "sessions/2026/10/23/rollout-2026-10-23-session-a.jsonl";
     const std::string prefix =

@@ -1394,7 +1394,7 @@ void quota_batch_dispatch_matches_powershell(
     const std::filesystem::path& executable, const std::filesystem::path& helper)
 {
     namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() /
+    const fs::path root = fs::canonical(fs::temp_directory_path()) /
         ("codex quota batch " + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(root);
     const fs::path wrapper = root / "codex.CmD";

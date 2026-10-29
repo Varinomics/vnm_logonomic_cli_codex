@@ -720,7 +720,7 @@ int main(int argc, char** argv)
                 codex::supported_session_arguments({"codex", "--dangerously-bypass-approvals-and-sandbox", "-sread-only"}, resumed),
                 "Native bypass and sandbox precedence remains native-owned");
         }
-        const auto root = fs::temp_directory_path() / ("codex-preparation-" + addon::random_nonce_hex());
+        const auto root = fs::canonical(fs::temp_directory_path()) / ("codex-preparation-" + addon::random_nonce_hex());
         fs::create_directories(root);
         struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{root};
         native_account_fallback(root);
