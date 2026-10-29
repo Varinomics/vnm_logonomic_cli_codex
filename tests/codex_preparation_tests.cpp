@@ -38,6 +38,14 @@ namespace {
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
 
+const std::vector<std::vector<std::string>> k_permission_arguments{
+    {"--sandbox", "workspace-write", "--ask-for-approval", "on-request"},
+    {"--sandbox=workspace-write", "--ask-for-approval=on-request"},
+    {"-s", "workspace-write", "-a", "on-request"},
+    {"-s=workspace-write", "-a=on-request"},
+    {"-sworkspace-write", "-aon-request"},
+};
+
 class Context final : public addon::Invocation_context
 {
 public:
@@ -449,9 +457,14 @@ void initial_prompt_launches(
     };
     const auto powershell = through_powershell(direct);
     const auto modelled   = with_arguments(direct, {"--model", "gpt-5"});
+    std::vector<addon::Prepare_request> permissions;
+    for (const auto& arguments : k_permission_arguments) {
+        permissions.push_back(with_arguments(direct, arguments));
+    }
     std::vector<const addon::Prepare_request*> launchers{&direct, &powershell};
     if (full_argument_matrix) {
         launchers.push_back(&modelled);
+        for (const auto& permission : permissions) launchers.push_back(&permission);
     }
     else {
         texts.erase(texts.begin());
@@ -473,6 +486,11 @@ void initial_prompt_launches(
                 addon::validate_launch_patch(*patch, {}, {}, &failure),
                 "The host must accept the initial-prompt launch and its digest echo");
             const auto& prepared = *patch->argv;
+            if (launcher->launcher.runner_key == addon::k_runner_direct) {
+                require(std::search(prepared.begin(), prepared.end(),
+                    launcher->launcher_argv.begin() + 1, launcher->launcher_argv.end()) != prepared.end(),
+                    "The launcher's explicit options must reach Codex unchanged");
+            }
             require(prepared[prepared.size() - 2] == "--" && prepared.back() == text &&
                 std::count(prepared.begin(), prepared.end(), text) == 1,
                 "The text must be the one positional prompt, after --");
@@ -680,6 +698,28 @@ int main(int argc, char** argv)
         require(!codex::supported_session_arguments({"codex", "--yolo", "--yolo"}, true) &&
             codex::supported_session_arguments({"codex", "-c", "a=1", "--config", "b=2", "--enable", "x", "--enable", "y"}, false),
             "Only configuration, feature and attachment options may repeat");
+        for (const bool resumed : {false, true}) {
+            for (const auto& permission : k_permission_arguments) {
+                auto arguments = permission;
+                arguments.insert(arguments.begin(), "codex");
+                require(codex::supported_session_arguments(arguments, resumed),
+                    "Explicit native sandbox and approval options must remain preparable");
+            }
+            for (const auto& invalid : std::vector<std::vector<std::string>>{
+                    {"codex", "--sandbox", "invalid"}, {"codex", "-s="},
+                    {"codex", "-a", "always"}, {"codex", "--ask-for-approval"},
+                    {"codex", "-sread-only", "--sandbox", "workspace-write"},
+                    {"codex", "-anever", "--ask-for-approval=on-request"},
+                    {"codex", "--yolo", "-a", "on-request"},
+                    {"codex", "-anever", "--dangerously-bypass-approvals-and-sandbox"},
+                    {"codex", "--yolo", "--dangerously-bypass-approvals-and-sandbox"}}) {
+                require(!codex::supported_session_arguments(invalid, resumed),
+                    "Invalid, duplicate or conflicting permission options cannot prepare a session");
+            }
+            require(codex::supported_session_arguments({"codex", "-sworkspace-write", "--yolo"}, resumed) &&
+                codex::supported_session_arguments({"codex", "--dangerously-bypass-approvals-and-sandbox", "-sread-only"}, resumed),
+                "Native bypass and sandbox precedence remains native-owned");
+        }
         const auto root = fs::temp_directory_path() / ("codex-preparation-" + addon::random_nonce_hex());
         fs::create_directories(root);
         struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{root};
@@ -921,6 +961,45 @@ int main(int argc, char** argv)
                     argument.ends_with("default_tools_approval_mode=\"approve\"");
             }),
             "A launcher without --yolo runs in its own sandbox; only the Task tools are approved");
+        for (const auto& arguments : k_permission_arguments) {
+            const auto permission = with_arguments(prepare, arguments);
+            auto request = plain;
+            request.context.launcher = permission.launcher;
+            request.context.launcher_argv = permission.launcher_argv;
+            Context unsupported;
+            unsupported.input = {"permissions", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(unsupported);
+            require(!unsupported.succeeded &&
+                unsupported.output == addon::Json_value("delegated_launcher_options_unavailable"),
+                "Headless exec cannot silently replace an explicit human approval policy");
+        }
+        for (const auto& arguments : std::vector<std::vector<std::string>>{
+                {"--sandbox", "workspace-write"},
+                {"-s=read-only", "--ask-for-approval=never"},
+                {"-sdanger-full-access", "-anever"},
+                {"-c", "approvals_reviewer=\"auto_review\"", "-c", "approval_policy=\"on-request\"", "-anever"}}) {
+            const auto permission = with_arguments(prepare, arguments);
+            auto request = plain;
+            request.context.launcher = permission.launcher;
+            request.context.launcher_argv = permission.launcher_argv;
+            Context permitted;
+            permitted.input = {"permissions", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(permitted);
+            const auto result = addon::decode_delegated_prepare_result(permitted.output, &failure);
+            require(permitted.succeeded && result &&
+                std::search(result->process.argv.begin(), result->process.argv.end(),
+                    arguments.begin(), arguments.end()) != result->process.argv.end() &&
+                std::find(result->process.argv.begin(), result->process.argv.end(), "--yolo") == result->process.argv.end() &&
+                result->process.environment == plain_process->process.environment,
+                "Delegation preserves sandbox and never-approval flags without adding a bypass");
+            const auto exec = std::find(result->process.argv.begin(), result->process.argv.end(), "exec");
+            const bool explicit_never = arguments.back() == "-anever" || arguments.back() == "--ask-for-approval=never";
+            require(exec != result->process.argv.end() &&
+                std::count(exec, result->process.argv.end(), "approval_policy=\"never\"") == (explicit_never ? 1 : 0),
+                "Explicit never retains precedence even when native automatic review restores configured policy");
+        }
         addon::Resume_prepare_request resume;
         resume.context.launcher           = prepare.launcher;
         resume.context.launcher_argv      = prepare.launcher_argv;
@@ -988,6 +1067,24 @@ int main(int argc, char** argv)
             std::pair<std::string, std::string>{"OTEL_EXPORTER_OTLP_LOGS_HEADERS", ("Authorization=Bearer%20" + std::string(64, 'd'))}) == 1,
             "Resume patch lost private observer authorization");
         require(proposal->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763", "Exact resume identity changed");
+        for (const auto& arguments : k_permission_arguments) {
+            const auto permission = with_arguments(prepare, arguments);
+            auto request = resume;
+            request.context.launcher = permission.launcher;
+            request.context.launcher_argv = permission.launcher_argv;
+            Context resumed;
+            resumed.input = {"permissions", {"interactive-resume", 2}, "prepare_resume",
+                addon::encode_resume_prepare_request(request, 2), 15000};
+            codex::handle_preparation(resumed);
+            const auto result = addon::decode_resume_prepare_result(resumed.output, &failure, 2);
+            require(resumed.succeeded && result &&
+                std::search(result->process.argv.begin(), result->process.argv.end(),
+                    arguments.begin(), arguments.end()) != result->process.argv.end() &&
+                result->process.argv.back() == proposal->process.argv.back() &&
+                result->patch.set == proposal->patch.set && result->patch.account_context &&
+                addon::encode_account_context(*result->patch.account_context) == addon::encode_account_context(account),
+                "Exact resume preserves explicit permissions, session identity and selected profile");
+        }
         require(std::count(proposal->process.argv.begin(), proposal->process.argv.end(), "features.plugins=true") == 1 &&
             std::count(proposal->process.argv.begin(), proposal->process.argv.end(), "features.plugins=false") == 0,
             "Interactive resume keeps the user's plugin configuration");

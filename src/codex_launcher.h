@@ -42,7 +42,8 @@ std::optional<logonomic::cli_addon::Probe_output> run_probe(
     std::string_view working_directory, int timeout_ms,
     logonomic::cli_addon::Invocation_context& context, logonomic::cli_addon::Probe_exchange* exchange = nullptr);
 
-bool supported_session_arguments(const std::vector<std::string>& argv, bool resume);
+bool supported_session_arguments(const std::vector<std::string>& argv, bool resume,
+    std::string* approval_policy = nullptr);
 
 std::optional<std::vector<std::string>> resolve_probe_launcher(
     const Launcher_command& command,

@@ -384,6 +384,17 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, "invalid_implementation_request");
         return;
     }
+    const auto literal = request->context.launcher.runner_key == addon::k_runner_direct
+        ? request->context.launcher_argv : addon::literal_argv(request->context.launcher.script_body);
+    std::string approval;
+    if (!supported_session_arguments(literal, false, &approval)) {
+        context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
+        return;
+    }
+    if (!approval.empty() && approval != "never") {
+        context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
+        return;
+    }
     const auto launch = verified_launch(request->context.launcher, request->context.launcher_argv,
         request->context.launch_environment->effective_environment, request->context.working_directory, true, context);
     if (!launch) {
@@ -393,8 +404,10 @@ void prepare_delegated(addon::Invocation_context& context)
     }
     // `codex exec` refuses a directory outside a Git repository unless the
     // launcher's --yolo lifts its sandbox; its own message reaches only stderr.
-    if (std::find(launch->argv.begin() + static_cast<std::ptrdiff_t>(launch->prefix_size), launch->argv.end(), "--yolo") ==
-            launch->argv.end() &&
+    if (std::none_of(launch->argv.begin() + static_cast<std::ptrdiff_t>(launch->prefix_size), launch->argv.end(),
+            [](const auto& argument) {
+                return argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox";
+            }) &&
         !inside_git_repository(addon::path_from_utf8(request->context.working_directory)))
     {
         context.fail(addon::Result_status::UNAVAILABLE, "untrusted_working_directory",
@@ -411,11 +424,17 @@ void prepare_delegated(addon::Invocation_context& context)
 #else
     result.process.executable = "helpers/codex_launch_bridge";
 #endif
-    // The run keeps the launcher's sandbox and approval posture: its --yolo,
-    // configuration and profile, and the user's config.toml. The package's
-    // only grant is the per-server approval of its own Task tools below.
+    // Keep the launcher's options verbatim. Native exec cannot ask for human
+    // approval; an explicit policy requiring it was refused above.
+    // The package's only grant is approval of its own Task tools below.
     result.process.argv = launch->argv;
     result.process.argv.insert(result.process.argv.end(), {"exec", "--json", "--ephemeral"});
+    if (approval == "never") {
+        // Exec does not inherit the TUI's -a flag. Its default is never, but
+        // automatic review can restore a configured policy. Preserve the
+        // explicit flag's precedence over that configuration as well.
+        result.process.argv.insert(result.process.argv.end(), {"-c", "approval_policy=\"never\""});
+    }
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();
         const std::string key = "mcp_servers.logonomic_" + nonce + ".";

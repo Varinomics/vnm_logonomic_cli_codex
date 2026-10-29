@@ -485,24 +485,37 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
     return result;
 }
 
-bool supported_session_arguments(const std::vector<std::string>& argv, bool resume)
+bool supported_session_arguments(const std::vector<std::string>& argv, bool resume, std::string* approval_policy)
 {
+    if (approval_policy) {
+        approval_policy->clear();
+    }
     if (argv.empty() || !is_codex_program(argv.front())) {
         return false;
     }
     std::vector<std::string> values{
-        "-c", "--config", "--enable", "--disable", "-m", "--model", "--local-provider", "-p", "--profile"};
+        "-c", "--config", "--enable", "--disable", "-m", "--model", "--local-provider", "-p", "--profile",
+        "-s", "--sandbox", "-a", "--ask-for-approval"};
     if (!resume) {
         values.insert(values.end(), {"-i", "--image", "--add-dir"});
     }
-    const std::vector<std::string> switches{"--oss", "--yolo", "--search", "--no-alt-screen"};
+    const std::vector<std::string> switches{
+        "--oss", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--search", "--no-alt-screen"};
     // Codex's parser (clap) rejects a second occurrence of a flag or of a
     // single-value option; configuration, feature and attachment options
     // accumulate.
     const std::vector<std::string> repeatable{"-c", "--config", "--enable", "--disable", "-i", "--image", "--add-dir"};
     std::vector<std::string> seen;
+    std::string approval;
+    bool bypass = false;
     const auto repeated = [&](const std::string& option) {
-        const auto name = option == "-m" ? "--model" : option == "-p" ? "--profile" : option;
+        auto name = option;
+        if (name == "-m") { name = "--model"; } else
+        if (name == "-p") { name = "--profile"; } else
+        if (name == "-s") { name = "--sandbox"; } else
+        if (name == "-a") { name = "--ask-for-approval"; } else
+        if (name == "--dangerously-bypass-approvals-and-sandbox") { name = "--yolo"; }
+
         if (std::find(repeatable.begin(), repeatable.end(), name) != repeatable.end()) {
             return false;
         }
@@ -515,19 +528,44 @@ bool supported_session_arguments(const std::vector<std::string>& argv, bool resu
     for (std::size_t index = 1; index < argv.size(); ++index) {
         const auto& argument = argv[index];
         const auto equal = argument.find('=');
-        const auto key = argument.substr(0, equal);
+        auto key = argument.substr(0, equal);
+        const bool compact_permission = argument.size() > 2 && argument[0] == '-' &&
+            (argument[1] == 's' || argument[1] == 'a') && argument[2] != '=';
+        if (compact_permission) {
+            key = argument.substr(0, 2);
+        }
         if (std::find(values.begin(), values.end(), key) != values.end()) {
             if (repeated(key)) {
                 return false;
             }
+            std::string_view value;
+            if (compact_permission) {
+                value = std::string_view(argument).substr(2);
+            }
+            else
             if (equal != std::string::npos) {
                 if (equal + 1 == argument.size()) {
                     return false;
                 }
+                value = std::string_view(argument).substr(equal + 1);
+            }
+            else {
+                if (++index == argv.size() || !separate_option_value(argv[index])) {
+                    return false;
+                }
+                value = argv[index];
+            }
+            if (key == "-s" || key == "--sandbox") {
+                if (value != "read-only" && value != "workspace-write" && value != "danger-full-access") {
+                    return false;
+                }
             }
             else
-            if (++index == argv.size() || !separate_option_value(argv[index])) {
-                return false;
+            if (key == "-a" || key == "--ask-for-approval") {
+                if (value != "on-request" && value != "never") {
+                    return false;
+                }
+                approval = value;
             }
             continue;
         }
@@ -537,6 +575,17 @@ bool supported_session_arguments(const std::vector<std::string>& argv, bool resu
         if (std::find(switches.begin(), switches.end(), argument) == switches.end() || repeated(argument)) {
             return false;
         }
+        if (argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox") {
+            bypass = true;
+        }
+    }
+    // Native clap rejects an explicit approval policy together with bypass.
+    // A sandbox flag alone may coexist with bypass; Codex owns its precedence.
+    if (bypass && !approval.empty()) {
+        return false;
+    }
+    if (approval_policy) {
+        *approval_policy = std::move(approval);
     }
     return true;
 }

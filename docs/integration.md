@@ -168,10 +168,17 @@ quota and AUTH processes.
 
 ## Delegated implementation permissions
 
-A delegated implementation runs as `codex <launcher options> exec` and keeps the
-launcher's permission posture: its sandbox and approvals come from the
-launcher's own `--yolo`, `-c` settings or `-p` profile and from the user's
-`config.toml`, while `codex exec` itself never asks for approval. The package's
+A delegated implementation runs as `codex <launcher options> exec`. Its sandbox
+comes from the launcher's explicit sandbox flags, `--yolo`, configuration and
+profile under native precedence. Native `exec` cannot request human approval,
+so preparation refuses an explicit `--ask-for-approval on-request` instead of
+silently replacing it. Explicit `never` and sandbox flags are retained; `never`
+also gets an exec-local configuration override because native exec does not
+inherit the TUI flag and automatic review can change its default policy.
+Interactive Continue and exact resume also retain
+`on-request`. The long names, short names and attached-value forms are supported.
+Invalid values, repeated single-value options and approval/bypass conflicts
+remain unavailable. The package's
 only grant is `default_tools_approval_mode = "approve"` on the task's own Task
 servers, whose tools are limited to the task's actions. A task that edits files
 needs a launcher or configuration that allows writes, for example

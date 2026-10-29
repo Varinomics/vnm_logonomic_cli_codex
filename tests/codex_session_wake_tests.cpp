@@ -167,6 +167,24 @@ int main(int argc, char** argv)
         // protocol, not a second native thread/resume or turn/start invocation.
         const auto patch = prepare(request);
         require(patch.session_wake && patch.session_wake->available, "Native queue birth evidence missing");
+        for (const auto& arguments : std::vector<std::vector<std::string>>{
+                {"--sandbox", "workspace-write", "--ask-for-approval", "on-request"},
+                {"--sandbox=read-only", "--ask-for-approval=never"},
+                {"-s", "workspace-write", "-a", "on-request"},
+                {"-s=read-only", "-a=never"},
+                {"-sworkspace-write", "-aon-request"}})
+        {
+            auto selected = request;
+            for (const auto& argument : arguments) {
+                selected.launcher.script_body += " " + argument;
+                selected.launcher_argv.push_back(argument);
+            }
+            const auto prepared = prepare(selected);
+            require(prepared.session_wake && prepared.session_wake->available && prepared.argv &&
+                std::search(prepared.argv->begin(), prepared.argv->end(),
+                    arguments.begin(), arguments.end()) != prepared.argv->end(),
+                "Explicit session permissions retain native wake preparation and the original launch options");
+        }
         const auto& binding = patch.session_wake->binding;
         require(text(binding, "codex_home") == utf8(root) && text(binding, "sqlite_home") == utf8(root / "relative-store"),
             "Selected account or relative SQLite store was lost");
