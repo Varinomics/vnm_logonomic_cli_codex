@@ -277,11 +277,27 @@ bool conversational_stop()
     ok &= check(base && base->observations.front().attention_transition == addon::Attention_transition::NONE,
         "Unnegotiated lifecycle classification emitted a hint");
 
+    // The byte-boundary positive case must be prose, not an indented code line.
+    const std::string sentence = "The build is ready. ";
+    for (const std::string ending : {"Which directory?", "\n\nWhich directory?"}) {
+        std::string reply;
+        while (reply.size() + sentence.size() + ending.size() <= 2048) {
+            reply += sentence;
+        }
+        reply.append(2048 - reply.size() - ending.size(), ' ');
+        reply += ending;
+        ok &= check(reply.size() == 2048, "Prose reply fixture missed the byte bound");
+        native.set("last_assistant_message", addon::Json_value(reply));
+        request.base.event.body = codex::hook_metadata(native);
+        result = codex::classify_attention(request);
+        ok &= check(request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
+            result->attention_kind->kind == "conversational_hint", "Complete prose reply at the byte bound lost its hint");
+    }
     native.set("last_assistant_message", addon::Json_value(std::string(2032, ' ') + "Which directory?"));
     request.base.event.body = codex::hook_metadata(native);
     result = codex::classify_attention(request);
-    ok &= check(request.base.event.body.find("last_assistant_message") && result && result->attention_kind &&
-        result->attention_kind->kind == "conversational_hint", "Complete reply at the byte bound lost its hint");
+    ok &= check(request.base.event.body.find("last_assistant_message") && result && !result->attention_kind &&
+        result->base.observations.size() == 1, "Indented code at the byte bound became a conversational hint");
     // Codex renders replies as Markdown, so the closing question may be emphasised.
     native.set("last_assistant_message",
         addon::Json_value("The build is configured.\n\n**Which target should I build?**"));
