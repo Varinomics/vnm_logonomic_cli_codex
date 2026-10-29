@@ -24,3 +24,15 @@ Package validation, conformance, preparation, startup-observer, lifecycle,
 implementation-protocol, account/probe and usage contract fixtures are registered
 with CTest. Run them from the configured build directory after building the
 corresponding targets.
+
+## Manual CI
+
+The repository's CI workflow builds the standalone package and runs its existing
+provider contract tests on Windows/Linux x86-64 and macOS ARM64. The SDK's
+compiler-target proof excludes macOS Intel and FreeBSD package builds.
+
+Run the workflow manually in GitHub Actions. Its shared build workflow lives
+with the Logonomic CLI add-on SDK and consumes SDK source from `master` using
+`VARINOMICS_REPO_READ_TOKEN`. Provider credentials are not required. Retained
+artifacts are development packages and validation evidence; official bundle
+assembly and publication remain separate operations.
