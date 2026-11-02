@@ -1,4 +1,5 @@
 #include "codex_hook_metadata.h"
+#include "codex_jsonl_projector.h"
 #include "codex_launcher.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
@@ -81,6 +82,55 @@ private:
 const std::string k_legacy = R"({"timestamp":"2026-10-26T10:00:00Z","type":"session_meta","payload":{"id":"session-a","history_mode":"legacy","history_base":null}})" "\n";
 const std::string k_compacted = R"({"timestamp":"2026-10-26T10:00:01Z","type":"compacted","payload":{"message":"summary","replacement_history":[]}})" "\n";
 const std::string k_usage = R"({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":999999},"last_token_usage":{"total_tokens":2400},"model_context_window":10000}}})" "\n";
+
+void ignored_string_boundaries()
+{
+    // JSON strings retain their syntax and UTF-8 requirements even when their
+    // contents are irrelevant to either projection. Split each exceptional
+    // sequence at every byte to exercise retained state between input chunks.
+    const std::vector<std::pair<std::string, bool>> sequences{
+        {"plain ASCII \x7f", true},
+        {R"(\"\\\/\b\f\n\r\t)", true},
+        {R"(\u0000\u20ac\ud83d\udd27)", true},
+        {"\xc2\xa2\xe2\x82\xac\xf0\x9f\x94\xa7", true},
+        {std::string(1, '\0'), false},
+        {"\x1f", false},
+        {"\x80", false},
+        {"\xc0\xaf", false},
+        {"\xed\xa0\x80", false},
+        {"\xf4\x90\x80\x80", false},
+        {"\xe2\x82", false},
+        {R"(\q)", false},
+        {R"(\u12x4)", false},
+    };
+    const std::string prefix = R"({"type":"response_item","payload":{"ignored":")" +
+        std::string(65 * 1024, 'x');
+    const std::string suffix = R"(","type":"function_call_output"}})" "\n";
+    const auto expected = json(R"({"type":"response_item","payload":{"type":"function_call_output"}})");
+    for (const auto projection : {codex::Jsonl_projection::CONTEXT, codex::Jsonl_projection::USAGE}) {
+        for (const auto& [sequence, valid] : sequences) {
+            const auto bytes = prefix + sequence + suffix;
+            std::vector<std::size_t> splits{0, 1, 64 * 1024, bytes.size() - 1, bytes.size()};
+            for (std::size_t index = 0; index <= sequence.size(); ++index) {
+                splits.push_back(prefix.size() + index);
+            }
+            for (const auto split : splits) {
+                unsigned records = 0;
+                codex::Codex_jsonl_projector projector([&](const auto& record) {
+                    check(record == expected, "ignored text cannot change selected metadata");
+                    ++records;
+                    return true;
+                }, projection);
+                std::string error;
+                const bool accepted = projector.feed(std::string_view(bytes).substr(0, split), &error) &&
+                    projector.feed(std::string_view(bytes).substr(split), &error);
+                check(accepted == valid, "ignored strings keep JSON and UTF-8 validation across chunks");
+                check(records == (valid ? 1U : 0U), "only a complete valid record is emitted");
+                check(valid || !error.empty(), "malformed ignored text reports its failed record");
+            }
+        }
+    }
+}
 
 class Packaged_host
 {
@@ -216,6 +266,26 @@ void fresh_reads(Packaged_host& host, const fs::path& path)
     addon::apply_context_update(state, equal);
     check(state.compaction_count == 1 && state.compaction_count_complete,
         "equal revision replay cannot change count or completeness");
+
+    const auto modified = fs::last_write_time(path);
+    const auto size = fs::file_size(path);
+    auto rewritten = original;
+    const auto used = rewritten.find("2400");
+    check(used != std::string::npos, "current usage exists in the rewrite fixture");
+    rewritten.replace(used, 4, "3600");
+    write(path, rewritten);
+    fs::last_write_time(path, modified);
+    check(fs::file_size(path) == size && fs::last_write_time(path) == modified,
+        "rewrite preserves file size and modification time");
+    const auto refreshed = host.snapshot(path);
+    check(refreshed.event_id != restored.event_id &&
+        refreshed.compaction_count_revision > restored.compaction_count_revision &&
+        refreshed.compaction_count == 1 && refreshed.compaction_count_complete &&
+        refreshed.used_tokens == 3600 && !refreshed.usage_unavailable,
+        "a fresh read observes same-size and same-time rewritten bytes");
+    addon::apply_context_update(state, refreshed);
+    check(state.used_tokens == 3600 && state.compaction_count_complete,
+        "the host applies fresh rewritten usage with its complete count");
 
     write(path, k_legacy + k_usage);
     addon::apply_context_update(state, host.snapshot(path));
@@ -446,6 +516,7 @@ int main(int argc, char** argv)
             return 2;
         }
         check(argc == 2, "expected packaged adapter directory");
+        ignored_string_boundaries();
         Temporary_directory fixture;
         Packaged_host host(addon::path_from_utf8(argv[1]), fixture.path());
         const auto rollout = fixture.path() / "rollout.jsonl";

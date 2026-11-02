@@ -1,5 +1,6 @@
 #include "codex_launcher.h"
 #include "codex_accounts.h"
+#include "codex_macho.h"
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -610,7 +611,8 @@ std::string member_text(const addon::Json_value& object, std::string_view key)
     return value && value->is_string() ? value->as_string() : std::string{};
 }
 
-std::optional<std::pair<std::string, std::string>> native_target(const fs::path& file)
+std::optional<std::pair<std::string, std::string>> native_target(
+    const fs::path& file, [[maybe_unused]] std::string_view preferred_target = {})
 {
     std::ifstream input(file, std::ios::binary);
 #ifdef _WIN32
@@ -651,6 +653,26 @@ std::optional<std::pair<std::string, std::string>> native_target(const fs::path&
     }
     if (machine == 0xb7) {
         return std::pair{"linux-arm64", "aarch64-unknown-linux-musl"};
+    }
+#elif defined(__APPLE__)
+#if defined(__aarch64__) || defined(__arm64__)
+    auto preferred = detail::Macho_architecture::ARM64;
+#else
+    auto preferred = detail::Macho_architecture::X86_64;
+#endif
+    if (preferred_target == "darwin-x64") {
+        preferred = detail::Macho_architecture::X86_64;
+    }
+    else
+    if (preferred_target == "darwin-arm64") {
+        preferred = detail::Macho_architecture::ARM64;
+    }
+    const auto architecture = detail::macho_target(input, preferred);
+    if (architecture == detail::Macho_architecture::ARM64) {
+        return std::pair{"darwin-arm64", "aarch64-apple-darwin"};
+    }
+    if (architecture == detail::Macho_architecture::X86_64) {
+        return std::pair{"darwin-x64", "x86_64-apple-darwin"};
     }
 #endif
     return std::nullopt;
@@ -807,7 +829,7 @@ std::optional<Verified_launch> verified_launch(
         constexpr auto image_name = "codex";
 #endif
         const auto image = regular_file(native_root / "vendor" / target->second / "bin" / image_name);
-        if (!image || native_target(*image) != target) {
+        if (!image || native_target(*image, target->first) != target) {
             return std::nullopt;
         }
         prefix = {path_to_utf8(*node), path_to_utf8(*javascript)};

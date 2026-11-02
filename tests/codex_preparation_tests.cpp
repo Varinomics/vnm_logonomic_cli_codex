@@ -625,7 +625,7 @@ void codex_invocation_resume(
         "Resume adaptation must preserve the bridge, exact session, hooks, account and private observer");
 }
 
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const fs::path& root, bool pet = false)
 {
     const auto directory = root / (pet ? "npm pet installation" : "npm installation");
@@ -635,6 +635,12 @@ addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const 
 #ifdef _WIN32
     const auto image = platform / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe";
     const auto node = directory / "node.exe";
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    const auto image = platform / "vendor" / "aarch64-apple-darwin" / "bin" / "codex";
+    const auto node = directory / "node";
+#elif defined(__APPLE__)
+    const auto image = platform / "vendor" / "x86_64-apple-darwin" / "bin" / "codex";
+    const auto node = directory / "node";
 #elif defined(__aarch64__)
     const auto image = platform / "vendor" / "aarch64-unknown-linux-musl" / "bin" / "codex";
     const auto node = directory / "node";
@@ -827,7 +833,7 @@ int main(int argc, char** argv)
         };
         codex_invocation_launches(npm, npm_prefix, probe_environment, root);
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
         const auto npm_pet = npm_launcher(pet, root, true);
         const std::vector<std::string> npm_pet_prefix{
 #ifdef _WIN32
@@ -838,6 +844,24 @@ int main(int argc, char** argv)
             utf8(root / "npm pet installation" / "node_modules" / "@imakris" / "codex-pet" / "bin" / "codex.js"),
         };
         codex_invocation_launches(npm_pet, npm_pet_prefix, probe_environment, root, false);
+        addon::Discover_request npm_discovery;
+        npm_discovery.platform_id = environment.platform_id;
+        npm_discovery.ambient_environment = npm_pet.launch_environment->effective_environment;
+        const auto npm_candidates = codex::discover_launchers(npm_discovery);
+        require(!npm_candidates.empty() && npm_candidates.front().script_body == "codex-pet",
+            "The npm pet link must remain the preferred discoverable launcher");
+        const auto& discovered = npm_candidates.front();
+        std::vector<std::string> discovered_argv{discovered.script_body};
+        if (discovered.runner_key == addon::k_runner_powershell) {
+            discovered_argv = {"powershell.exe", "-NoLogo", "-Command", discovered.script_body};
+        }
+        Context discovered_probe;
+        const auto discovered_launch = codex::verified_launch(
+            {discovered.script_body, discovered.runner_key, discovered.environment_text},
+            discovered_argv, npm_discovery.ambient_environment, utf8(root), false, discovered_probe);
+        require(discovered_launch && discovered_launch->argv == npm_pet_prefix &&
+            discovered_launch->prefix_size == npm_pet_prefix.size(),
+            "A discovered npm pet launcher must verify the same Node, script and native payload chain");
 #endif
         addon::Delegated_prepare_request delegated;
         delegated.context.launcher           = prepare.launcher;
@@ -920,7 +944,7 @@ int main(int argc, char** argv)
                     "Codex pet delegation preserves the verified launcher, prompt and account");
             };
         verify_pet_delegation(pet, pet_prefix);
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
         verify_pet_delegation(npm_pet, npm_pet_prefix);
 #endif
         require(std::any_of(task_process->process.argv.begin(), task_process->process.argv.end(), [](const auto& argument) {
@@ -1100,7 +1124,7 @@ int main(int argc, char** argv)
         npm_resume.context.launcher_argv = npm.launcher_argv;
         codex_invocation_resume(npm_resume, npm_prefix);
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
         auto npm_pet_resume = resume;
         npm_pet_resume.context.launcher      = npm_pet.launcher;
         npm_pet_resume.context.launcher_argv = npm_pet.launcher_argv;
