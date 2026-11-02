@@ -1113,7 +1113,22 @@ Codex_jsonl_projector::~Codex_jsonl_projector() = default;
 
 bool Codex_jsonl_projector::feed(std::string_view bytes, std::string* out_error)
 {
-    for (const char byte : bytes) {
+    auto current = bytes.begin();
+    while (current != bytes.end()) {
+        if (m_impl->token == Token_kind::STRING && !m_impl->capture_token &&
+            !m_impl->invalid && !m_impl->string_escape &&
+            m_impl->unicode_digits == 0 && m_impl->utf8_remaining == 0) {
+            // Ordinary ASCII cannot change an ignored string's state. Stop at
+            // every boundary that still needs the token validator, including
+            // non-ASCII bytes split across successive feed calls.
+            current = std::find_if(current, bytes.end(), [](unsigned char byte) {
+                return byte < 0x20U || byte >= 0x80U || byte == '"' || byte == '\\';
+            });
+            if (current == bytes.end()) {
+                break;
+            }
+        }
+        const char byte = *current++;
         if (byte == '\n') {
             if (!m_impl->finish_line(out_error)) {
                 return false;
