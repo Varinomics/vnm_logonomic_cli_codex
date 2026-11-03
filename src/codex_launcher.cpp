@@ -214,13 +214,10 @@ std::vector<fs::path> authenticated_codex_profiles(
 }
 
 addon::Launcher_candidate generic_codex_candidate(
-    const addon::Discover_request& request, const std::string& program)
+    const std::string& program, const std::string& runner_key)
 {
     return {
-        "interactive", "Codex", program,
-        request.platform_id == "windows-x86_64"
-            ? addon::k_runner_powershell
-            : addon::k_runner_direct,
+        "interactive", "Codex", program, runner_key,
         "", true, addon::Json_value::object(),
     };
 }
@@ -355,19 +352,24 @@ std::vector<addon::Launcher_candidate> discover_launchers(
         environment.emplace_back(member.name, member.value.as_string());
     }
     std::string program = "codex-pet";
-    if (!resolve_program(program, environment, {}, Launcher_whitespace::ASCII)) {
+    auto selected = resolve_program(program, environment, {}, Launcher_whitespace::ASCII);
+    if (!selected) {
         program = "codex";
-        if (!resolve_program(program, environment, {}, Launcher_whitespace::ASCII)) {
+        selected = resolve_program(program, environment, {}, Launcher_whitespace::ASCII);
+        if (!selected) {
             return {};
         }
     }
+    const auto runner_key = addon::preferred_discovery_runner(
+        *selected,
+        request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct);
 
     const auto selected_home = configured_codex_home(request);
     const std::vector<fs::path> profiles = selected_home
         ? authenticated_codex_profiles(*selected_home, out_profile_stats)
         : std::vector<fs::path>{};
     if (profiles.empty()) {
-        return {generic_codex_candidate(request, program)};
+        return {generic_codex_candidate(program, runner_key)};
     }
 
     std::vector<addon::Launcher_candidate> candidates;
@@ -390,9 +392,7 @@ std::vector<addon::Launcher_candidate> discover_launchers(
             "codex_profile_" + std::to_string(index + 1),
             profile_display_name(profiles[index]),
             program,
-            request.platform_id == "windows-x86_64"
-                ? addon::k_runner_powershell
-                : addon::k_runner_direct,
+            runner_key,
             *environment_text,
             is_selected,
             addon::Json_value::object(),
