@@ -446,7 +446,8 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
     for (const auto& member : effective_environment.as_object()) {
         set_environment(environment, member.name, member.value.as_string());
     }
-    for (const auto& entry : command.environment) set_environment(environment, entry.first, entry.second);
+    // Script prefixes have already been applied to the frozen environment.
+    // Recognizer values retain shell spelling and cannot replace that result.
     const auto program = resolve_program(
         command.program, environment, working_directory, Launcher_whitespace::ASCII);
     if (!program) return std::nullopt;

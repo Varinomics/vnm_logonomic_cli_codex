@@ -16,6 +16,7 @@
 #include "codex_launcher_approval.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1389,6 +1390,55 @@ void probe_preparation_preserves_program_environment_and_custody(
     }
 }
 
+void probe_preparation_uses_frozen_export_values(const std::filesystem::path& executable)
+{
+    const auto directory = addon::path_to_utf8(executable.parent_path());
+    const auto profile = addon::path_to_utf8(std::filesystem::temp_directory_path() / "codex-export-profile");
+    addon::Probe_prepare_request request;
+    request.observe_current_account = true;
+    request.context.working_directory = directory;
+    request.context.account_context = addon::Account_context{2, codex::profile_account_key(profile), profile};
+    request.context.launch_environment = addon::Launch_environment{};
+    request.context.launch_environment->platform_id = addon::host_platform_id();
+    auto& frozen = request.context.launch_environment->effective_environment;
+    frozen.set("PATH", addon::Json_value(directory));
+    frozen.set("CODEX_BIN", addon::Json_value(directory));
+    frozen.set("CODEX_HOME", addon::Json_value(profile));
+    frozen.set("OPENAI_API_KEY", addon::Json_value(" frozen-token-canary "));
+    frozen.set("SESSION_KEY", addon::Json_value(" frozen-token-canary "));
+    frozen.set("EXTRA", addon::Json_value("two words"));
+    frozen.set("EMPTY", addon::Json_value(""));
+    for (const auto* script : {
+            "export\tPATH=\"$CODEX_BIN\"; codex",
+            "export PATH=\"$CODEX_BIN\" EXTRA='two words'; codex",
+            "export OPENAI_API_KEY=\"$SESSION_KEY\" EXTRA='two words'; codex",
+            "export OPENAI_API_KEY=first OPENAI_API_KEY=\"$SESSION_KEY\"; codex",
+            "export EMPTY='' OPENAI_API_KEY=\"$SESSION_KEY\"; codex"})
+    {
+        request.context.launcher = {script, addon::k_runner_bash, ""};
+        request.context.launcher_argv = {"bash", "-c", script};
+        for (const auto* capability : {"auth-status", "quota", "account-refresh"}) {
+            const bool shared = std::string_view(capability) == "account-refresh";
+            Context context;
+            context.input = {"export-probe", {capability, static_cast<std::uint16_t>(shared ? 1 : 2)},
+                "prepare", shared ? addon::encode_account_refresh_prepare_request(request)
+                    : addon::encode_probe_prepare_request(request, 2)};
+            codex::handle_probes(context);
+            const auto result = addon::decode_structured_prepare_result(context.output, nullptr);
+            check(context.succeeded && result, "export formatting must not hide the frozen native program");
+            const std::size_t program_index = std::string_view(capability) == "quota" ? 0 : 1;
+            check(std::filesystem::equivalent(addon::path_from_utf8(result->process.argv.at(program_index)), executable),
+                "probe program resolution uses the frozen PATH");
+            for (const auto* name : {"PATH", "CODEX_HOME", "OPENAI_API_KEY", "EXTRA", "EMPTY"}) {
+                check(addon::environment_value(result->process.environment, name) == frozen.find(name)->as_string() &&
+                    std::count_if(result->process.environment.begin(), result->process.environment.end(),
+                        [name](const auto& entry) { return entry.first == name; }) == 1,
+                    "probe environment preserves one exact frozen value for every prefix assignment");
+            }
+        }
+    }
+}
+
 #ifdef _WIN32
 void quota_batch_dispatch_matches_powershell(
     const std::filesystem::path& executable, const std::filesystem::path& helper)
@@ -1494,6 +1544,7 @@ int main(int argc, char** argv)
             std::filesystem::absolute(argv[1]));
         probe_preparation_preserves_program_environment_and_custody(
             std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
+        probe_preparation_uses_frozen_export_values(std::filesystem::absolute(argv[1]));
 #ifdef _WIN32
         quota_batch_dispatch_matches_powershell(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
 #endif
