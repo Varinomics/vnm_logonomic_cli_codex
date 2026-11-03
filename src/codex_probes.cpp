@@ -273,9 +273,8 @@ void handle_probes(addon::Invocation_context& context)
         for (const auto& item : environment.effective_environment.as_object()) {
             assign_environment(&result.process.environment, item.name, item.value.as_string(), windows);
         }
-        for (const auto& assignment : command->environment) {
-            assign_environment(&result.process.environment, assignment.first, assignment.second, windows);
-        }
+        // Keep the host's resolved prefix values, including quoting and
+        // expansion, instead of replaying recognizer text into the probe.
         assign_environment(&result.process.environment, "CODEX_HOME", selected->profile_path, windows);
         result.profile_storage = request->context.profile_storage;
         result.account_context = request->context.account_context;
