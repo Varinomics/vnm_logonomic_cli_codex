@@ -40,6 +40,21 @@ else()
     endif()
 endif()
 
+if(NOT TARGET tomlplusplus::tomlplusplus)
+    find_path(CODEX_TOML_INCLUDE_DIR NAMES toml++/toml.hpp)
+    if(NOT CODEX_TOML_INCLUDE_DIR)
+        include(FetchContent)
+        # Consume only headers so sibling packages can select their own parser target.
+        FetchContent_Declare(codex_tomlplusplus
+            GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+            GIT_TAG master
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR include)
+        FetchContent_MakeAvailable(codex_tomlplusplus)
+        set(CODEX_TOML_INCLUDE_DIR "${codex_tomlplusplus_SOURCE_DIR}/include")
+    endif()
+endif()
+
 function(codex_target target)
     target_link_libraries(${target} PRIVATE logonomic_cli_addon_sdk::sdk)
     # The Windows API selection belongs to the platform, so a MinGW build gets
@@ -58,6 +73,7 @@ endfunction()
 add_library(codex_provider STATIC
     src/codex_account_refresh.cpp
     src/codex_accounts.cpp
+    src/codex_pet.cpp
     src/codex_context.cpp
     src/codex_conversation.cpp
     src/codex_conversation_source.cpp
@@ -157,6 +173,13 @@ target_link_libraries(codex_adapter PRIVATE codex_provider)
 codex_target(codex_adapter)
 add_executable(codex_helper src/codex_helper.cpp)
 codex_target(codex_helper)
+add_executable(codex_pet_helper src/codex_pet_helper.cpp src/codex_pet_inspection.cpp)
+codex_target(codex_pet_helper)
+if(TARGET tomlplusplus::tomlplusplus)
+    target_link_libraries(codex_pet_helper PRIVATE tomlplusplus::tomlplusplus)
+else()
+    target_include_directories(codex_pet_helper SYSTEM PRIVATE "${CODEX_TOML_INCLUDE_DIR}")
+endif()
 logonomic_cli_addon_add_launch_bridge(codex_launch_bridge)
 codex_target(codex_launch_bridge)
 add_executable(codex_quota_helper src/codex_quota_helper.cpp src/codex_quota_exchange.cpp
@@ -171,7 +194,7 @@ set(CODEX_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
 logonomic_cli_addon_add_package(codex_package logonomic.cli.codex CODEX_PACKAGE_DIRECTORY
     ADAPTER codex_adapter
-    HELPERS codex_helper codex_launch_bridge codex_quota_helper
+    HELPERS codex_helper codex_pet_helper codex_launch_bridge codex_quota_helper
     INDEX_ARGUMENTS
         --third-party "assets/openai.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
@@ -185,6 +208,12 @@ if(LOGONOMIC_CLI_ADDON_EMBEDDED)
 endif()
 
 enable_testing()
+add_executable(codex_pet_tests tests/codex_pet_tests.cpp)
+target_link_libraries(codex_pet_tests PRIVATE codex_provider)
+codex_target(codex_pet_tests)
+add_dependencies(codex_pet_tests codex_package)
+add_test(NAME codex_pet_tests COMMAND codex_pet_tests "${CODEX_PACKAGE_DIRECTORY}")
+set_tests_properties(codex_pet_tests PROPERTIES TIMEOUT 90)
 add_executable(codex_macho_tests tests/codex_macho_tests.cpp)
 target_include_directories(codex_macho_tests PRIVATE src)
 if(MSVC)

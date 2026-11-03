@@ -4,6 +4,7 @@
 #include "codex_launcher.h"
 #include "codex_launcher_approval.h"
 #include "codex_lifecycle.h"
+#include "codex_pet.h"
 #include "codex_preparation.h"
 #include "codex_probes.h"
 #include "codex_startup_observation.h"
@@ -76,6 +77,10 @@ void invoke(addon::Invocation_context& context)
         else
         if (request.capability.capability_id == "accounts") {
             codex::handle_accounts(context);
+        }
+        else
+        if (request.capability.capability_id == addon::k_account_pet_capability_id) {
+            codex::handle_account_pet(context);
         }
         else
         if (request.capability.capability_id == "auth-status" || request.capability.capability_id == "quota" ||
@@ -157,6 +162,7 @@ int main()
         {addon::k_async_question_attention_capability_id, addon::k_async_question_attention_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 3},
+        {addon::k_account_pet_capability_id, addon::k_account_pet_version},
         {"current-account", 1},
         {addon::k_quota_failure_capability_id, addon::k_quota_failure_version},
         {addon::k_account_refresh_capability_id, addon::k_account_refresh_version},

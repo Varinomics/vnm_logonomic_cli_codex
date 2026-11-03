@@ -1,0 +1,7 @@
+{
+  "upstream": "https://github.com/marzer/tomlplusplus",
+  "source": "include/toml++",
+  "license": "MIT",
+  "notice": "notices/tomlplusplus_mit.txt",
+  "use": "Header-only TOML parsing compiled into the Codex pet metadata helper."
+}
