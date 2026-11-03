@@ -85,7 +85,7 @@ std::optional<Conversation_store_source> conversation_store_source(
         "SELECT rollout_path, history_mode FROM threads WHERE id = ?1", -1, &raw_statement, nullptr);
     const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(raw_statement, sqlite3_finalize);
     if (prepared != SQLITE_OK || sqlite3_bind_text(statement.get(), 1, session_id.data(),
-            static_cast<int>(session_id.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
+            static_cast<int>(session_id.size()), SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_step(statement.get()) != SQLITE_ROW ||
         sqlite3_column_type(statement.get(), 0) != SQLITE_TEXT ||
         sqlite3_column_type(statement.get(), 1) != SQLITE_TEXT)

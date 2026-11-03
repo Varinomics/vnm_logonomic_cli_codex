@@ -58,6 +58,7 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
 {
     std::optional<fs::path> found;
     const std::string suffix = "-" + std::string(id) + ".jsonl";
+    const std::string compressed_suffix = suffix + ".zst";
     for (const auto* directory : {"sessions", "archived_sessions"}) {
         const auto root = profile / directory;
         if (!fs::exists(root)) {
@@ -69,7 +70,7 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
                 return {};
             }
             const auto name = addon::path_to_utf8(entry.path().filename());
-            if (name.ends_with(suffix + ".zst")) {
+            if (name.ends_with(compressed_suffix)) {
                 fail(failure, "conversation_format_unavailable",
                     "This Codex conversation uses compressed native history.");
                 return {};
@@ -90,13 +91,14 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
     return found;
 }
 
-std::string reference(std::string value)
+std::string reference(std::string_view value)
 {
     if (value.starts_with("data:")) {
         const auto end = value.find_first_of(";,");
-        return "Embedded " + value.substr(5, end == std::string::npos ? end : end - 5) + " attachment";
+        return "Embedded " + std::string(value.substr(5, end == std::string_view::npos ? end : end - 5)) +
+            " attachment";
     }
-    return value;
+    return std::string(value);
 }
 
 bool content_blocks(const Json& content, std::vector<Block>& blocks, Kind text_kind,
@@ -120,17 +122,24 @@ bool content_blocks(const Json& content, std::vector<Block>& blocks, Kind text_k
         }
         else
         if (type == "input_image" || type == "image" || type == "input_audio") {
-            auto value = json::text(part, type == "input_audio" ? "audio_url" : "image_url");
+            const auto& url = json::member(part, type == "input_audio" ? "audio_url" : "image_url");
+            std::string_view value = url.is_string() ? url.as_string() : std::string_view{};
             if (value.empty()) {
-                value = json::text(part, "file_id");
+                const auto& file_id = json::member(part, "file_id");
+                if (file_id.is_string()) {
+                    value = file_id.as_string();
+                }
             }
             if (value.empty() && type == "image") {
-                value = json::text(part, "data").empty() ? std::string{} : "Embedded image attachment";
+                const auto& data = json::member(part, "data");
+                if (data.is_string() && !data.as_string().empty()) {
+                    value = "Embedded image attachment";
+                }
             }
             if (value.empty()) {
                 return fail(failure, "conversation_content_invalid", "A Codex attachment reference is missing.");
             }
-            blocks.push_back({Kind::ATTACHMENT, reference(std::move(value)), type});
+            blocks.push_back({Kind::ATTACHMENT, reference(value), type});
         }
         else {
             return fail(failure, "conversation_content_unavailable",
