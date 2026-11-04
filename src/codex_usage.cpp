@@ -235,16 +235,17 @@ std::string encode_record(const Rollout_usage_record& record,
     bool include_temporal = true, bool include_turn_context = false)
 {
     auto envelope = record_accounting(record);
+    const bool with_temporal = include_temporal && (record.temporal.instant || record.temporal.opaque ||
+        record.temporal.reason != "missing-evidence");
+    auto temporal = with_temporal
+        ? encode_temporal_observation(record.temporal, envelope) : addon::Json_value{};
     // This flag travels only through a fresh parse's temporary spool. Accepted
     // caches never supply a witness for a later correction.
     if (include_turn_context && record.turn_cwd_witnessed) {
         envelope.set("turn_cwd_witnessed", addon::Json_value(true));
     }
-    if (include_temporal && (record.temporal.instant || record.temporal.opaque ||
-        record.temporal.reason != "missing-evidence"))
-    {
-        envelope.set("temporal_observation", encode_temporal_observation(record.temporal,
-            record_accounting(record)));
+    if (with_temporal) {
+        envelope.set("temporal_observation", std::move(temporal));
         const auto encoded = addon::serialize_json(envelope);
         if (encoded.size() <= k_line_limit) return encoded;
         envelope.erase("temporal_observation");
@@ -417,27 +418,6 @@ bool id_less(std::string_view left, std::string_view right)
         [](unsigned char a, unsigned char b) { return a < b; });
 }
 
-// Consecutive turns in one directory resolve its repository once. The memo
-// holds one directory however many a history has.
-class Repository_memo final
-{
-public:
-    void refresh(Rollout_usage_record* record)
-    {
-        if (!m_resolved || m_cwd != record->recorded_cwd) {
-            m_cwd      = record->recorded_cwd;
-            m_root     = repository_for_cwd(record->recorded_cwd);
-            m_resolved = true;
-        }
-        refresh_repository(record, m_root);
-    }
-
-private:
-    std::string                m_cwd;
-    std::optional<std::string> m_root;
-    bool                       m_resolved = false;
-};
-
 fs::path run_path(const fs::path& work, std::string_view name, std::uint64_t level, std::uint64_t index)
 {
     return work / (std::string(name) + "-" + std::to_string(level) + "-" + std::to_string(index));
@@ -493,6 +473,18 @@ public:
         m_chunk.push_back(std::move(record));
     }
 
+    // Unfinished peer runs are unnecessary when no rollout was reparsed.
+    void discard()
+    {
+        m_chunk.clear();
+        m_bytes = 0;
+        for (std::uint64_t index = 0; index < m_runs; ++index) {
+            check_cancel(m_cancelled);
+            fs::remove(run_path(m_work, m_name, 0, index));
+        }
+        m_runs = 0;
+    }
+
     // Moves every added line, sorted by key, to `destination`.
     void finish(const fs::path& destination)
     {
@@ -511,6 +503,7 @@ public:
         }
         if (m_runs == 1) fs::rename(run_path(m_work, m_name, level, 0), destination);
         else { std::ofstream empty(destination, std::ios::binary); require(static_cast<bool>(empty), "usage_storage_write_failed"); }
+        m_runs = 0;
     }
 
 private:
@@ -1445,21 +1438,27 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         request.mode != "incremental", parsed, rollout_peers, unindexed_rollouts,
         progress, working, &metadata_changed, &reparsed, !incremental);
     fs::remove(found_rollouts_path);
-    const auto unindexed_path = work / "unindexed-rollouts";
-    unindexed_rollouts.finish(unindexed_path);
-    if (reparsed && fs::file_size(unindexed_path) != 0 &&
-        index_rollout_copies(request, accepted_manifest, work,
-            unindexed_path, rollout_peers, limits, working))
-    {
-        incomplete = true;
+    if (reparsed) {
+        const auto unindexed_path = work / "unindexed-rollouts";
+        unindexed_rollouts.finish(unindexed_path);
+        if (fs::file_size(unindexed_path) != 0 &&
+            index_rollout_copies(request, accepted_manifest, work,
+                unindexed_path, rollout_peers, limits, working))
+        {
+            incomplete = true;
+        }
+        fs::remove(unindexed_path);
+        const auto peers_path = work / "rollout-peers";
+        rollout_peers.finish(peers_path);
+        if (recheck_rollout_copies(work, peers_path, parsed, progress, working)) {
+            incomplete = true;
+        }
+        fs::remove(peers_path);
     }
-    fs::remove(unindexed_path);
-    const auto peers_path = work / "rollout-peers";
-    rollout_peers.finish(peers_path);
-    if (recheck_rollout_copies(work, peers_path, parsed, progress, working)) {
-        incomplete = true;
+    else {
+        unindexed_rollouts.discard();
+        rollout_peers.discard();
     }
-    fs::remove(peers_path);
     // Incremental source observations do not prove that earlier coverage gaps
     // were resolved. A repair or reset verifies current sources in full.
     if (request.mode == "incremental" && accepted_incomplete) {

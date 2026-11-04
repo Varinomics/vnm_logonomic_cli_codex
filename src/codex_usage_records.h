@@ -22,7 +22,6 @@ struct Rollout_usage_record
 };
 
 std::optional<std::string> repository_for_cwd(std::string_view cwd);
-void refresh_repository(Rollout_usage_record* record);
 // Attributes the record to `repository`, already resolved for its recorded cwd.
 void refresh_repository(Rollout_usage_record* record, const std::optional<std::string>& repository);
 bool read_rollout_usage(std::istream& input, const std::filesystem::path& path,

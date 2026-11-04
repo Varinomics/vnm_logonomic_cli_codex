@@ -254,16 +254,23 @@ void reducer_attributes_resumed_turns(const fs::path& fixture)
     const auto records = reduce(
         metadata_with_cwd("resumed", original) +
         start("first") + turn_context("first", original) + tokens(1200) + complete("first") +
-        start("second") + turn_context("second", resumed) + tokens(1800) + complete("second"),
+        start("second") + tokens(1800) + complete("second") +
+        start("third") + turn_context("third", resumed) + tokens(2100) + complete("third") +
+        start("fourth") + turn_context("fourth", resumed) + tokens(2500) + complete("fourth"),
         fixture / "rollout-resumed.jsonl");
-    check(records.size() == 2 && records[0].usage.total_tokens == 1200 &&
-        records[1].usage.total_tokens == 600, "resume keeps the correct account-wide token deltas");
-    check(records[0].recorded_cwd == addon::path_to_utf8(original) &&
-        records[1].recorded_cwd == addon::path_to_utf8(resumed),
-        "each completed turn uses its matching native working directory");
-    check(records[0].usage.repository_usage->allocations[0].repository_path == addon::path_to_utf8(original) &&
-        records[1].usage.repository_usage->allocations[0].repository_path == addon::path_to_utf8(resumed),
-        "resumed usage belongs to its native turn repository");
+    check(records.size() == 4 && records[0].usage.total_tokens == 1200 &&
+        records[1].usage.total_tokens == 600 && records[2].usage.total_tokens == 300 &&
+        records[3].usage.total_tokens == 400, "resume keeps the correct account-wide token deltas");
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        const auto expected = addon::path_to_utf8(index < 2 ? original : resumed);
+        const auto& record = records[index];
+        check(record.recorded_cwd == expected,
+            "each completed turn uses its matching native working directory");
+        check(record.usage.repository_usage && record.usage.repository_usage->allocations.size() == 1 &&
+            record.usage.repository_usage->allocations[0].repository_path == expected &&
+            record.usage.repository_usage->allocations[0].total_tokens == record.usage.total_tokens,
+            "repeated and resumed directories retain each turn's own repository allocation");
+    }
 
     const auto invalid_context = "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":42,\"cwd\":" +
         addon::serialize_json(addon::Json_value(addon::path_to_utf8(resumed))) + "}}\n";
@@ -1189,6 +1196,39 @@ void selected_cache_stays_compact_across_incremental_scans(const fs::path& fixtu
     const auto first = scan("first", std::nullopt);
     check(first.records.size() == rollouts && total(first) == 1180, "first scan records every rollout");
     check(files(first) <= 4, "a candidate's file count does not grow with its rollouts");
+
+    const auto unindexed_root = storage / "unindexed";
+    check(fs::create_directory(unindexed_root), "allocate unindexed compact baseline");
+    for (const auto* name : {"snapshot", "cache-state", "records"}) {
+        check(fs::copy_file(storage / "first" / name, unindexed_root / name), "copy compact accounting baseline");
+    }
+    {
+        std::ifstream input(storage / "first" / "rollouts", std::ios::binary);
+        std::ofstream output(unindexed_root / "rollouts", std::ios::binary);
+        check(input && output, "open compact rollout metadata");
+        std::string line;
+        while (std::getline(input, line)) {
+            auto row = addon::parse_json(line, {}, nullptr);
+            check(row.has_value(), "decode compact rollout metadata");
+            row->erase("native_session");
+            output << addon::serialize_json(*row) << '\n';
+        }
+        check(input.eof() && output, "write compact rollout metadata without a native-session index");
+    }
+    addon::Contract_failure failure;
+    const auto unindexed = addon::seal_usage_cache_candidate(utf8(unindexed_root), utf8(storage),
+        request.context.account_context, first.snapshot_id, "codex-rollout-cache@3", cancelled, &failure);
+    check(unindexed.has_value(), "seal unindexed compact baseline");
+    for (const auto& baseline : {*first.cache_candidate, *unindexed}) {
+        const auto candidate = storage / (baseline.root == first.cache_candidate->root
+            ? "unchanged-indexed" : "unchanged-unindexed");
+        check(fs::create_directory(candidate), "allocate unchanged compact candidate");
+        request.cache_selection = addon::Usage_cache_selection{baseline, utf8(candidate)};
+        const auto unchanged = codex::scan_usage_incremental(
+            request, profile, storage, cancelled, quiet_progress, &error, limits);
+        check(unchanged && !unchanged->changes && unchanged->baseline == baseline && fs::is_empty(candidate),
+            "unchanged indexed and unindexed histories discard every temporary run and retain the accepted generation");
+    }
 
     // Rollout 0 gains a turn, rollout 1 disappears, and rollout 2 becomes
     // unparseable behind an unchanged size and modification time.
