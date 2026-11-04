@@ -152,6 +152,27 @@ struct Cumulative_category
     }
 };
 
+// Consecutive turns in one directory resolve its repository once. The memo
+// holds one directory however many a history has and expires with its parse.
+class Repository_memo final
+{
+public:
+    void refresh(Rollout_usage_record* record)
+    {
+        if (!m_resolved || m_cwd != record->recorded_cwd) {
+            m_cwd      = record->recorded_cwd;
+            m_root     = repository_for_cwd(record->recorded_cwd);
+            m_resolved = true;
+        }
+        refresh_repository(record, m_root);
+    }
+
+private:
+    std::string                m_cwd;
+    std::optional<std::string> m_root;
+    bool                       m_resolved = false;
+};
+
 } // namespace
 
 std::optional<std::string> repository_for_cwd(std::string_view cwd)
@@ -167,11 +188,6 @@ std::optional<std::string> repository_for_cwd(std::string_view cwd)
         candidate = parent;
     }
     return std::nullopt;
-}
-
-void refresh_repository(Rollout_usage_record* record)
-{
-    refresh_repository(record, repository_for_cwd(record->recorded_cwd));
 }
 
 void refresh_repository(Rollout_usage_record* record, const std::optional<std::string>& repository)
@@ -191,6 +207,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
     std::int64_t started_ms = 0;
     std::uint64_t latest = 0, pending = 0;
     Cumulative_category input_tokens, output_tokens, cache_tokens;
+    Repository_memo repository;
     bool have_identity = false, have_total = false, forked = false, local_activity = false;
     bool complete_turn_event = false, saw_turn_sample = false;
     bool turn_cwd_witnessed = false;
@@ -303,7 +320,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
         }
         record.recorded_cwd = cwd;
         record.turn_cwd_witnessed = turn_cwd_witnessed;
-        refresh_repository(&record);
+        repository.refresh(&record);
         if (!emit(record)) return false;
         pending = 0;
         complete_turn_event = false;
