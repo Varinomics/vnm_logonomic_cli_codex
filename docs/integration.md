@@ -60,15 +60,22 @@ selection. Rejecting a reporting hook does not prevent two native live owners.
 Equivalent cross-worktree adoption and exclusive ownership remain bounded by
 the shared host contract and a suitable native selection control.
 
+Codex builds with native hook trust present their own startup hook review.
+Continuing without trusting leaves the prepared hooks inactive. Logonomic does
+not override that choice. An isolated Windows TUI check with Codex `0.160.0`
+confirmed this review for command-line hooks and continuation without trusting.
+
 `codex_resume_tests` checks these event shapes, nonce-attributed cwd, native-history
-inspection and packaged host negotiation. It does not emulate a successful native
-selection by sending slash-command text. The attempted native gate used Codex
-`0.167.0-alpha.4`, `--no-alt-screen --no-daemon`, a disposable profile and a no-auth
-loopback model fixture. Startup stopped before a thread existed because the
-required read-only sandbox could not create a `NETLINK_ROUTE` socket. Managed
-requirements also rejected `danger-full-access`; they were not bypassed.
-Actual native switch order, picker cancellation and loaded-thread return remain
-unvalidated in this environment.
+inspection and packaged host negotiation. A disposable Windows native App Server
+check with Codex `0.160.0` and a no-auth loopback model confirmed deferred initial
+starts and loaded A → B → A return without another `SessionStart`. The returned
+thread's prompt and stop hooks still carried its exact ID. Those facts establish
+the engine boundary; they do not establish which loaded thread the TUI displays.
+The provider does not promote an unmatched prompt into an activation; the host
+rejects events whose identity differs from its current epoch. A background
+thread's prompt does not prove a foreground selection. Actual TUI picker
+cancellation, selection order and cross-directory reassociation need their own
+native acceptance; sending slash-command text is not proof of selection.
 
 Interactive launch and resume reuse the native configuration read described
 below to keep the terminal title's activity field available. If an explicit

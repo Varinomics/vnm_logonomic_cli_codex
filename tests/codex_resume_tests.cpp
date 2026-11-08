@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -178,6 +179,8 @@ void native_activation_facts(const fs::path& fixture)
 addon::Resume_inspect_request inspection_request(const fs::path& fixture)
 {
     const auto profile = addon::path_to_utf8(fixture / "profile");
+    // Native preparation publishes its verified state store with generic separators.
+    const auto store = (fixture / "store").generic_u8string();
     addon::Resume_inspect_request request;
     request.context.launcher = {"codex", addon::k_runner_direct, {}};
     request.context.launcher_argv = {"codex"};
@@ -186,7 +189,8 @@ addon::Resume_inspect_request inspection_request(const fs::path& fixture)
     request.context.launch_environment = addon::Launch_environment{
         addon::host_platform_id(), Json::object(), std::nullopt};
     request.context.launch_environment->effective_environment.set("CODEX_HOME", Json("/unrelated/current-profile"));
-    request.resume_record = *codex::bound_resume_record(k_session_a, profile, addon::path_to_utf8(fixture / "store"));
+    request.resume_record = *codex::bound_resume_record(k_session_a, profile,
+        std::string(store.begin(), store.end()));
     return request;
 }
 
@@ -333,6 +337,11 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture)
     addon::Resume_prepare_request request;
     request.context = inspection.context;
     request.context.launcher_argv = {addon::path_to_utf8(native_fixture)};
+    request.context.launch_environment->effective_environment.set("TEMP",
+        Json(addon::path_to_utf8(fs::temp_directory_path())));
+    if (const char* system_root = std::getenv("SystemRoot")) {
+        request.context.launch_environment->effective_environment.set("SystemRoot", Json(system_root));
+    }
     request.context.launch_environment->effective_environment.set("CODEX_FIXTURE_SQLITE_HOME",
         Json(addon::path_to_utf8(fixture / "changed-default-store")));
     request.resume_record = inspection.resume_record;
@@ -344,8 +353,10 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture)
     codex::handle_preparation(context);
     addon::Contract_failure failure;
     const auto result = addon::decode_resume_prepare_result(context.output, &failure, 2);
-    check(context.succeeded && result, "saved native store supports explicit preparation");
-    const auto store = addon::path_to_utf8(fixture / "store");
+    check(context.succeeded && result,
+        "saved native store supports explicit preparation: " + addon::serialize_json(context.output));
+    const auto store_path = (fixture / "store").generic_u8string();
+    const std::string store(store_path.begin(), store_path.end());
     check(result->process.argv.back() == k_session_a &&
         result->process.argv[result->process.argv.size() - 2] == request.context.working_directory &&
         result->process.argv[result->process.argv.size() - 3] == "-C" &&
