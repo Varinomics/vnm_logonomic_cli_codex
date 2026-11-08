@@ -16,6 +16,60 @@ from the host's one-shot admission service and returned using Codex's
 content through the lifecycle ledger or fabricate instructions after admission
 fails.
 
+### Native conversation activation and default directory
+
+Root `SessionStart` observations retain the exact native session ID. Native
+`startup`, `clear` and `fork` sources establish a new conversation; `resume`
+establishes a resumed activation, including a return to a previously observed
+ID. The provider sends one STARTED observation with the native source. The host
+owns the epoch, stable conversation/Notes association, departure retention and
+late-event rejection. `SessionEnd` retains the ending ID and native reason;
+it does not retarget the current conversation. Native `compact` starts and
+`PostCompact` update context without creating a departed conversation.
+
+When preparation resolves and pins the local native store, the helper captures
+that `CODEX_HOME` and `sqlite_home` with the ID in an opaque `native_store`
+version 1 resume record. These values come from the prepared process environment,
+not hook-supplied extra fields. A delivery retry uses the same helper key and
+transition nonce. A separate native start gets a fresh nonce; it is not deduplicated
+merely because the conversation ID appeared earlier.
+
+With `execution-context@1` negotiated, the same accepted start carries the exact
+native `cwd`, environment `local`, its activation nonce and sequence zero.
+Absolute nested and non-Git paths are valid, and no path normalization or Git-root
+replacement is performed. Missing or invalid cwd yields an attributed UNKNOWN
+observation while identity remains usable. The provider does not infer the
+default directory from a transcript, launch directory, tool-specific `workdir`,
+child shell, title or typed command. It does not emit later cwd-only observations:
+those require an authoritative default-directory signal captured with the
+activation identity at its native source. Host-initiated resume continues to pass
+`resume -C <host-selected-directory> <exact-id>`; this argument alone is not
+confirmation that Codex accepted that directory.
+
+These are reporting hooks, with a specific native observation boundary. Source
+review at Codex `748ab55ca7de0b647d9a7a9d9a8e70e00f28666d` still shows
+[`SessionStart` dispatch during turn processing](https://github.com/openai/codex/blob/748ab55ca7de0b647d9a7a9d9a8e70e00f28666d/codex-rs/core/src/session/turn.rs)
+and [reuse of an already loaded thread on resume](https://github.com/openai/codex/blob/748ab55ca7de0b647d9a7a9d9a8e70e00f28666d/codex-rs/app-server/src/request_processors/thread_processor.rs).
+Consequently an idle `/clear`, `/new` or cold `/resume` need not be reported until
+a turn, and returning to a loaded conversation need not emit a new start at all.
+The provider cannot promise immediate picker selection, idle A → B → A, or its
+accepted cwd from this hook path. No command text or file-activity heuristic fills
+that gap. The [native start hook](https://github.com/openai/codex/blob/748ab55ca7de0b647d9a7a9d9a8e70e00f28666d/codex-rs/hooks/src/events/session_start.rs)
+can stop processing a turn, but that is not a proven veto or rollback of a TUI
+selection. Rejecting a reporting hook does not prevent two native live owners.
+Equivalent cross-worktree adoption and exclusive ownership remain bounded by
+the shared host contract and a suitable native selection control.
+
+`codex_resume_tests` checks these event shapes, nonce-attributed cwd, native-history
+inspection and packaged host negotiation. It does not emulate a successful native
+selection by sending slash-command text. The attempted native gate used Codex
+`0.167.0-alpha.4`, `--no-alt-screen --no-daemon`, a disposable profile and a no-auth
+loopback model fixture. Startup stopped before a thread existed because the
+required read-only sandbox could not create a `NETLINK_ROUTE` socket. Managed
+requirements also rejected `danger-full-access`; they were not bypassed.
+Actual native switch order, picker cancellation and loaded-thread return remain
+unvalidated in this environment.
+
 Interactive launch and resume reuse the native configuration read described
 below to keep the terminal title's activity field available. If an explicit
 `tui.terminal_title` list omits both `activity` and its `spinner` alias, preparation
@@ -103,6 +157,35 @@ exporter, and verifies startup telemetry using an isolated saved conversation.
 The probe does not request a model turn. Authentication headers remain in the
 launched process environment, while vendor OTLP interpretation belongs to this
 package.
+
+The provider also declares optional `interactive-resume@3` and `@4`, with the
+same preparation/startup declaration as `@2`. Read-only inspection checks the
+exact saved native store and account before selecting history; it does not run
+Codex or a model. Version 3 reports availability and the exact-request digest.
+Version 4 additionally reports independent UNKNOWN, EMPTY or NONEMPTY content.
+An original ID-only record has no trustworthy stored location for later
+inspection and therefore remains UNKNOWN. It retains the older explicit
+resume path. A new bound record is inspected afresh for explicit preparation,
+then its saved store is pinned and verified through the native config reader;
+changed launcher defaults cannot silently redirect that resume.
+UNKNOWN inspection leaves this explicit path available: a supported native
+reader can resolve history that the provider cannot inspect. The exact ID and
+private startup confirmation still govern association. Invalid scope or failed
+native-store verification remains a preparation failure.
+
+The [conversation reader](conversation_export.md) supplies the inspection's
+identity and replay checks. Complete understood metadata or injected context
+without meaningful conversation content can be EMPTY. Canonical user,
+assistant, tool or agent content is NONEMPTY when its history is understood.
+Partial final writes, malformed or unsupported history, inherited/reference
+ambiguity and unsupported compaction remain UNKNOWN. Every inspection reads a
+fresh snapshot, so a completed later write can change the answer without
+reconstructing the saved record. A missing SQLite row or file alone remains
+UNKNOWN: native legacy filesystem fallback or a live writer can still resolve
+the conversation. Inspection never deletes or alters native history. The optional
+inspection reads at most a 64 MiB source and honors cancellation; larger or
+inaccessible sources remain UNKNOWN, while explicit export keeps its existing
+snapshot behavior.
 
 ## Initial prompt
 

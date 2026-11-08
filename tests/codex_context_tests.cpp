@@ -158,9 +158,10 @@ public:
         addon::Classify_event_request result;
         result.event.name = hook;
         result.event.body = codex::hook_metadata(native);
-        check(!result.event.body.find("prompt") && !result.event.body.find("cwd") &&
+        check(!result.event.body.find("prompt") &&
+            (hook == "SessionStart" ? addon::json::text(result.event.body, "cwd") == "private" : !result.event.body.find("cwd")) &&
             addon::json::text(result.event.body, "transcript_path") == addon::path_to_utf8(transcript),
-            "the helper's bounded metadata preserves the exact transcript without prompt or cwd");
+            "bounded metadata preserves transcript and only start cwd, without prompt content");
         result.ledger.current_epoch = 1;
         result.ledger.current_transition = addon::Ledger_transition{
             addon::Transition_kind::START, "session-a", std::string(32, 'a')};

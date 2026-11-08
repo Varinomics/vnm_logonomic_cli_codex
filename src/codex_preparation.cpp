@@ -1,9 +1,12 @@
 #include "codex_preparation.h"
 #include "codex_jsonl.h"
 #include "codex_accounts.h"
+#include "codex_conversation.h"
+#include "codex_conversation_source.h"
 #include "codex_launcher.h"
 #include "codex_startup_probe.h"
 #include "codex_session_wake.h"
+#include "codex_resume_record.h"
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launch_preparation.h>
@@ -15,7 +18,6 @@
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
-#include <regex>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -276,19 +278,34 @@ void prepare_resume(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
-    const auto* id = request->resume_record.find("provider_session_id");
+    const auto record = decode_resume_record(request->resume_record);
     const auto profile = selected_profile(request->context, context);
     if (!profile) return;
-    static const std::regex uuid("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
     const auto directory = addon::path_from_utf8(request->context.working_directory);
-    if (!request->resume_record.is_object() || request->resume_record.as_object().size() != 1 ||
-        !id || !id->is_string() || !std::regex_match(id->as_string(), uuid) ||
+    if (!record ||
         !directory.is_absolute() || directory.lexically_normal() != directory || !request->startup_observer ||
         request->startup_observer->confirmation != "prepared-identity")
     {
         context.fail(addon::Result_status::FAILED, "invalid_resume_request",
             "Exact Codex resume requires a canonical session UUID, workspace and private startup observer.");
         return;
+    }
+    if (!record->sqlite_home.empty()) {
+        if (record->codex_home != profile->profile_path) {
+            context.fail(addon::Result_status::UNAVAILABLE, "resume_scope_unavailable");
+            return;
+        }
+        const auto inspection = inspect_resume({request->context, request->resume_record},
+            [&] { return context.cancel_requested(); });
+        if (context.cancel_requested() || inspection.availability == addon::Resume_availability::ABSENT) {
+            context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+                context.cancel_requested() ? "cancelled" : "resume_source_unavailable");
+            return;
+        }
+        // UNKNOWN must remain explicitly recoverable. Native Codex may support
+        // a compressed/referenced source or a live writer the reader cannot
+        // inspect. The verified scope and private startup observer still bind
+        // the actual launch to this exact ID; no last-session fallback is used.
     }
     const auto literal = request->context.launcher.runner_key == addon::k_runner_direct
         ? request->context.launcher_argv : addon::literal_argv(request->context.launcher.script_body);
@@ -303,9 +320,19 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
         return;
     }
+    if (!record->sqlite_home.empty()) {
+        // Resume the saved native scope even if the launcher's current defaults changed.
+        launch->argv.insert(launch->argv.end(), {"-c", "sqlite_home=" + toml_string(record->sqlite_home)});
+    }
     auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
         request->context.working_directory, context);
+    if (!record->sqlite_home.empty() &&
+        addon::environment_value(launch->environment, k_export_sqlite_home_environment) != record->sqlite_home)
+    {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_scope_unavailable");
+        return;
+    }
     std::optional<addon::Session_wake_preparation> wake;
     if (request->context.session_wake) {
         wake = std::move(native_preparation.session_wake);
@@ -333,7 +360,7 @@ void prepare_resume(addon::Invocation_context& context)
     const auto configuration_end = launch->argv.size();
     launch->argv.insert(launch->argv.end(), {"-c", "otel.exporter={otlp-http={endpoint=" +
         toml_string(request->startup_observer->endpoint) + ",protocol=\"json\"}}", "-c", "otel.log_user_prompt=false",
-        "resume", "-C", request->context.working_directory, id->as_string()});
+        "resume", "-C", request->context.working_directory, record->session_id});
     add_title_activity(launch->argv, configuration_end, native_preparation.terminal_title);
     addon::Resume_prepare_result result;
 #ifdef _WIN32
@@ -597,6 +624,23 @@ bool hooks_configuration_conflicts(const std::vector<std::string>& argv, std::si
 
 void handle_preparation(addon::Invocation_context& context)
 {
+    if (context.request().capability.capability_id == "interactive-resume" &&
+        context.request().operation == addon::k_inspect_resume_operation)
+    {
+        addon::Contract_failure failure;
+        const auto request = addon::decode_resume_inspect_request(context.request().payload, &failure);
+        if (!request) {
+            context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+            return;
+        }
+        const auto result = inspect_resume(*request, [&] { return context.cancel_requested(); });
+        if (context.cancel_requested()) {
+            context.fail(addon::Result_status::CANCELLED, "cancelled");
+            return;
+        }
+        context.succeed(addon::encode_resume_inspect_result(result, context.request().capability.version));
+        return;
+    }
     if (context.request().capability.capability_id == "interactive-resume" && context.request().operation == addon::k_prepare_resume_operation) {
         prepare_resume(context);
         return;

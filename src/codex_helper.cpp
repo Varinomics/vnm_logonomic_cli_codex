@@ -1,4 +1,6 @@
 #include "codex_hook_metadata.h"
+#include "codex_conversation_source.h"
+#include "codex_resume_record.h"
 
 #include <logonomic_cli_addon/helper_client.h>
 #include <logonomic_cli_addon/ids.h>
@@ -13,6 +15,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -96,7 +99,19 @@ int main()
     }
     const auto key   = addon::random_nonce_hex();
     const auto nonce = addon::random_nonce_hex();
-    const auto metadata = codex::hook_metadata(*event);
+    auto metadata = codex::hook_metadata(*event);
+    if (name->as_string() == "SessionStart" && !event->find("agent_id")) {
+        const auto* session = event->find("session_id");
+        const auto* profile = std::getenv("CODEX_HOME");
+        const auto* sqlite = std::getenv(codex::k_export_sqlite_home_environment);
+        // The preparer pins this native store in argv. Do not accept a store
+        // supplied by hook JSON or recover it later from an unrelated profile.
+        if (session && session->is_string() && profile && sqlite) {
+            if (auto record = codex::bound_resume_record(session->as_string(), profile, sqlite)) {
+                metadata.set("resume_record", std::move(*record));
+            }
+        }
+    }
     auto outcome = client.deliver_provider_event(name->as_string(), metadata, key, nonce);
     if (!short_hook && !outcome.committed && !cancelled() &&
         (outcome.exit_code == addon::k_helper_exit_transport_failure || outcome.exit_code == addon::k_helper_exit_pending))

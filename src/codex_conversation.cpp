@@ -2,6 +2,7 @@
 
 #include "codex_accounts.h"
 #include "codex_conversation_source.h"
+#include "codex_resume_record.h"
 
 #include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -291,35 +293,51 @@ bool response_message(const Json& item, Message& message, addon::Contract_failur
     return true;
 }
 
-} // namespace
-
-std::optional<addon::Conversation_export_result> export_conversation(
-    const addon::Conversation_export_request& request, const std::function<bool()>& cancelled,
-    addon::Contract_failure* failure)
+struct Conversation_history
 {
-    const auto profile = source_profile(request, failure);
-    if (!profile) {
-        return {};
-    }
-    const auto sqlite_home = addon::environment_value(
-        addon::environment_pairs(request.launch_environment.effective_environment), k_export_sqlite_home_environment);
+    std::vector<Message> messages;
+    bool incomplete_tail = false;
+    bool content_understood = true;
+    bool events_seen = false;
+};
+
+std::optional<Conversation_history> read_history(
+    const fs::path& profile, const std::string& sqlite_home, std::string_view session_id,
+    const std::function<bool()>& cancelled,
+    addon::Contract_failure* failure, bool inspection = false)
+{
     std::optional<Conversation_store_source> stored_source;
     std::optional<fs::path> source;
     if (!sqlite_home.empty()) {
-        stored_source = conversation_store_source(*profile, addon::path_from_utf8(sqlite_home),
-            request.provider_session_id, cancelled, failure);
+        stored_source = conversation_store_source(profile, addon::path_from_utf8(sqlite_home),
+            session_id, cancelled, failure);
         if (!stored_source) {
             return {};
         }
         source = stored_source->path;
     }
     else {
-        source = source_file(*profile, request.provider_session_id, cancelled, failure);
+        source = source_file(profile, session_id, cancelled, failure);
     }
     if (!source) {
         return {};
     }
-    std::vector<Message> messages;
+    // Inspection is an optional background query, not an unbounded export.
+    // Check at each reader checkpoint as a native writer can grow the source.
+    constexpr std::uintmax_t inspection_limit = 64 * 1024 * 1024;
+    const auto stopped = [&] {
+        if (cancelled && cancelled()) {
+            return true;
+        }
+        if (inspection) {
+            std::error_code error;
+            const auto bytes = fs::file_size(*source, error);
+            return error || bytes > inspection_limit;
+        }
+        return false;
+    };
+    Conversation_history history;
+    auto& messages = history.messages;
     std::vector<std::size_t> turns;
     bool identity_seen = false;
     bool paginated = false;
@@ -333,7 +351,7 @@ std::optional<addon::Conversation_export_result> export_conversation(
                     return fail(error, "conversation_source_invalid", "The Codex file does not begin with session metadata.");
                 }
                 identity_seen = true;
-                if (json::text(payload, "id") != request.provider_session_id) {
+                if (json::text(payload, "id") != session_id) {
                     return fail(error, "conversation_identity_mismatch", "The Codex file names another conversation.");
                 }
                 const auto mode = json::text(payload, "history_mode");
@@ -354,11 +372,22 @@ std::optional<addon::Conversation_export_result> export_conversation(
                 if (stored_source && stored_source->history_mode != (paginated ? "paginated" : "legacy")) {
                     return fail(error, "conversation_source_changed", "The Codex history mode changed while being read.");
                 }
+                if (!json::member(payload, "forked_from_id").is_null() ||
+                    !json::member(payload, "forked_from_ordinal_exclusive").is_null() ||
+                    !json::member(payload, "subagent_history_start_ordinal").is_null())
+                {
+                    history.content_understood = false;
+                }
             }
             else
             if (paginated && type == "session_meta") {
                 return fail(error, "conversation_format_unavailable",
                     "This paginated Codex history contains inherited session metadata.");
+            }
+            else
+            if (type == "session_meta") {
+                // A legacy inherited metadata block does not prove an empty root.
+                history.content_understood = false;
             }
             if (paginated) {
                 const auto& ordinal = json::member(row, "ordinal");
@@ -375,12 +404,22 @@ std::optional<addon::Conversation_export_result> export_conversation(
                 if (!response_message(payload, message, error)) {
                     return false;
                 }
+                const auto item_type = json::text(payload, "type");
+                if (item_type == "compaction" || item_type == "compaction_summary" ||
+                    item_type == "context_compaction" ||
+                    (item_type == "reasoning" && !json::member(payload, "encrypted_content").is_null()) ||
+                    (item_type == "message" && message.role != "user" && message.role != "assistant" &&
+                        message.role != "system" && message.role != "developer"))
+                {
+                    history.content_understood = false;
+                }
                 if (!message.content.empty()) {
                     messages.push_back(std::move(message));
                 }
             }
             else
             if (type == "event_msg") {
+                history.events_seen = true;
                 const auto event = json::text(payload, "type");
                 if (event == "task_started" || event == "turn_started") {
                     turns.push_back(messages.size());
@@ -404,6 +443,13 @@ std::optional<addon::Conversation_export_result> export_conversation(
                         turns.resize(keep);
                     }
                 }
+                else
+                if (event != "user_message" && event != "agent_message" && event != "token_count" &&
+                    event != "task_complete" && event != "turn_complete" && event != "agent_reasoning" &&
+                    event != "agent_reasoning_raw_content")
+                {
+                    history.content_understood = false;
+                }
                 // User and assistant events mirror response_item bodies. Using both
                 // would duplicate each displayed message and lose canonical tool data.
             }
@@ -415,14 +461,20 @@ std::optional<addon::Conversation_export_result> export_conversation(
                 return fail(error, "conversation_content_unavailable",
                     "This paginated Codex history contains an unsupported record type.");
             }
+            else
+            if (type != "session_meta" && type != "turn_context" && type != "token_usage_record") {
+                // Export can retain understood messages beside opaque legacy rows.
+                // Such rows cannot establish that no meaningful content exists.
+                history.content_understood = false;
+            }
             return true;
-        }, cancelled, failure);
+        }, stopped, failure);
     if (!snapshot) {
         return {};
     }
     if (stored_source) {
-        const auto current = conversation_store_source(*profile, addon::path_from_utf8(sqlite_home),
-            request.provider_session_id, cancelled, failure);
+        const auto current = conversation_store_source(profile, addon::path_from_utf8(sqlite_home),
+            session_id, cancelled, failure);
         if (!current) {
             return {};
         }
@@ -431,7 +483,86 @@ std::optional<addon::Conversation_export_result> export_conversation(
             return {};
         }
     }
-    if (!identity_seen || messages.empty()) {
+    if (!identity_seen) {
+        fail(failure, "conversation_source_invalid", "The Codex file has no session metadata.");
+        return {};
+    }
+    history.incomplete_tail = snapshot->incomplete_tail_omitted;
+    return history;
+}
+
+bool meaningful_message(const Message& message)
+{
+    if (message.role == "system" || message.role == "developer") {
+        return false;
+    }
+    return std::any_of(message.content.begin(), message.content.end(), [&](const auto& block) {
+        return (message.role != "user" || block.compact_visible) &&
+            (block.kind != Kind::TEXT || block.text.find_first_not_of(" \t\r\n") != std::string::npos);
+    });
+}
+
+} // namespace
+
+addon::Resume_inspect_result inspect_resume(
+    const addon::Resume_inspect_request& request, const std::function<bool()>& cancelled)
+{
+    addon::Resume_inspect_result result;
+    result.request_digest_hex = addon::resume_inspect_request_digest_hex(request);
+    const auto record = decode_resume_record(request.resume_record);
+    const auto& account = request.context.account_context;
+    // An old ID-only record does not identify the original store. Inspection is
+    // reconstructed later and cannot recover a preparer's environment patch.
+    if (!record || record->sqlite_home.empty() || !account || !account->profile_path ||
+        *account->profile_path != record->codex_home ||
+        account->adapter_account_key != profile_account_key(record->codex_home) ||
+        (cancelled && cancelled()))
+    {
+        return result;
+    }
+    addon::Contract_failure failure;
+    std::optional<Conversation_history> history;
+    try {
+        history = read_history(addon::path_from_utf8(record->codex_home), record->sqlite_home,
+            record->session_id, cancelled, &failure, true);
+    }
+    catch (const fs::filesystem_error&) {
+        return result;
+    }
+    if (!history) {
+        // SQLite absence alone is not native absence: Codex can still resolve
+        // legacy files or a live writer. Unsupported and changing stores remain unknown.
+        return result;
+    }
+    result.availability = addon::Resume_availability::AVAILABLE;
+    if (history->incomplete_tail || !history->content_understood) {
+        return result;
+    }
+    if (std::any_of(history->messages.begin(), history->messages.end(), meaningful_message)) {
+        result.content = addon::Resume_content::NONEMPTY;
+    }
+    else
+    if (!history->events_seen) {
+        result.content = addon::Resume_content::EMPTY;
+    }
+    return result;
+}
+
+std::optional<addon::Conversation_export_result> export_conversation(
+    const addon::Conversation_export_request& request, const std::function<bool()>& cancelled,
+    addon::Contract_failure* failure)
+{
+    const auto profile = source_profile(request, failure);
+    if (!profile) {
+        return {};
+    }
+    const auto sqlite_home = addon::environment_value(
+        addon::environment_pairs(request.launch_environment.effective_environment), k_export_sqlite_home_environment);
+    const auto history = read_history(*profile, sqlite_home, request.provider_session_id, cancelled, failure);
+    if (!history) {
+        return {};
+    }
+    if (history->messages.empty()) {
         fail(failure, "conversation_content_unavailable", "No retained Codex conversation messages are available.");
         return {};
     }
@@ -439,12 +570,12 @@ std::optional<addon::Conversation_export_result> export_conversation(
     if (!writer.open(failure)) {
         return {};
     }
-    for (const auto& message : messages) {
+    for (const auto& message : history->messages) {
         if (!writer.append(message, failure)) {
             return {};
         }
     }
-    return writer.finish(snapshot->incomplete_tail_omitted, failure);
+    return writer.finish(history->incomplete_tail, failure);
 }
 
 } // namespace codex

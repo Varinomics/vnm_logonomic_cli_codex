@@ -60,6 +60,10 @@ std::optional<Conversation_store_source> conversation_store_source(
         return unavailable(failure, "The conversation's original Codex state store is unavailable.");
     }
     for (const auto& entry : fs::directory_iterator(sqlite_home)) {
+        if (cancelled && cancelled()) {
+            *failure = {"cancelled", "Conversation extraction was cancelled."};
+            return {};
+        }
         const auto name = addon::path_to_utf8(entry.path().filename());
         if (name.starts_with("state_") && name.ends_with(".sqlite") && name != "state_5.sqlite") {
             return unavailable(failure, "The Codex profile contains an unsupported state-store generation.");
