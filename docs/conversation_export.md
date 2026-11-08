@@ -15,6 +15,13 @@ currently displaying. After conversation A has been confirmed, an idle internal
 authoritative identity event arrives. The export can therefore contain the
 previous conversation; validating its native file does not resolve this gap.
 
+The provider now distinguishes true native activation from compaction, retains
+the original native-store resume binding, and supplies read-only availability
+and content inspection to the host. Those changes apply when the native
+activation is observed; they do not create a missing foreground-selection
+signal. See [native activation and default directory](integration.md#native-conversation-activation-and-default-directory)
+for the current dispatch evidence and validation boundary.
+
 Codex `0.160.0` and `0.164.0` defer `SessionStart` hooks until turn processing.
 Returning to an already loaded thread can also reuse its native session without
 another `conversation_starts` initialization event. An upgrade to `0.164.0` or

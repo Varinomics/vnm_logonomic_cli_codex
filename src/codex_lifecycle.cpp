@@ -1,6 +1,7 @@
 #include "codex_lifecycle.h"
 
 #include "codex_context.h"
+#include "codex_resume_record.h"
 
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
@@ -288,7 +289,9 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
     if (request.context_failure && !body.find("agent_id")) {
         result.context_failure = addon::Context_failure{*session, *request.context_failure};
     }
-    if (*name == "PostCompact") {
+    const auto source = metadata(body, "source");
+    if (*name == "PostCompact" || (*name == "SessionStart" && source == "compact")) {
+        // Native compaction reuses the root conversation. It is not an activation.
         return result;
     }
     addon::Lifecycle_observation observation;
@@ -298,12 +301,34 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
     if (*name == "SessionStart") {
         observation.session_transition = addon::Session_transition::STARTED;
         result.classification = addon::Classification::TRANSITION;
-        const auto source = metadata(body, "source");
         result.transition = source && *source == "resume" ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
+        observation.session_source = source.value_or("");
+        if (const auto* record = body.find("resume_record")) {
+            const auto decoded = decode_resume_record(*record);
+            if (decoded && decoded->session_id == *session && !decoded->sqlite_home.empty()) {
+                observation.resume_record = *record;
+            }
+        }
+        if (request.execution_context_version == 1 && !request.execution_failure) {
+            addon::Execution_context_update update;
+            update.provider_session_id = *session;
+            update.transition_nonce    = request.transition_nonce;
+            update.source              = "codex.SessionStart";
+            const auto* cwd = body.find("cwd");
+            if (cwd && cwd->is_string() && addon::is_execution_local_path(cwd->as_string())) {
+                update.status      = addon::Execution_context_status::CONFIRMED;
+                update.environment = "local";
+                update.cwd         = cwd->as_string();
+            }
+            // This joint native start owns sequence zero. Tool hooks may report
+            // per-call workdir overrides, not the conversation's default cwd.
+            result.execution_updates.push_back(std::move(update));
+        }
     }
     else
     if (*name == "SessionEnd") {
         observation.session_transition = addon::Session_transition::ENDED;
+        observation.session_end_reason = metadata(body, "reason").value_or("");
     }
     else {
         const auto turn = metadata(body, "turn_id");

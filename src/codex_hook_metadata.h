@@ -123,17 +123,25 @@ inline logonomic::cli_addon::Json_value hook_metadata(const logonomic::cli_addon
 {
     namespace addon = logonomic::cli_addon;
     auto result = addon::Json_value::object();
-    for (const auto field : {"hook_event_name", "session_id", "turn_id", "agent_id", "agent_type", "source"}) {
+    for (const auto field : {"hook_event_name", "session_id", "turn_id", "agent_id", "agent_type", "source", "reason"}) {
         if (const auto* value = event.find(field)) {
             result.set(field, *value);
         }
+    }
+    const auto* name = event.find("hook_event_name");
+    if (const auto* cwd = event.find("cwd"); name && *name == addon::Json_value("SessionStart") &&
+        !event.find("agent_id") && cwd && cwd->is_string() &&
+        cwd->as_string().size() <= addon::limits::k_max_start_absolute_path_bytes)
+    {
+        // Preserve native bytes. Validation and optional-capability handling
+        // belong to classification; neither launch cwd nor transcript path is a substitute.
+        result.set("cwd", *cwd);
     }
     if (const auto* transcript = event.find("transcript_path"); transcript &&
         logonomic::cli_addon::json::bounded_string(*transcript, addon::limits::k_max_start_absolute_path_bytes))
     {
         result.set("transcript_path", *transcript);
     }
-    const auto* name = event.find("hook_event_name");
     if (name && name->is_string() && name->as_string() == "Stop" && !event.find("agent_id")) {
         // Infer from bounded final-paragraph evidence after scanning the complete reply.
         const auto* reply = event.find("last_assistant_message");

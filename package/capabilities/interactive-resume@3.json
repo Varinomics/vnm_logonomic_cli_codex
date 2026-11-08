@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "payload": {
+    "startup_observer": {
+      "mechanism": "http-json-post",
+      "confirmation": "prepared-identity",
+      "version": 1
+    },
+    "environment_names": [
+      "CODEX_HOME",
+      "CODEX_SQLITE_HOME",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "NO_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+      "no_proxy",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP",
+      "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+      "NODE_OPTIONS",
+      "NODE_PATH",
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+      "OTEL_EXPORTER_OTLP_HEADERS"
+    ]
+  },
+  "capability_id": "interactive-resume"
+}

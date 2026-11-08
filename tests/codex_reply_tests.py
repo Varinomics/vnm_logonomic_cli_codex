@@ -108,6 +108,26 @@ def reply_contract(helper, wrapper, executable, directory):
     )
     adapter = Adapter(executable)
     try:
+        session = "019933a1-6e43-7102-a520-b3c8294cc763"
+        environment["CODEX_HOME"] = str(directory / "profile")
+        environment["VNM_CODEX_EXPORT_SQLITE_HOME"] = str(directory / "original-store")
+        start = {"hook_event_name": "SessionStart", "session_id": session,
+            "source": "clear", "cwd": str(directory / "non-git folder" / "nested"),
+            "resume_record": {"native_store": "untrusted hook field"}}
+        delivery = deliver(start)
+        body = delivery["event"]["body"]
+        assert body["cwd"] == start["cwd"]
+        expected_record = {"provider_session_id": session, "native_store": {"version": 1,
+            "codex_home": environment["CODEX_HOME"], "sqlite_home": environment["VNM_CODEX_EXPORT_SQLITE_HOME"]}}
+        assert body["resume_record"] == expected_record
+        classified = adapter.classify(delivery, attention=False)
+        assert classified["observations"][0]["resume_record"] == expected_record
+        assert adapter.classify(delivery, attention=False) == classified
+        del environment["VNM_CODEX_EXPORT_SQLITE_HOME"]
+        assert "resume_record" not in deliver(start)["event"]["body"]
+        compact = deliver({**start, "source": "compact"})
+        ignored = adapter.classify(compact, attention=False)
+        assert ignored["classification"] == "ignore" and ignored["observations"] == []
         for invalid in (b'{"hook_event_name":"Stop","last_assistant_message":"\xff?"}',
                         b'{"hook_event_name":"Stop","last_assistant_message":"Which directory?'):
             result, records = run(invalid)
