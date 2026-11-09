@@ -7,6 +7,8 @@
   "lifecycle_minimum": "0.146.0",
   "delegated_implementation_minimum": "0.150.1",
   "session_wake_watcher_minimum": "0.149.0",
+  "terminal_identity_minimum": "0.167.0 stable",
+  "terminal_identity_source": "https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/tui/src/chatwidget/status_surfaces.rs",
   "session_wake_source": "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/ext/queue/tests/queue_service.rs",
   "forward_policy": "Newer versions are admitted after launcher verification; protocol records and startup observation are validated.",
   "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",

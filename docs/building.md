@@ -25,6 +25,12 @@ implementation-protocol, account/probe and usage contract fixtures are registere
 with CTest. Run them from the configured build directory after building the
 corresponding targets.
 
+`codex_terminal_identity_tests` is a standalone provider contract target with
+the real provider and SQLite dependencies. Its idle `/clear` regression does
+not require a packaged artifact or a model turn. Passing it does not establish
+package assembly, native TUI delivery or the host's card/Note behavior; those
+retain their existing independent gates.
+
 ## Manual CI
 
 The repository's CI workflow builds the standalone package and runs its existing

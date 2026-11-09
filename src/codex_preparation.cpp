@@ -52,12 +52,12 @@ std::string toml_array(const std::vector<std::string>& values)
     return result + ']';
 }
 
-void add_title_activity(
+bool add_terminal_title(
     std::vector<std::string>& argv, std::size_t configuration_end,
     const std::optional<std::vector<std::string>>& selected)
 {
     if (!selected) {
-        return;
+        return false;
     }
     addon::Launch_patch candidate;
     candidate.argv = argv;
@@ -67,7 +67,9 @@ void add_title_activity(
     // evidence must not invalidate a launch, including its prompt or resume ID.
     if (addon::validate_launch_patch(candidate, {}, {}, nullptr)) {
         argv = std::move(*candidate.argv);
+        return true;
     }
+    return false;
 }
 
 std::vector<std::string> hook_arguments()
@@ -235,7 +237,7 @@ void prepare_interactive(addon::Invocation_context& context)
     }
     auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),
-        request->working_directory, context);
+        request->working_directory, context, request->terminal_identity.has_value());
     std::optional<addon::Session_wake_preparation> wake;
     if (request->session_wake) {
         wake = std::move(native_preparation.session_wake);
@@ -261,7 +263,9 @@ void prepare_interactive(addon::Invocation_context& context)
         patch.initial_prompt = addon::Initial_prompt_acknowledgment{
             addon::initial_prompt_text_digest_hex(prompt->text)};
     }
-    add_title_activity(*patch.argv, configuration_end, native_preparation.terminal_title);
+    if (add_terminal_title(*patch.argv, configuration_end, native_preparation.terminal_title)) {
+        patch.terminal_identity = std::move(native_preparation.terminal_identity);
+    }
     if (prompt && !addon::validate_launch_patch(patch, {}, {}, &failure)) {
         refuse_initial_prompt(context,
             "The launch with the initial prompt is not a valid replacement: " + failure.detail);
@@ -301,6 +305,7 @@ void prepare_resume(addon::Invocation_context& context)
         inspection_request.context.declared_assets.clear();
         inspection_request.context.codex_invocation.reset();
         inspection_request.context.session_wake.reset();
+        inspection_request.context.terminal_identity.reset();
         const auto inspection = inspect_resume(inspection_request, [&] { return context.cancel_requested(); });
         if (context.cancel_requested() || inspection.availability == addon::Resume_availability::ABSENT) {
             context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
@@ -331,7 +336,7 @@ void prepare_resume(addon::Invocation_context& context)
     }
     auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
-        request->context.working_directory, context);
+        request->context.working_directory, context, request->context.terminal_identity.has_value());
     if (!record->sqlite_home.empty() &&
         addon::environment_value(launch->environment, k_export_sqlite_home_environment) != record->sqlite_home)
     {
@@ -366,7 +371,7 @@ void prepare_resume(addon::Invocation_context& context)
     launch->argv.insert(launch->argv.end(), {"-c", "otel.exporter={otlp-http={endpoint=" +
         toml_string(request->startup_observer->endpoint) + ",protocol=\"json\"}}", "-c", "otel.log_user_prompt=false",
         "resume", "-C", request->context.working_directory, record->session_id});
-    add_title_activity(launch->argv, configuration_end, native_preparation.terminal_title);
+    const bool title_applied = add_terminal_title(launch->argv, configuration_end, native_preparation.terminal_title);
     addon::Resume_prepare_result result;
 #ifdef _WIN32
     result.process.executable = "helpers/codex_launch_bridge.exe";
@@ -384,6 +389,9 @@ void prepare_resume(addon::Invocation_context& context)
     result.patch.profile_storage = request->context.profile_storage;
     result.patch.account_context = request->context.account_context;
     result.patch.session_wake = std::move(wake);
+    if (title_applied) {
+        result.patch.terminal_identity = std::move(native_preparation.terminal_identity);
+    }
     if (request->context.codex_invocation) {
         // The terminal launches the bridge ahead of this verified invocation.
         // Its prefix belongs with Codex's executable when inserting CLI options.
