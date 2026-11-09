@@ -295,8 +295,13 @@ void prepare_resume(addon::Invocation_context& context)
             context.fail(addon::Result_status::UNAVAILABLE, "resume_scope_unavailable");
             return;
         }
-        const auto inspection = inspect_resume({request->context, request->resume_record},
-            [&] { return context.cancel_requested(); });
+        // Inspection's digest accepts only read-only context. Keep preparation
+        // offers on the original request for the resumed process to acknowledge.
+        addon::Resume_inspect_request inspection_request{request->context, request->resume_record};
+        inspection_request.context.declared_assets.clear();
+        inspection_request.context.codex_invocation.reset();
+        inspection_request.context.session_wake.reset();
+        const auto inspection = inspect_resume(inspection_request, [&] { return context.cancel_requested(); });
         if (context.cancel_requested() || inspection.availability == addon::Resume_availability::ABSENT) {
             context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
                 context.cancel_requested() ? "cancelled" : "resume_source_unavailable");

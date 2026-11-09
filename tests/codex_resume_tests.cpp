@@ -331,7 +331,7 @@ public:
     bool finished() const override { return done; }
 };
 
-void bound_preparation(const fs::path& fixture, const fs::path& native_fixture)
+void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, const fs::path& package)
 {
     const auto inspection = inspection_request(fixture);
     addon::Resume_prepare_request request;
@@ -365,6 +365,61 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture)
     check(std::find(result->patch.set.begin(), result->patch.set.end(),
         std::pair<std::string, std::string>{"VNM_CODEX_EXPORT_SQLITE_HOME", store}) != result->patch.set.end(),
         "preparation pins original store instead of current launcher defaults");
+
+    addon::Simulator_options options;
+    options.package_directory = package;
+    addon::Host_simulator host(options, nullptr);
+    check(host.start(&failure), "packaged resume adapter starts: " + failure.detail);
+    std::string storage_error;
+    const auto storage = addon::allocate_profile_storage_root(
+        host.profile_storage_root(), "logonomic.cli.codex", &storage_error);
+    check(storage.has_value(), "allocate resume-owned storage: " + storage_error);
+    addon::Simulator_invocation_options invocation;
+    invocation.profile_storage = addon::Profile_storage_context{1, *storage};
+    // Native SessionStart now binds the store in remembered records. Exercise
+    // that record with the same preparation offers the desktop sends on resume.
+    for (const int offers : {1, 2, 3}) {
+        auto offered = request;
+        offered.context.launcher_argv.insert(offered.context.launcher_argv.end(),
+            {"-c", "model=\"retained-model\"", "--sandbox", "read-only"});
+        if (offers & 1) {
+            offered.context.session_wake = addon::Session_wake_offer{};
+        }
+        if (offers & 2) {
+            offered.context.codex_invocation = addon::Codex_invocation_request{};
+        }
+        const auto id = host.invoke({"interactive-resume", 4}, addon::k_prepare_resume_operation,
+            addon::encode_resume_prepare_request(offered, 2), 15000, invocation);
+        const auto outcome = host.wait_outcome(id, 16000);
+        check(outcome && outcome->status == addon::Host_status::SUCCESS,
+            "packaged bound resume with preparation offers: " +
+                (outcome ? outcome->reason_code + ": " + outcome->message : "no result"));
+        const auto prepared = addon::decode_resume_prepare_result(outcome->payload, &failure, 2);
+        check(prepared && prepared->process.argv.back() == k_session_a &&
+            prepared->acknowledgment.record_digest_hex == addon::resume_record_digest_hex(offered.resume_record) &&
+            prepared->patch.profile_storage && prepared->patch.profile_storage->root == *storage &&
+            prepared->patch.account_context &&
+            prepared->patch.account_context->profile_path == offered.context.account_context->profile_path,
+            "bound resume preserves exact conversation, account and owned storage");
+        check(std::find(prepared->process.argv.begin(), prepared->process.argv.end(),
+                "model=\"retained-model\"") != prepared->process.argv.end() &&
+            std::find(prepared->process.argv.begin(), prepared->process.argv.end(),
+                "read-only") != prepared->process.argv.end(),
+            "bound resume preserves supplied model and permissions");
+        check(prepared->patch.session_wake.has_value() == ((offers & 1) != 0) &&
+            prepared->patch.codex_invocation.has_value() == ((offers & 2) != 0),
+            "read-only inspection preserves preparation acknowledgments for the resumed process");
+        if (prepared->patch.session_wake) {
+            const auto* bound_store = prepared->patch.session_wake->binding.find("sqlite_home");
+            check(prepared->patch.session_wake->available && bound_store && *bound_store == Json(store),
+                "resumed wake preparation retains the remembered native store");
+        }
+        if (prepared->patch.codex_invocation) {
+            check(prepared->patch.codex_invocation->argument_prefix_size == 2,
+                "resumed invocation retains the bridge and verified Codex prefix");
+        }
+    }
+    check(host.shutdown(1000, nullptr), "packaged resume adapter exits");
     fs::remove(fixture / "profile/archived_sessions/replacement.jsonl");
     Preparation_context missing;
     missing.input = context.input;
@@ -397,7 +452,7 @@ int main(int argc, char** argv)
         native_activation_facts(fixture);
         native_history(fixture);
         packaged_inspection(addon::path_from_utf8(argv[1]), fixture);
-        bound_preparation(fixture, addon::path_from_utf8(argv[2]));
+        bound_preparation(fixture, addon::path_from_utf8(argv[2]), addon::path_from_utf8(argv[1]));
         fs::remove_all(fixture);
         return 0;
     }
