@@ -2,7 +2,9 @@
 
 #include "codex_context.h"
 #include "codex_resume_record.h"
+#include "codex_terminal_identity.h"
 
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 
@@ -283,13 +285,23 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
     if (!session) {
         return std::nullopt;
     }
+    const auto source = metadata(body, "source");
+    std::optional<Native_terminal_identity> selected;
+    if (*name == "SessionStart" && source != "compact") {
+        selected = observed_terminal_identity(request);
+        if (selected && selected->observation.provider_session_id != *session) {
+            // A delayed reporting hook cannot undo a newer displayed selection.
+            return result;
+        }
+    }
+    const bool already_selected = selected && request.ledger.current_transition &&
+        request.ledger.current_transition->provider_session_id == *session;
     if (const auto snapshot = context_snapshot(request)) {
         result.context_updates.push_back(*snapshot);
     }
     if (request.context_failure && !body.find("agent_id")) {
         result.context_failure = addon::Context_failure{*session, *request.context_failure};
     }
-    const auto source = metadata(body, "source");
     if (*name == "PostCompact" || (*name == "SessionStart" && source == "compact")) {
         // Native compaction reuses the root conversation. It is not an activation.
         return result;
@@ -312,7 +324,8 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
         if (request.execution_context_version == 1 && !request.execution_failure) {
             addon::Execution_context_update update;
             update.provider_session_id = *session;
-            update.transition_nonce    = request.transition_nonce;
+            update.transition_nonce    = already_selected
+                ? request.ledger.current_transition->nonce : request.transition_nonce;
             update.source              = "codex.SessionStart";
             const auto* cwd = body.find("cwd");
             if (cwd && cwd->is_string() && addon::is_execution_local_path(cwd->as_string())) {
@@ -323,6 +336,13 @@ std::optional<addon::Classify_event_result> classify_hook(const addon::Classify_
             // This joint native start owns sequence zero. Tool hooks may report
             // per-call workdir overrides, not the conversation's default cwd.
             result.execution_updates.push_back(std::move(update));
+        }
+        if (already_selected) {
+            // The title already opened this activation. Keep the native cwd
+            // and context evidence under that nonce without opening it again.
+            result.classification = addon::Classification::IGNORED;
+            result.transition.reset();
+            return result;
         }
     }
     else
@@ -539,6 +559,20 @@ void handle_lifecycle(addon::Invocation_context& context)
         return;
     }
     addon::Contract_failure failure;
+    if (context.request().capability.capability_id == addon::k_terminal_identity_capability_id) {
+        const auto request = addon::decode_classify_event_request(context.request().payload, &failure);
+        if (!request) {
+            context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+            return;
+        }
+        const auto result = classify_title_identity(*request, [&] { return context.cancel_requested(); });
+        if (!result) {
+            context.fail(addon::Result_status::FAILED, "invalid_provider_event");
+            return;
+        }
+        context.succeed(addon::encode_terminal_identity_classification_result(*result));
+        return;
+    }
     if (context.request().capability.capability_id == addon::k_async_question_attention_capability_id) {
         const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
         if (!request) {

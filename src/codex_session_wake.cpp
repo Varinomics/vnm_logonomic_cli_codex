@@ -1,4 +1,5 @@
 #include "codex_session_wake.h"
+#include "codex_terminal_identity.h"
 #include "codex_conversation_source.h"
 #include "codex_preparation.h"
 
@@ -304,7 +305,8 @@ std::optional<Bound_queue> bound_queue(const addon::Session_wake_target& target)
 
 Native_launch_preparation prepare_native_launch(
     Verified_launch& launch, const Environment& environment,
-    const std::string& working_directory, addon::Invocation_context& context)
+    const std::string& working_directory, addon::Invocation_context& context,
+    bool offer_terminal_identity)
 {
     // Clear an inherited marker even when optional native configuration fails.
     // Only this launch's resolved and pinned state store may authorize export.
@@ -315,7 +317,7 @@ Native_launch_preparation prepare_native_launch(
     std::optional<std::vector<std::string>> terminal_title;
     const auto unavailable = [&](std::string reason) {
         return Native_launch_preparation{
-            {false, Json::object(), std::move(reason)}, std::move(terminal_title)};
+            {false, Json::object(), std::move(reason)}, std::move(terminal_title), {}};
     };
     // 0.149 introduced both the writer and the external queue watcher. A new
     // executable found later cannot retroactively add the watcher to an old TUI.
@@ -367,7 +369,14 @@ Native_launch_preparation prepare_native_launch(
             value = sqlite_home;
         }
     }
-    return {{true, std::move(binding), {}}, std::move(terminal_title)};
+    std::optional<addon::Terminal_identity_preparation> identity;
+    if (offer_terminal_identity) {
+        if (auto prepared = prepare_title_identity(launch.version, *config, home, sqlite_home)) {
+            terminal_title = std::move(prepared->terminal_title);
+            identity = std::move(prepared->preparation);
+        }
+    }
+    return {{true, std::move(binding), {}}, std::move(terminal_title), std::move(identity)};
 }
 
 void handle_session_wake(addon::Invocation_context& context)

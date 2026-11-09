@@ -110,6 +110,7 @@ void invoke(addon::Invocation_context& context)
         else
         if (request.capability.capability_id == "lifecycle-events" ||
             request.capability.capability_id == "helper-ingress" ||
+            request.capability.capability_id == addon::k_terminal_identity_capability_id ||
             request.capability.capability_id == addon::k_async_question_attention_capability_id ||
             request.capability.capability_id == addon::k_attention_kind_capability_id)
         {
@@ -155,6 +156,7 @@ int main()
         {"launch-preparation", 3}, {"structured-session", 3}, {"delegated-session", 3},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},
+        {addon::k_terminal_identity_capability_id, addon::k_terminal_identity_version},
         {addon::k_session_wake_capability_id, addon::k_session_wake_version},
         {addon::k_model_context_delivery_capability_id, addon::k_model_context_delivery_version},
         {"interactive-resume", 2}, {"interactive-resume", 3}, {"interactive-resume", 4},

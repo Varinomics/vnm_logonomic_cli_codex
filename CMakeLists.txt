@@ -89,6 +89,7 @@ add_library(codex_provider STATIC
     src/codex_session_wake.cpp
     src/codex_startup_observation.cpp
     src/codex_startup_probe.cpp
+    src/codex_terminal_identity.cpp
     src/codex_usage.cpp
     src/codex_usage_temporal.cpp
     src/codex_usage_records.cpp)
@@ -244,6 +245,16 @@ codex_target(codex_resume_tests)
 add_dependencies(codex_resume_tests codex_package)
 add_test(NAME codex_resume_tests COMMAND codex_resume_tests "${CODEX_PACKAGE_DIRECTORY}" "$<TARGET_FILE:codex_fake_cli>")
 set_tests_properties(codex_resume_tests PROPERTIES TIMEOUT 30)
+add_executable(codex_terminal_identity_tests tests/codex_terminal_identity_tests.cpp)
+target_link_libraries(codex_terminal_identity_tests PRIVATE codex_provider)
+if(MINGW)
+    target_include_directories(codex_terminal_identity_tests PRIVATE "${codex_sqlite_include}")
+elseif(NOT WIN32)
+    target_link_libraries(codex_terminal_identity_tests PRIVATE SQLite::SQLite3)
+endif()
+codex_target(codex_terminal_identity_tests)
+add_test(NAME codex_terminal_identity_tests COMMAND codex_terminal_identity_tests)
+set_tests_properties(codex_terminal_identity_tests PROPERTIES TIMEOUT 30)
 add_executable(codex_fake_cli tests/codex_fake_cli.cpp)
 add_dependencies(codex_resume_tests codex_fake_cli)
 codex_target(codex_fake_cli)

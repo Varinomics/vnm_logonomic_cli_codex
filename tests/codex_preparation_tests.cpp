@@ -374,6 +374,100 @@ void title_configuration_launches(const addon::Prepare_request& direct, const fs
     }
 }
 
+void identity_title_launches(const addon::Prepare_request& direct, const fs::path& root)
+{
+    struct Title_case
+    {
+        const char* version;
+        const char* tui;
+        const char* overlay;
+        bool identity;
+    };
+    const Title_case cases[] = {
+        {"0.167.0", nullptr,
+            R"(tui.terminal_title=["activity","thread-name","project-name","session-id","thread-name","thread"])", true},
+        {"0.167.0", R"({"terminal_title":null})",
+            R"(tui.terminal_title=["activity","thread-name","project-name","session-id","thread-name","thread"])", true},
+        {"0.167.0", R"({"terminal_title":[]})",
+            R"(tui.terminal_title=["spinner","session-id","thread-name","thread"])", true},
+        {"0.167.0", R"({"terminal_title":["project-name","run-state"]})",
+            R"(tui.terminal_title=["spinner","project-name","run-state","session-id","thread-name","thread"])", true},
+        {"0.167.0", R"({"terminal_title":["spinner","thread-title","project-name"],"animations":false})",
+            R"(tui.terminal_title=["spinner","thread-title","project-name","session-id","thread-name","thread"])", true},
+        {"0.167.0", R"({"terminal_title":["project-name","activity","thread-name"]})", nullptr, false},
+        {"0.167.0", R"({"terminal_title":["spinner","project-name","activity"]})", nullptr, false},
+        {"0.166.0", nullptr, nullptr, false},
+        {"0.166.0", R"({"terminal_title":[]})", R"(tui.terminal_title=["spinner"])", false},
+        {"0.167.0-alpha.4", nullptr, nullptr, false},
+        {"0.167.1-alpha.1", nullptr, nullptr, false},
+        {"0.167.0+qualified", nullptr,
+            R"(tui.terminal_title=["activity","thread-name","project-name","session-id","thread-name","thread"])", true},
+        {"0.168.0", nullptr, nullptr, false},
+        {"0.168.0", R"({"terminal_title":["activity","project-name"]})",
+            R"(tui.terminal_title=["activity","project-name","session-id","thread-name","thread"])", true},
+    };
+    const auto store_path = utf8(root / "identity-state");
+    for (const auto& example : cases) {
+        auto request = direct;
+        request.terminal_identity = addon::Terminal_identity_offer{};
+        auto& environment = request.launch_environment->effective_environment;
+        environment.set("CODEX_FIXTURE_VERSION", addon::Json_value(example.version));
+        environment.set("CODEX_FIXTURE_SQLITE_HOME", addon::Json_value(store_path));
+        if (example.tui) {
+            environment.set("CODEX_FIXTURE_TUI", addon::Json_value(example.tui));
+        }
+        Context context;
+        prepare_launch(context, request);
+        addon::Contract_failure failure;
+        const auto patch = addon::decode_launch_patch(context.output, &failure, 3);
+        require(context.succeeded && patch && patch->argv,
+            "Unavailable title identity must preserve ordinary launch preparation");
+        require(patch->terminal_identity.has_value() == example.identity,
+            "Only qualified stable native title layouts may opt into immediate identity");
+        std::vector<std::string> overlays;
+        for (const auto& argument : *patch->argv) {
+            if (argument.starts_with("tui.terminal_title=")) {
+                overlays.push_back(argument);
+            }
+            require(!argument.starts_with("tui.") || argument.starts_with("tui.terminal_title="),
+                "Identity preparation must preserve disabled animations and unrelated TUI settings");
+        }
+        require(overlays == (example.overlay ? std::vector<std::string>{example.overlay} : std::vector<std::string>{}),
+            "Identity suffix must retain explicit original fields, verified defaults and field ordering");
+        if (patch->terminal_identity) {
+            const auto& prepared = patch->terminal_identity->context;
+            const auto* native_store = prepared.find("native_store");
+            require(native_store && *native_store->find("codex_home") == addon::Json_value(utf8(root)) &&
+                *native_store->find("sqlite_home") == addon::Json_value(store_path) &&
+                *prepared.find("native_version") == addon::Json_value(example.version),
+                "Immediate identity must capture the prepared native namespace before the first hook");
+        }
+    }
+    auto failed = direct;
+    failed.terminal_identity = addon::Terminal_identity_offer{};
+    failed.launch_environment->effective_environment.set("CODEX_FIXTURE_VERSION", addon::Json_value("0.167.0"));
+    failed.launch_environment->effective_environment.set("CODEX_FIXTURE_WAKE", addon::Json_value("init-failure"));
+    Context unavailable;
+    prepare_launch(unavailable, failed);
+    addon::Contract_failure failure;
+    const auto patch = addon::decode_launch_patch(unavailable.output, &failure, 3);
+    require(unavailable.succeeded && patch && !patch->terminal_identity,
+        "A failed native configuration probe must not fabricate title or store qualification");
+
+    auto prompted = direct;
+    prompted.terminal_identity = addon::Terminal_identity_offer{};
+    prompted.launch_environment->effective_environment.set("CODEX_FIXTURE_VERSION", addon::Json_value("0.167.0"));
+    prompted.initial_prompt = addon::Initial_prompt_request{"-- exact initial text", utf8(root / "brief.md")};
+    Context with_prompt;
+    prepare_launch(with_prompt, prompted);
+    const auto prompt_patch = addon::decode_launch_patch(with_prompt.output, &failure, 3);
+    require(with_prompt.succeeded && prompt_patch && prompt_patch->terminal_identity && prompt_patch->argv &&
+        addon::validate_initial_prompt_acknowledgment(prompted.initial_prompt, *prompt_patch, &failure) &&
+        prompt_patch->argv->at(prompt_patch->argv->size() - 2) == "--" &&
+        prompt_patch->argv->back() == prompted.initial_prompt->text,
+        "The identity override must precede and preserve the actual initial prompt");
+}
+
 void title_configuration_bounds(const addon::Prepare_request& direct)
 {
     auto long_title = direct;
@@ -409,6 +503,16 @@ void title_configuration_bounds(const addon::Prepare_request& direct)
         require(std::none_of(patch->argv->begin(), patch->argv->end(), [](const auto& argument) {
             return argument.starts_with("tui.terminal_title=");
         }), "A title override that exceeds the launch contract must leave the original title intact");
+        auto offered = request;
+        offered.terminal_identity = addon::Terminal_identity_offer{};
+        offered.launch_environment->effective_environment.set("CODEX_FIXTURE_VERSION", addon::Json_value("0.167.0"));
+        Context identity;
+        prepare_launch(identity, offered);
+        const auto identity_patch = addon::decode_launch_patch(identity.output, &failure, 3);
+        require(identity.succeeded && identity_patch && identity_patch->argv && !identity_patch->terminal_identity &&
+            std::none_of(identity_patch->argv->begin(), identity_patch->argv->end(), [](const auto& argument) {
+                return argument.starts_with("tui.terminal_title=");
+            }), "A rejected suffix override must not publish a prepared identity capsule");
     }
 }
 
@@ -786,6 +890,7 @@ int main(int argc, char** argv)
         account.profile_path        = utf8(root);
         prepare.account_context     = account;
         title_configuration_launches(prepare, root);
+        identity_title_launches(prepare, root);
         title_configuration_bounds(prepare);
         Context interactive;
         interactive.input = {"interactive", {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(prepare, 3)};
@@ -1091,6 +1196,19 @@ int main(int argc, char** argv)
             std::pair<std::string, std::string>{"OTEL_EXPORTER_OTLP_LOGS_HEADERS", ("Authorization=Bearer%20" + std::string(64, 'd'))}) == 1,
             "Resume patch lost private observer authorization");
         require(proposal->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763", "Exact resume identity changed");
+        auto identity_resume = title_resume;
+        identity_resume.context.terminal_identity = addon::Terminal_identity_offer{};
+        identity_resume.context.launch_environment->effective_environment.set("CODEX_FIXTURE_VERSION", addon::Json_value("0.167.0"));
+        Context identified_resume;
+        identified_resume.input = {"identity-resume", {"interactive-resume", 2}, "prepare_resume",
+            addon::encode_resume_prepare_request(identity_resume, 2), 15000};
+        codex::handle_preparation(identified_resume);
+        const auto identified = addon::decode_resume_prepare_result(identified_resume.output, &failure, 2);
+        require(identified_resume.succeeded && identified && identified->patch.terminal_identity &&
+            identified->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763" &&
+            std::count(identified->process.argv.begin(), identified->process.argv.end(),
+                R"(tui.terminal_title=["spinner","session-id","thread-name","thread"])") == 1,
+            "Exact resume must prepare immediate identity without replacing its native UUID or display settings");
         for (const auto& arguments : k_permission_arguments) {
             const auto permission = with_arguments(prepare, arguments);
             auto request = resume;

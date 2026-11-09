@@ -60,6 +60,76 @@ selection. Rejecting a reporting hook does not prevent two native live owners.
 Equivalent cross-worktree adoption and exclusive ownership remain bounded by
 the shared host contract and a suitable native selection control.
 
+### Immediate displayed identity
+
+With `terminal-identity@1` negotiated and a qualified prepared launch, the
+provider can report the displayed thread before a turn. It appends the native
+`session-id`, `thread-name`, and `thread` title items to the effective original
+selection. Original fields keep their relative order, including duplicates;
+the existing activity preparation still supplies a leading `spinner` when
+activity was absent. The host removes the appended identity fields before
+publishing the original human caption. Native permission/question attention
+continues to consume its existing raw title evidence.
+
+This path requires a stable Codex release at least 0.167.0, a successfully
+verified local native store, and leading or absent activity. Prereleases and
+custom lists with nonleading or repeated activity remain on the existing hook
+path, without an identity override. The host's leading activity normalization
+then gives identity classification a stable revision across spinner frames.
+Configuration files, disabled animations, accessibility settings, hooks, and
+the exact resume UUID remain unchanged.
+
+Native `config/read` does not expand an unset title list. For stable 0.167
+releases, preparation retains the source-verified default
+`activity, thread-name, project-name`. It does not invent defaults for later
+release families: an unset/null list there leaves immediate identity
+unavailable. An explicit resolved list can be preserved without assuming a
+native default. A failed configuration probe, unsupported profile/store, or
+title override exceeding launch bounds leaves ordinary preparation available
+and publishes no identity opt-in.
+
+The opaque prepared context freezes the verified native version, `CODEX_HOME`,
+and pinned `sqlite_home` before any hook. Only the terminal owner supplies that
+context and a scoped `terminal_title_changed` event to `classify_event`; helper
+JSON cannot nominate them. The provider checks the complete right-hand suffix,
+not arbitrary UUID-looking text elsewhere in a title. In the
+[0.167.0 native formatter](https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/tui/src/chatwidget/status_surfaces.rs),
+`session-id` retains 29 UUID characters plus `...`; an unnamed thread omits
+`thread-name` and `thread` supplies its complete UUID. A named thread renders
+the same bounded name twice. Duplicate names, embedded separators and a human
+name resembling a UUID therefore retain their structural role.
+
+A fresh unnamed thread needs no native files. For a named thread, the provider
+opens only the frozen `state_5.sqlite` read-only and resolves the prefix through
+the native ID index, reading at most two candidates. Exactly one canonical ID
+is required. Names, modification times and most-recent files never choose the
+conversation. Native 0.167
+[naming materializes the thread before success](https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/thread-store/src/local/update_thread_metadata.rs).
+Missing or ambiguous index evidence and unsupported database generations stay
+unavailable. The
+[native title writer](https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/tui/src/terminal_title.rs)
+caps the whole title at 240 Unicode characters; a title reaching that boundary
+is rejected because its suffix may have been cut. An unavailable observation
+does not publish a raw caption containing identity fields; the host retains
+its previous safe presentation.
+
+An exact selection of a different ID produces an ordinary typed RESUME/STARTED
+observation, including for a new ID or a return to a loaded conversation. The
+host owns the fresh transition nonce, journal, generation/revision fences,
+stable card and Note association. The title never claims a default cwd.
+A later matching native `SessionStart` contributes cwd/context under the
+accepted nonce without opening a duplicate activation. A contradictory late
+start is ignored before it can attach context or move ownership back. Existing
+attention and asynchronous-question result envelopes are preserved.
+
+`codex_terminal_identity_tests` exercises idle selection without a hook or
+history, named native-index resolution, A → B → A, duplicate/stale starts,
+UTF-8 bounds, misleading names, prefix collisions and unavailable scope.
+Preparation fixtures exercise stable-version qualification, preserved defaults
+and custom fields, exact resume, initial prompts and rejected overrides.
+These are provider contract tests. Actual native TUI transport, picker and Note
+behavior remain part of the separate host/native acceptance gate.
+
 Codex builds with native hook trust present their own startup hook review.
 Continuing without trusting leaves the prepared hooks inactive. Logonomic does
 not override that choice. An isolated Windows TUI check with Codex `0.160.0`
@@ -82,7 +152,8 @@ below to keep the terminal title's activity field available. If an explicit
 `tui.terminal_title` list omits both `activity` and its `spinner` alias, preparation
 prepends `spinner` through a process-local `-c` override. Every configured field
 and its relative order is preserved; an explicit empty list becomes activity
-alone. An absent or null list keeps Codex's native default. Configuration files
+alone when immediate identity is not negotiated. Without that qualified opt-in,
+an absent or null list keeps Codex's native default. Configuration files
 and unrelated TUI settings are unchanged. This preparation requires the existing
 native configuration probe (Codex 0.149.0 or newer); unsupported named profiles
 or a failed probe retain their original title configuration. Preparation also
