@@ -130,7 +130,8 @@ void invoke(addon::Invocation_context& context)
             const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure);
             if (!inspection) context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
             else if (inspection->purpose != addon::Structured_purpose::IMPLEMENTATION) context.fail(addon::Result_status::UNAVAILABLE, "purpose_unavailable");
-            else context.succeed(addon::encode_structured_inspect_result(codex::inspect_implementation(inspection->inspection)));
+            else context.succeed(addon::encode_structured_inspect_result(
+                codex::inspect_implementation(inspection->inspection), inspection->report_failure_diagnostics));
         }
         else {
             codex::handle_preparation(context);
@@ -154,6 +155,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {addon::k_conversation_export_capability_id, addon::k_conversation_export_version},
         {"launch-preparation", 3}, {"structured-session", 3}, {"delegated-session", 3},
+        {addon::k_structured_failure_diagnostics_capability_id, addon::k_structured_failure_diagnostics_version},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},
         {addon::k_terminal_identity_capability_id, addon::k_terminal_identity_version},

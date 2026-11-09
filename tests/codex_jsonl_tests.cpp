@@ -1,7 +1,12 @@
 #include "codex_jsonl.h"
 
+#include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/limits.h>
+
 #include <iostream>
 #include <string>
+#include <string_view>
+#include <utility>
 
 int main()
 {
@@ -92,6 +97,140 @@ int main()
     }
     if (!refused(metadata_notice + thread_started + turn_started + answer + turn_completed)) {
         std::cerr << "A notice before the thread starts must fail the task\n";
+        return 1;
+    }
+
+    const auto inspect = [](std::string output, int exit_code = 0, bool timed_out = false,
+        std::string stderr_bytes = {}) {
+        addon::Structured_inspection request;
+        request.protocol_state = codex::initial_implementation_state();
+        request.stdout_bytes = std::move(output);
+        request.stderr_bytes = std::move(stderr_bytes);
+        request.final = true;
+        request.exit_code = exit_code;
+        request.timed_out = timed_out;
+        return codex::inspect_implementation(request);
+    };
+    const auto failure_matches = [](const addon::Structured_inspect_result& result,
+        std::string_view reason, std::string_view source, std::string_view message, bool truncated = false) {
+        return result.complete && result.failure_reason == reason && !result.result_bytes &&
+            result.failure_diagnostics && result.failure_diagnostics->source == source &&
+            result.failure_diagnostics->message == message &&
+            result.failure_diagnostics->truncated == truncated;
+    };
+    const auto native_error = [](const std::string& type, const std::string& message) {
+        auto event = addon::Json_value::object();
+        event.set("type", addon::Json_value(type));
+        auto error = addon::Json_value::object();
+        error.set("message", addon::Json_value(message));
+        if (type == "error") {
+            event.set("message", addon::Json_value(message));
+        }
+        else {
+            event.set("error", std::move(error));
+        }
+        return addon::serialize_json(event) + '\n';
+    };
+
+    // Native fatal error fields are caller evidence, independently of the
+    // existing reason code and of transport chunk boundaries.
+    const std::string native_message =
+        "Provider request failed: r\xc3\xa9seau unavailable.\nDetails: retry limit reached.";
+    for (const std::string type : {"error", "turn.failed"}) {
+        const auto event = native_error(type, native_message);
+        const auto result = inspect(thread_started + turn_started + event);
+        if (!failure_matches(result, "implementation_failed", "native_error", native_message)) {
+            std::cerr << "Native error text or existing failure code was lost\n";
+            return 1;
+        }
+        for (std::size_t split = 0; split < event.size(); ++split) {
+            addon::Structured_inspection first;
+            first.protocol_state = codex::initial_implementation_state();
+            first.stdout_bytes = thread_started + turn_started + event.substr(0, split);
+            const auto partial = codex::inspect_implementation(first);
+            if (partial.complete) {
+                std::cerr << "A partial native error record completed early\n";
+                return 1;
+            }
+            addon::Structured_inspection last;
+            last.protocol_state = partial.protocol_state;
+            last.stdout_bytes = event.substr(split);
+            last.final = true;
+            if (!failure_matches(codex::inspect_implementation(last),
+                    "implementation_failed", "native_error", native_message))
+            {
+                std::cerr << "Chunking discarded native failure evidence\n";
+                return 1;
+            }
+        }
+        const auto legacy_wire = addon::encode_structured_inspect_result(result);
+        const auto opted_in_wire = addon::encode_structured_inspect_result(result, true);
+        addon::Contract_failure failure;
+        const auto decoded = addon::decode_structured_inspect_result(opted_in_wire, true, &failure);
+        if (legacy_wire.find("failure_diagnostics") || !opted_in_wire.find("failure_diagnostics") ||
+            !decoded || !failure_matches(*decoded, "implementation_failed", "native_error", native_message))
+        {
+            std::cerr << "Native failure evidence must be readable only on the opted-in wire\n";
+            return 1;
+        }
+    }
+    if (!failure_matches(inspect(native_error("error", native_message)),
+            "startup_failed", "native_error", native_message) ||
+        !failure_matches(inspect("", 1, false, "Not logged in\n"),
+            "authentication_required", "native_error", "Not logged in") ||
+        !failure_matches(inspect(transcript + native_error("error", native_message)),
+            "implementation_failed", "native_error", native_message))
+    {
+        std::cerr << "Startup, authentication or late native error evidence changed its failure contract\n";
+        return 1;
+    }
+
+    constexpr std::size_t message_limit = 16 * 1024;
+    if (addon::limits::k_max_structured_failure_message_bytes != message_limit) {
+        std::cerr << "The negotiated native failure-message contract is 16 KiB\n";
+        return 1;
+    }
+    const std::string exact_message(message_limit, 'x');
+    const std::string unicode_prefix(message_limit - 1, 'x');
+    const std::string oversized_message = unicode_prefix + "\xe2\x82\xac" + " beyond the limit";
+    const auto exact = inspect(thread_started + turn_started + native_error("error", exact_message));
+    const auto bounded = inspect(thread_started + turn_started + native_error("turn.failed", oversized_message));
+    if (!failure_matches(exact, "implementation_failed", "native_error", exact_message) ||
+        !failure_matches(bounded, "implementation_failed", "native_error", unicode_prefix, true) ||
+        !addon::is_valid_utf8(bounded.failure_diagnostics->message))
+    {
+        std::cerr << "Native failure text lost its exact bound or safe UTF-8 truncation\n";
+        return 1;
+    }
+    const std::string nul_message("Before\0after", 12);
+    if (!failure_matches(inspect(thread_started + turn_started + native_error("error", nul_message)),
+            "implementation_failed", "native_error", std::string("Before") + "\xef\xbf\xbd" + "after"))
+    {
+        std::cerr << "An embedded NUL must not make the optional native diagnostic unreadable\n";
+        return 1;
+    }
+
+    const auto malformed = inspect(thread_started + turn_started + "private-invalid-record\n");
+    const auto nonzero = inspect(transcript, 7);
+    const auto timeout = inspect(transcript, 0, true);
+    const auto incomplete = inspect(thread_started + turn_started + answer);
+    for (const auto* result : {&malformed, &nonzero, &timeout, &incomplete}) {
+        if (!result->complete || result->failure_reason != "implementation_failed" || result->result_bytes) {
+            std::cerr << "Diagnostic detail must preserve the existing failed-result contract\n";
+            return 1;
+        }
+    }
+    if (!malformed.failure_diagnostics || malformed.failure_diagnostics->source != "protocol_error" ||
+        malformed.failure_diagnostics->message.empty() ||
+        malformed.failure_diagnostics->message.find("private-invalid-record") != std::string::npos ||
+        !nonzero.failure_diagnostics || nonzero.failure_diagnostics->source != "process_exit" ||
+        nonzero.failure_diagnostics->message.find('7') == std::string::npos ||
+        !timeout.failure_diagnostics || timeout.failure_diagnostics->source != "process_exit" ||
+        timeout.failure_diagnostics->message.find("timed out") == std::string::npos ||
+        !incomplete.failure_diagnostics || incomplete.failure_diagnostics->source != "protocol_error" ||
+        incomplete.failure_diagnostics->message.find("turn.completed") == std::string::npos)
+    {
+        std::cerr << "Parser and process failures need useful evidence without copying a raw invalid record\n";
         return 1;
     }
     return 0;
