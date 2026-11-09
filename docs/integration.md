@@ -79,12 +79,11 @@ then gives identity classification a stable revision across spinner frames.
 Configuration files, disabled animations, accessibility settings, hooks, and
 the exact resume UUID remain unchanged.
 
-Native `config/read` does not expand an unset title list. For stable 0.167
-releases, preparation retains the source-verified default
-`activity, thread-name, project-name`. It does not invent defaults for later
-release families: an unset/null list there leaves immediate identity
-unavailable. An explicit resolved list can be preserved without assuming a
-native default. A failed configuration probe, unsupported profile/store, or
+Native `config/read` does not expand an unset title list. Preparation retains
+the established native default `activity, thread-name, project-name` across
+compatible stable releases. An explicit resolved list preserves its selected
+fields. Exact observed suffix proof and the native-store checks determine
+identity availability. A failed configuration probe, unsupported profile/store, or
 title override exceeding launch bounds leaves ordinary preparation available
 and publishes no identity opt-in.
 

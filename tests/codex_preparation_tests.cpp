@@ -402,7 +402,8 @@ void identity_title_launches(const addon::Prepare_request& direct, const fs::pat
         {"0.167.1-alpha.1", nullptr, nullptr, false},
         {"0.167.0+qualified", nullptr,
             R"(tui.terminal_title=["activity","thread-name","project-name","session-id","thread-name","thread"])", true},
-        {"0.168.0", nullptr, nullptr, false},
+        {"0.168.0", nullptr,
+            R"(tui.terminal_title=["activity","thread-name","project-name","session-id","thread-name","thread"])", true},
         {"0.168.0", R"({"terminal_title":["activity","project-name"]})",
             R"(tui.terminal_title=["activity","project-name","session-id","thread-name","thread"])", true},
     };
@@ -437,8 +438,8 @@ void identity_title_launches(const addon::Prepare_request& direct, const fs::pat
         if (patch->terminal_identity) {
             const auto& prepared = patch->terminal_identity->context;
             const auto* native_store = prepared.find("native_store");
-            require(native_store && *native_store->find("codex_home") == addon::Json_value(utf8(root)) &&
-                *native_store->find("sqlite_home") == addon::Json_value(store_path) &&
+            require(native_store && addon::path_from_utf8(native_store->find("codex_home")->as_string()) == root &&
+                addon::path_from_utf8(native_store->find("sqlite_home")->as_string()) == root / "identity-state" &&
                 *prepared.find("native_version") == addon::Json_value(example.version),
                 "Immediate identity must capture the prepared native namespace before the first hook");
         }

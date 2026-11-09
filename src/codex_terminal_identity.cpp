@@ -272,11 +272,8 @@ std::optional<Title_identity_preparation> prepare_title_identity(
     const auto* selected = tui ? tui->find("terminal_title") : nullptr;
     std::vector<std::string> items;
     if (!selected || selected->is_null()) {
-        // config/read leaves native defaults unexpanded. Only this verified
-        // release family has a known default to preserve in an explicit list.
-        if (!native_version.starts_with("0.167.")) {
-            return {};
-        }
+        // config/read leaves native defaults unexpanded. Preserve the native
+        // default selection; observed suffix proof still owns exact identity.
         items = {"activity", "thread-name", "project-name"};
     }
     else {
