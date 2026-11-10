@@ -2,9 +2,12 @@
 #include "codex_hook_metadata.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/host_simulator.h>
+#include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/sidecar.h>
 
 #include <filesystem>
@@ -23,6 +26,104 @@ bool check(bool condition, const char* message)
         std::cerr << message << '\n';
     }
     return condition;
+}
+
+bool classification_diagnostics(const std::filesystem::path& package)
+{
+    const auto root = std::filesystem::temp_directory_path() / ("codex-event-diagnostics-" + addon::random_nonce_hex());
+    addon::Simulator_options options;
+    options.package_directory = package;
+    options.profile_storage_root = root;
+    addon::Host_simulator host(options, nullptr);
+    addon::Contract_failure failure;
+    if (!check(host.start(&failure), "Packaged Codex diagnostic adapter did not start")) {
+        return false;
+    }
+    bool ok = true;
+    const auto rejected = [
+            &host,
+            &ok
+        ](
+            const char* capability,
+            const char* event_name,
+            const char* body,
+            const char* field,
+            addon::Provider_event_problem problem)
+        {
+            addon::Attention_classification_request request;
+            request.base.event = {event_name, *addon::parse_json(body, {}, nullptr)};
+            request.base.transition_nonce = std::string(32, 'a');
+            const auto id = host.invoke({capability, 1}, addon::k_classify_event_operation,
+                addon::encode_attention_classification_request(request), 5000);
+            const auto outcome = host.wait_outcome(id, 6000);
+            if (!check(outcome && outcome->status == addon::Host_status::FAILED &&
+                outcome->reason_code == "invalid_provider_event", "Malformed Codex event did not fail explicitly"))
+            {
+                ok = false;
+                return;
+            }
+            const auto diagnostic = addon::decode_provider_event_diagnostic(outcome->message);
+            ok &= check(diagnostic && diagnostic->event_name == event_name && diagnostic->field == field &&
+                    diagnostic->problem == problem && !diagnostic->rule.empty(),
+                "Packaged Codex failure lost its exact event, malformed field or validation rule");
+            ok &= check(outcome->message.find("private_value_sentinel") == std::string::npos,
+                "Codex diagnostic included a native field value");
+        };
+    rejected(addon::k_attention_kind_capability_id, "UserPromptSubmit",
+        R"({"hook_event_name":"UserPromptSubmit","session_id":"session-a","turn_id":null})",
+        "turn_id", addon::Provider_event_problem::WRONG_TYPE);
+    rejected(addon::k_attention_kind_capability_id, "SubagentStart",
+        R"({"hook_event_name":"SubagentStart","session_id":"session-a","turn_id":"turn-a","agent_id":"child-a"})",
+        "agent_type", addon::Provider_event_problem::MISSING);
+    rejected(addon::k_attention_kind_capability_id, "PreToolUse",
+        R"({"hook_event_name":"PreToolUse","session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+            "tool_name":"request_user_input","tool_input":{"questions":[{"id":"q-a","header":7,"question":"Which file?"}]}})",
+        "tool_input.questions[0].header", addon::Provider_event_problem::WRONG_TYPE);
+    rejected(addon::k_attention_kind_capability_id, "PostToolUse",
+        R"({"hook_event_name":"PostToolUse","session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+            "tool_name":"request_user_input","tool_input":{"questions":[{"id":"q-a","header":"File","question":"Which file?"}]},
+            "tool_response":"{\"answers\":{\"private_value_sentinel\":{\"answers\":[]}}}"})",
+        "tool_response.answers[0]", addon::Provider_event_problem::MISMATCH);
+    rejected(addon::k_attention_kind_capability_id, "PostToolUse",
+        R"({"hook_event_name":"PostToolUse","session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+            "tool_name":"request_user_input","tool_input":{"questions":[{"id":"q-a","header":"File","question":"Which file?"}]},
+            "tool_response":[{"type":"input_text","text":7}]})",
+        "tool_response[0].text", addon::Provider_event_problem::WRONG_TYPE);
+    rejected(addon::k_attention_kind_capability_id, "PostToolUse",
+        R"({"hook_event_name":"PostToolUse","session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+            "tool_name":"request_user_input","tool_input":{"questions":[{"id":"q-a","header":"File","question":"Which file?"}]},
+            "tool_response":[{"type":"input_text"}]})",
+        "tool_response[0].text", addon::Provider_event_problem::MISSING);
+    rejected(addon::k_attention_kind_capability_id, "PostToolUse",
+        R"({"hook_event_name":"PostToolUse","session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+            "tool_name":"request_user_input","tool_input":{"questions":[{"id":"q-a","header":"File","question":"Which file?"}]},
+            "tool_response":"{\"answers\":{\"q-a\":{\"answers\":17}}}"})",
+        "tool_response.answers[0].answers", addon::Provider_event_problem::WRONG_TYPE);
+    rejected(addon::k_attention_kind_capability_id, "PostToolUse",
+        R"({"hook_event_name":"PostToolUse","session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a",
+            "tool_name":"request_user_input","tool_input":{"questions":[{"id":"q-a","header":"File","question":"Which file?"}]},
+            "tool_response":"{\"answers\":{\"q-a\":{\"answers\":[\"private_value_sentinel\",17]}}}"})",
+        "tool_response.answers[0].answers[1]", addon::Provider_event_problem::WRONG_TYPE);
+    rejected(addon::k_attention_kind_capability_id, "NativeSignal",
+        R"({"origin":"host_terminal","candidate":{"session_id":"session-a","turn_id":"turn-a","tool_use_id":"call-a"},
+            "terminal_event":{"terminal_id":"17","generation":"2","source":"logonomic_terminal_worker",
+                "stream":"terminal","stream_index":0,"timestamp":1234.5,
+                "payload":{"kind":"terminal_title_changed","title_sequence":"0","title":"private_value_sentinel"}}})",
+        "terminal_event.payload.title_sequence", addon::Provider_event_problem::INVALID_VALUE);
+    rejected(addon::k_terminal_identity_capability_id, "NativeSignal", R"({"origin":"host_terminal"})",
+        "terminal_identity", addon::Provider_event_problem::MISSING);
+    addon::Classify_event_request valid;
+    valid.event.name = "SessionStart";
+    valid.event.body = *addon::parse_json(R"({"hook_event_name":"SessionStart","session_id":"session-a"})", {}, nullptr);
+    valid.transition_nonce = std::string(32, 'a');
+    const auto valid_id = host.invoke({"helper-ingress", 2}, addon::k_classify_event_operation,
+        addon::encode_classify_event_request(valid), 5000);
+    const auto accepted = host.wait_outcome(valid_id, 6000);
+    ok &= check(accepted && accepted->status == addon::Host_status::SUCCESS,
+        "Optional Codex source metadata became a required field");
+    ok &= check(host.shutdown(1000, nullptr), "Packaged Codex diagnostic adapter did not exit cleanly");
+    std::filesystem::remove_all(root);
+    return ok;
 }
 
 bool permission_title_corroboration()
@@ -790,5 +891,6 @@ int main(int argc, char** argv)
         return 1;
     }
     const bool gated = declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
-    return permission_title_corroboration() && question_hooks() && async_question_hooks() && conversational_stop() && gated ? 0 : 1;
+    return classification_diagnostics(addon::path_from_utf8(argv[1])) && permission_title_corroboration() &&
+        question_hooks() && async_question_hooks() && conversational_stop() && gated ? 0 : 1;
 }
