@@ -33,6 +33,7 @@ std::optional<Native_terminal_identity> observed_terminal_identity(
 
 std::optional<logonomic::cli_addon::Terminal_identity_classification_result> classify_title_identity(
     const logonomic::cli_addon::Classify_event_request& request,
-    const std::function<bool()>& cancelled = {});
+    const std::function<bool()>& cancelled = {},
+    logonomic::cli_addon::Contract_failure* failure = nullptr);
 
 } // namespace codex

@@ -4,6 +4,7 @@
 #include "codex_resume_record.h"
 
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 
 #ifdef _WIN32
 #include <winsqlite/winsqlite3.h>
@@ -355,12 +356,28 @@ std::optional<Native_terminal_identity> observed_terminal_identity(
 }
 
 std::optional<addon::Terminal_identity_classification_result> classify_title_identity(
-    const addon::Classify_event_request& request, const std::function<bool()>& cancelled)
+    const addon::Classify_event_request& request, const std::function<bool()>& cancelled,
+    addon::Contract_failure* failure)
 {
-    if (request.event.name != "NativeSignal" || !exact_members(request.event.body, {"origin"}) ||
-        *request.event.body.find("origin") != Json("host_terminal") || !request.terminal_identity)
-    {
-        return {};
+    if (request.event.name != "NativeSignal") {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "event.name", addon::Provider_event_problem::MISMATCH,
+            nullptr, {}, "native_signal_event"));
+    }
+    if (!exact_members(request.event.body, {"origin"})) {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "body", addon::Provider_event_problem::INVALID_SHAPE,
+            &request.event.body, {}, "terminal_identity_envelope"));
+    }
+    if (*request.event.body.find("origin") != Json("host_terminal")) {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "origin", addon::Provider_event_problem::MISMATCH,
+            request.event.body.find("origin"), {}, "host_terminal_origin"));
+    }
+    if (!request.terminal_identity) {
+        return addon::reject_provider_event(failure, addon::make_provider_event_diagnostic(
+            request.event.name, "terminal_identity", addon::Provider_event_problem::MISSING,
+            nullptr, {}, "terminal_identity_context"));
     }
     addon::Terminal_identity_classification_result result;
     const auto identity = observed_terminal_identity(request, cancelled);
