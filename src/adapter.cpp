@@ -18,6 +18,7 @@
 #include <logonomic_cli_addon/startup_observer.h>
 
 #include <exception>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -129,9 +130,16 @@ void invoke(addon::Invocation_context& context)
             addon::Contract_failure failure;
             const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure);
             if (!inspection) context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
-            else if (inspection->purpose != addon::Structured_purpose::IMPLEMENTATION) context.fail(addon::Result_status::UNAVAILABLE, "purpose_unavailable");
-            else context.succeed(addon::encode_structured_inspect_result(
-                codex::inspect_implementation(inspection->inspection), inspection->report_failure_diagnostics));
+            else {
+                auto result = codex::inspect_implementation(inspection->inspection);
+                if (inspection->purpose == addon::Structured_purpose::READ_ONLY_REVIEW && result.failure_reason &&
+                    result.failure_reason->starts_with("implementation_"))
+                {
+                    result.failure_reason = "review_" +
+                        result.failure_reason->substr(std::string_view("implementation_").size());
+                }
+                context.succeed(addon::encode_structured_inspect_result(result, inspection->report_failure_diagnostics));
+            }
         }
         else {
             codex::handle_preparation(context);
@@ -155,6 +163,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {addon::k_conversation_export_capability_id, addon::k_conversation_export_version},
         {"launch-preparation", 3}, {"structured-session", 3}, {"delegated-session", 3},
+        {addon::k_delegated_model_selection_capability_id, addon::k_delegated_model_selection_version},
         {addon::k_structured_failure_diagnostics_capability_id, addon::k_structured_failure_diagnostics_version},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_terminal_codex_invocation_capability_id, addon::k_terminal_codex_invocation_version},

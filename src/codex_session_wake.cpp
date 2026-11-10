@@ -303,6 +303,20 @@ std::optional<Bound_queue> bound_queue(const addon::Session_wake_target& target)
 
 } // namespace
 
+std::optional<Json> read_native_configuration(
+    const Verified_launch& launch, const Environment& environment,
+    const std::string& working_directory, addon::Invocation_context& context)
+{
+    const auto configuration = configuration_arguments(launch);
+    if (!configuration) return std::nullopt;
+    std::vector<std::string> argv(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
+    argv.insert(argv.end(), configuration->begin(), configuration->end());
+    const auto response = call(argv, environment, working_directory, "config/read",
+        object({{"cwd", Json(working_directory)}, {"includeLayers", Json(false)}}), context);
+    const auto* config = response.result ? response.result->find("config") : nullptr;
+    return config && config->is_object() ? std::optional<Json>(*config) : std::nullopt;
+}
+
 Native_launch_preparation prepare_native_launch(
     Verified_launch& launch, const Environment& environment,
     const std::string& working_directory, addon::Invocation_context& context,
@@ -328,12 +342,8 @@ Native_launch_preparation prepare_native_launch(
     if (home.empty()) return unavailable("wake_profile_unavailable");
     const auto evidence = file_evidence(launch.files);
     if (!evidence) return unavailable("wake_executable_unavailable");
-    std::vector<std::string> argv(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
-    argv.insert(argv.end(), configuration->begin(), configuration->end());
-    const auto response = call(argv, environment, working_directory, "config/read",
-        object({{"cwd", Json(working_directory)}, {"includeLayers", Json(false)}}), context);
-    const auto* config = response.result ? response.result->find("config") : nullptr;
-    if (!config || !config->is_object()) return unavailable("wake_configuration_unavailable");
+    const auto config = read_native_configuration(launch, environment, working_directory, context);
+    if (!config) return unavailable("wake_configuration_unavailable");
     const auto after = file_evidence(launch.files);
     if (!after || *after != *evidence) return unavailable("wake_executable_changed");
     terminal_title = title_activity(*config);

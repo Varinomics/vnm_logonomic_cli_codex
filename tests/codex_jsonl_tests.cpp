@@ -1,14 +1,16 @@
 #include "codex_jsonl.h"
 
+#include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/limits.h>
 
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
-int main()
+int main(int argc, char** argv)
 {
     namespace addon = logonomic::cli_addon;
     // Oracle: committed native Codex exec JSONL reducer requires one root,
@@ -53,6 +55,48 @@ int main()
     const std::string answer =
         "{\"type\":\"item.completed\",\"item\":{\"id\":\"item-a\",\"type\":\"agent_message\",\"text\":\"Completed change\"}}\n";
     const std::string transcript = thread_started + turn_started + answer + turn_completed;
+    if (argc != 2) {
+        std::cerr << "Expected the built package directory\n";
+        return 1;
+    }
+    addon::Simulator_options options;
+    options.package_directory = argv[1];
+    addon::Host_simulator host(options, nullptr);
+    addon::Contract_failure failure;
+    if (!host.start(&failure)) {
+        std::cerr << "Packaged inspection adapter failed to start\n";
+        return 1;
+    }
+    // The review purpose must reach the packaged dispatch, including the
+    // request-only failure diagnostic extension, not just its JSONL reducer.
+    for (const bool report : {false, true}) {
+        for (const bool failed_review : {false, true}) {
+            addon::Structured_inspect_request request;
+            request.purpose                    = addon::Structured_purpose::READ_ONLY_REVIEW;
+            request.report_failure_diagnostics = report;
+            request.inspection.protocol_state = codex::initial_implementation_state();
+            request.inspection.stdout_bytes   = failed_review
+                ? thread_started + turn_started + "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Review unavailable\"}}\n"
+                : transcript;
+            request.inspection.final = true;
+            const auto id = host.invoke({"structured-session", 3}, addon::k_inspect_operation,
+                addon::encode_structured_inspect_request(request), 5000);
+            const auto outcome = host.wait_outcome(id, 6000);
+            const auto result = outcome && outcome->status == addon::Host_status::SUCCESS
+                ? addon::decode_structured_inspect_result(outcome->payload, true, &failure) : std::nullopt;
+            if (!result || !result->complete ||
+                (failed_review ? result->failure_reason != "review_failed" : result->result_bytes != "Completed change") ||
+                result->failure_diagnostics.has_value() != (failed_review && report))
+            {
+                std::cerr << "Packaged review inspection lost its result or request-only diagnostics\n";
+                return 1;
+            }
+        }
+    }
+    if (!host.shutdown(1000, nullptr)) {
+        std::cerr << "Packaged review adapter failed to stop\n";
+        return 1;
+    }
     if (!completes_in_any_chunking(transcript)) {
         return 1;
     }

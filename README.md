@@ -8,15 +8,16 @@ is installed separately.
 
 The package recognizes Codex launchers and selected `CODEX_HOME` accounts,
 prepares interactive launches and exact resume, supplies authenticated hooks,
-and supports delegated implementation, authentication, quota and per-turn
-usage. Structured read-only review is not advertised.
+and supports delegated implementation and read-only review, authentication,
+quota and per-turn usage.
 
 ## Use with Logonomic
 
 Install the indexed package through Logonomic's generic add-on ingestion. The
 selected launcher and native Codex configuration retain their sandbox,
-approval, model and account choices; this package does not grant general file
-or command permissions. Native executable and stock npm launcher chains are
+approval, model and account choices. A delegated task can override its model
+and reasoning effort for that invocation; read-only review constrains command
+execution and external tools. Native executable and stock npm launcher chains are
 verified before interactive or delegated preparation.
 
 Lifecycle support requires Codex 0.146.0 or newer; delegated implementation

@@ -1,6 +1,7 @@
 {
   "payload": {
     "purposes": [
+      "read_only_review",
       "implementation"
     ],
     "environment_names": [

@@ -282,7 +282,8 @@ foreach(test_name IN ITEMS codex_jsonl_tests codex_lifecycle_tests codex_startup
     if(test_name STREQUAL "codex_probe_tests")
         add_dependencies(${test_name} codex_fake_cli codex_quota_helper)
         add_test(NAME ${test_name} COMMAND ${test_name} "$<TARGET_FILE:codex_fake_cli>" "$<TARGET_FILE:codex_quota_helper>")
-    elseif(test_name STREQUAL "codex_usage_tests" OR test_name STREQUAL "codex_lifecycle_tests" OR test_name STREQUAL "codex_context_tests")
+    elseif(test_name STREQUAL "codex_usage_tests" OR test_name STREQUAL "codex_lifecycle_tests" OR
+           test_name STREQUAL "codex_context_tests" OR test_name STREQUAL "codex_jsonl_tests")
         add_dependencies(${test_name} codex_package)
         add_test(NAME ${test_name} COMMAND ${test_name} "${CODEX_PACKAGE_DIRECTORY}")
     else()

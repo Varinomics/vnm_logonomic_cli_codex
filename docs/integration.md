@@ -291,8 +291,7 @@ has exited.
 
 Authentication, quota, account discovery and per-turn usage scanning preserve the
 native integration's semantics. Historical account, resume and usage imports
-match the exact `codex` provider attribution. Structured read-only review is not
-advertised. Lifecycle support requires Codex 0.146.0 or newer; delegated
+match the exact `codex` provider attribution. Lifecycle support requires Codex 0.146.0 or newer; delegated
 implementation requires 0.150.1 or newer. Version checks have no upper bound,
 and accepted protocol records still undergo structural and identity validation.
 
@@ -345,3 +344,39 @@ needs a launcher or configuration that allows writes, for example
 `-c sandbox_mode="workspace-write"`. Without `--yolo`, `codex exec` runs only
 inside a Git repository, so preparation refuses another working directory with
 `untrusted_working_directory`.
+
+## Delegated model selection and read-only review
+
+`delegated-model-selection@1` accepts a task's exact native model and reasoning
+effort independently of its saved launcher and selected account. The process
+uses an exec-local `--model` and a `model_reasoning_effort` configuration override;
+omitted fields retain native defaults.
+The native CLI or model service rejects unsupported values; the package does
+not keep a model or effort allowlist. The result acknowledges the exact request.
+Neither account files nor launcher settings are rewritten.
+An explicit effort requires the selected CLI's `config/read` to acknowledge
+that exact value. A successful configuration read with a different or missing
+effort returns `reasoning_effort_unavailable` for either task purpose.
+Runtime `-p` profiles and legacy profiles are unavailable
+for effort overrides when that native reader cannot resolve their precedence.
+
+A read-only review replaces invocation-local sandbox and bypass options with
+`--sandbox read-only`, `--ignore-rules`, and a never-approval policy without
+automatic approval review. On Windows, `windows.sandbox="unelevated"` enables
+the native restricted-token sandbox without an elevation or setup prompt.
+Native apps, plugins, browsers, computer use and hooks are disabled for that
+invocation. The selected CLI's `config/read`, run with the
+same account, working directory and launcher configuration, verifies those
+controls and identifies configured MCP
+servers to disable before adding only the host's Task servers. Preparation
+refuses when native help cannot establish the required controls or the native
+configuration cannot be interpreted safely, including a configuration profile
+the native reader cannot resolve. Reviews require a Git working
+directory. Implementation tasks retain their launcher's permission posture.
+
+The task's requested model and effort select the root native invocation.
+Native helpers are internal to that session, not additional Logonomic Tasks.
+Read-only review relies on their inherited native read-only policy. A Windows
+Codex 0.160.0 probe of a default child without model or effort overrides verified
+inherited Astra/xhigh, denied repository writes and only the sanctioned MCP
+tool; explicit child selection overrides were not tested.

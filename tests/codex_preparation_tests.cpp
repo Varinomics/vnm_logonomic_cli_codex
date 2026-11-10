@@ -67,6 +67,15 @@ public:
 void require(bool value, const char* detail) { if (!value) throw std::runtime_error(detail); }
 std::string utf8(const fs::path& path) { const auto value = path.u8string(); return {value.begin(), value.end()}; }
 
+void require_root_configuration(const std::vector<std::string>& arguments)
+{
+    const auto exec = std::find(arguments.begin(), arguments.end(), "exec");
+    require(exec != arguments.end() && std::none_of(exec, arguments.end(), [](const auto& argument) {
+        return argument == "--config" || argument.starts_with("--config=") ||
+            (argument.starts_with("-c") && !argument.starts_with("--"));
+    }), "Every native configuration option must precede exec so it cannot replace the root configuration");
+}
+
 // One launch-preparation@3 prepare through the production dispatch.
 void prepare_launch(Context& context, const addon::Prepare_request& request)
 {
@@ -999,6 +1008,7 @@ int main(int argc, char** argv)
             task_process->acknowledgment.server_ids == std::vector<std::string>{"control"} &&
             task_process->acknowledgment.connection_version == addon::k_delegated_connection_version,
             "Delegation must acknowledge the configured relay");
+        require_root_configuration(task_process->process.argv);
         const auto has_overlay = [&](const std::string& suffix) {
             return std::any_of(task_process->process.argv.begin(), task_process->process.argv.end(),
                 [&](const auto& argument) {
@@ -1127,9 +1137,267 @@ int main(int argc, char** argv)
             const auto exec = std::find(result->process.argv.begin(), result->process.argv.end(), "exec");
             const bool explicit_never = arguments.back() == "-anever" || arguments.back() == "--ask-for-approval=never";
             require(exec != result->process.argv.end() &&
-                std::count(exec, result->process.argv.end(), "approval_policy=\"never\"") == (explicit_never ? 1 : 0),
+                std::count(result->process.argv.begin(), exec, "approval_policy=\"never\"") == (explicit_never ? 1 : 0),
                 "Explicit never retains precedence even when native automatic review restores configured policy");
+            require_root_configuration(result->process.argv);
         }
+        // Oracle: task-specific selection replaces only the requested native
+        // fields; the selected saved launcher and account are not rewritten.
+        for (const auto& model_arguments : std::vector<std::vector<std::string>>{
+                {"--model", "gpt-6.1-sol"}, {"--model=gpt-6.1-sol"},
+                {"-m", "gpt-6.1-sol"}, {"-m=gpt-6.1-sol"}})
+        {
+            const auto launcher = with_arguments(prepare, model_arguments);
+            auto request = plain;
+            request.context.launcher      = launcher.launcher;
+            request.context.launcher_argv = launcher.launcher_argv;
+            request.model_selection = addon::Delegated_model_selection{"gpt-6-astra", "xhigh"};
+            const auto original = addon::encode_delegated_prepare_request(request);
+            Context selected;
+            selected.input = {"selection", {"delegated-session", 3}, "prepare", original};
+            codex::handle_preparation(selected);
+            const auto result = addon::decode_delegated_prepare_result(selected.output, &failure);
+            require(selected.succeeded && result && result->model_selection == request.model_selection,
+                "Delegation must acknowledge the exact requested model and reasoning effort");
+            const auto& arguments = result->process.argv;
+            const auto exec = std::find(arguments.begin(), arguments.end(), "exec");
+            require(exec != arguments.end() && std::count(exec, arguments.end(), "--model") == 1 &&
+                std::count(exec, arguments.end(), "gpt-6-astra") == 1 &&
+                std::count(arguments.begin(), arguments.end(), "model_reasoning_effort=\"xhigh\"") == 1,
+                "Requested model and effort must be encoded in native exec arguments");
+            require(std::none_of(arguments.begin(), arguments.end(), [](const auto& argument) {
+                    return argument.find("gpt-6.1-sol") != std::string::npos;
+                }) && result->account_context && task_process->account_context &&
+                addon::encode_account_context(*result->account_context) ==
+                    addon::encode_account_context(*task_process->account_context) &&
+                result->process.environment == plain_process->process.environment &&
+                addon::encode_delegated_prepare_request(request) == original,
+                "Selection must replace the conflicting model argument and preserve its source account and request");
+        }
+        for (const auto& selection : std::vector<addon::Delegated_model_selection>{
+                {"provider/future-model", std::nullopt}, {std::nullopt, "future-native-effort"}})
+        {
+            auto request = plain;
+            request.model_selection = selection;
+            Context selected;
+            selected.input = {"selection", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(selected);
+            const auto result = addon::decode_delegated_prepare_result(selected.output, &failure);
+            require(selected.succeeded && result && result->model_selection == request.model_selection &&
+                std::count(result->process.argv.begin(), result->process.argv.end(), "--model") ==
+                    (selection.model ? 1 : 0) &&
+                std::count(result->process.argv.begin(), result->process.argv.end(),
+                    "model_reasoning_effort=\"future-native-effort\"") == (selection.reasoning_effort ? 1 : 0),
+                "Each optional native selection remains independent and has no frozen allowlist");
+        }
+        auto review = plain;
+        review.purpose = addon::Structured_purpose::READ_ONLY_REVIEW;
+        const auto review_launcher = with_arguments(prepare,
+            {"--yolo", "-sworkspace-write", "--add-dir", utf8(root), "--enable", "apps", "--enable=hooks"});
+        review.context.launcher      = review_launcher.launcher;
+        review.context.launcher_argv = review_launcher.launcher_argv;
+        review.context.launch_environment->effective_environment.set("CODEX_FIXTURE_CONFIGURATION",
+            addon::Json_value(R"({"mcp_servers":{"external-server":{"enabled":true,"token":"private-canary"}}})"));
+        Context reviewed;
+        reviewed.input = {"review", {"delegated-session", 3}, "prepare",
+            addon::encode_delegated_prepare_request(review)};
+        codex::handle_preparation(reviewed);
+        const auto review_result = addon::decode_delegated_prepare_result(reviewed.output, &failure);
+        require(reviewed.succeeded && review_result && !review_result->model_selection,
+            "Read-only review must prepare with the saved account and default model");
+        require_root_configuration(review_result->process.argv);
+        for (const char* argument : {"read-only", "--ignore-rules", "approval_policy=\"never\"",
+                "approvals_reviewer=\"user\"",
+                "mcp_servers.external-server.enabled=false"})
+        {
+            require(std::count(review_result->process.argv.begin(), review_result->process.argv.end(), argument) == 1,
+                "Read-only review must enforce its native command and external-tool ceiling");
+        }
+        require(std::count_if(review_result->process.argv.begin(), review_result->process.argv.end(),
+            [](const auto& argument) {
+                return argument.starts_with("features={") && argument.ends_with('}') &&
+                    argument.find("apps=false") != std::string::npos &&
+                    argument.find("plugins=false") != std::string::npos;
+            }) == 1, "Review feature controls must use one native inline table");
+        // Oracle: codex-cli 0.160.0 drops root controls when exec also receives
+        // -c options. The complete host configuration, including both Task
+        // servers, must precede exec and be the one inspected by config/read.
+        auto complete_review = review;
+#ifdef _WIN32
+        const auto complete_launcher = with_arguments(npm, {"-c", "approval_policy=\"on-request\"", "-anever"});
+#else
+        const auto complete_launcher = with_arguments(prepare, {"-c", "approval_policy=\"on-request\"", "-anever"});
+#endif
+        complete_review.context.launcher      = complete_launcher.launcher;
+        complete_review.context.launcher_argv = complete_launcher.launcher_argv;
+        complete_review.model_selection = addon::Delegated_model_selection{"gpt-6-astra", "xhigh"};
+        auto coordination = server;
+        coordination.server_id = "coordination";
+        coordination.actions   = {"status", "claim", "list", "release", "send", "receive", "notice_status", "fetch_notices"};
+        auto delegation = server;
+        delegation.server_id = "delegation";
+        delegation.actions   = {"targets", "submit", "status", "result", "cancel"};
+        complete_review.control.servers = {coordination, delegation};
+        const auto receipt = root / "delegated-configuration.json";
+        complete_review.context.launch_environment->effective_environment.set(
+            "CODEX_FIXTURE_RECEIPT", addon::Json_value(utf8(receipt)));
+        for (const auto purpose : {addon::Structured_purpose::IMPLEMENTATION, addon::Structured_purpose::READ_ONLY_REVIEW}) {
+            auto request = complete_review;
+            request.purpose = purpose;
+            Context prepared;
+            prepared.input = {"complete-delegation", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(prepared);
+            const auto result = addon::decode_delegated_prepare_result(prepared.output, &failure);
+            require(prepared.succeeded && result && result->process.argv.size() <= addon::limits::k_max_argv_entries &&
+                addon::validate_structured_process_proposal(result->process, &failure) &&
+                result->model_selection == request.model_selection &&
+                result->acknowledgment.server_ids == std::vector<std::string>{"coordination", "delegation"},
+                "The complete host invocation must fit the unchanged process limits");
+            require_root_configuration(result->process.argv);
+            addon::Json_value expected = addon::Json_value::array();
+            for (const auto& argument : result->process.argv) {
+                if (argument == "exec") break;
+                // App-server receives configuration, not the interactive -a flag.
+                if (argument != "-anever") expected.push_back(addon::Json_value(argument));
+            }
+            expected.push_back(addon::Json_value("app-server"));
+            std::ifstream observed(receipt);
+            std::string line;
+            std::getline(observed, line);
+            const auto record = addon::parse_json(line, {}, nullptr);
+            require(record && record->find("argv") && *record->find("argv") == expected &&
+                record->find("CODEX_HOME") && *record->find("CODEX_HOME") == addon::Json_value(utf8(root)),
+                "Final native verification must inspect the complete launch configuration with the selected account");
+        }
+        // Explicitly disabled saved servers need no argv entries. Forty
+        // redundant pairs alone would exceed the unchanged 64-entry cap.
+        auto disabled_inventory = addon::Json_value::object();
+        auto saved_servers = addon::Json_value::object();
+        for (int index = 0; index < 40; ++index) {
+            auto saved = addon::Json_value::object();
+            saved.set("enabled", addon::Json_value(false));
+            saved_servers.set("disabled-" + std::to_string(index), std::move(saved));
+        }
+        auto active_server = addon::Json_value::object();
+        active_server.set("enabled", addon::Json_value(true));
+        saved_servers.set("external-server", std::move(active_server));
+        disabled_inventory.set("mcp_servers", std::move(saved_servers));
+        auto many_disabled = complete_review;
+        many_disabled.context.launch_environment->effective_environment.set(
+            "CODEX_FIXTURE_CONFIGURATION", addon::Json_value(addon::serialize_json(disabled_inventory)));
+        Context compact_inventory;
+        compact_inventory.input = {"disabled-inventory", {"delegated-session", 3}, "prepare",
+            addon::encode_delegated_prepare_request(many_disabled)};
+        codex::handle_preparation(compact_inventory);
+        const auto compact_result = addon::decode_delegated_prepare_result(compact_inventory.output, &failure);
+        require(compact_inventory.succeeded && compact_result &&
+            compact_result->process.argv.size() <= addon::limits::k_max_argv_entries &&
+            addon::validate_structured_process_proposal(compact_result->process, &failure) &&
+            std::none_of(compact_result->process.argv.begin(), compact_result->process.argv.end(), [](const auto& argument) {
+                return argument.starts_with("mcp_servers.disabled-");
+            }) && std::count(compact_result->process.argv.begin(), compact_result->process.argv.end(),
+                "mcp_servers.external-server.enabled=false") == 1,
+            "Already-disabled servers must preserve argv headroom while active saved servers remain disabled");
+        require_root_configuration(compact_result->process.argv);
+        require(std::none_of(review_result->process.argv.begin(), review_result->process.argv.end(),
+            [](const auto& argument) {
+                return argument == "--yolo" || argument == "-sworkspace-write" || argument == "--add-dir";
+            }) && review_result->account_context && task_process->account_context &&
+            addon::encode_account_context(*review_result->account_context) ==
+                addon::encode_account_context(*task_process->account_context) &&
+            addon::serialize_json(reviewed.output).find("private-canary") == std::string::npos,
+            "Read-only review must remove invocation-only write grants without exposing inventory credentials");
+        for (const auto& inventory : {"not-json", R"({"mcp_servers":[]})",
+                R"({"mcp_servers":{"unknown.name":{}}})", R"({"profile":"unsafe-profile"})",
+                R"({"features":{"apps":true}})", R"({"sandbox_mode":"danger-full-access"})",
+                R"({"mcp_servers":{"external-server":{"enabled":true}}})"})
+        {
+            auto request = review;
+            request.context.launch_environment->effective_environment.set(
+                "CODEX_FIXTURE_MANAGED_CONFIGURATION", addon::Json_value(inventory));
+            Context unavailable;
+            unavailable.input = {"review", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(unavailable);
+            require(!unavailable.succeeded && unavailable.output == addon::Json_value("read_only_review_unavailable"),
+                "An unverified native permission ceiling must refuse read-only review");
+        }
+        auto approval_review = plain;
+        approval_review.purpose = addon::Structured_purpose::READ_ONLY_REVIEW;
+        const auto approval_launcher = with_arguments(prepare, {"-sworkspace-write", "-aon-request"});
+        approval_review.context.launcher      = approval_launcher.launcher;
+        approval_review.context.launcher_argv = approval_launcher.launcher_argv;
+        Context constrained_review;
+        constrained_review.input = {"review-approval", {"delegated-session", 3}, "prepare",
+            addon::encode_delegated_prepare_request(approval_review)};
+        codex::handle_preparation(constrained_review);
+        const auto constrained_result = addon::decode_delegated_prepare_result(constrained_review.output, &failure);
+        require(constrained_review.succeeded && constrained_result &&
+            std::count(constrained_result->process.argv.begin(), constrained_result->process.argv.end(),
+                "approval_policy=\"never\"") == 1 &&
+            std::count(constrained_result->process.argv.begin(), constrained_result->process.argv.end(),
+                "-aon-request") == 0,
+            "Read-only review must constrain a saved human-approval launcher to noninteractive never approval");
+        for (const auto purpose : {addon::Structured_purpose::IMPLEMENTATION, addon::Structured_purpose::READ_ONLY_REVIEW})
+        {
+            for (const auto& configuration : {R"({"model_reasoning_effort":"low"})",
+                    R"({"model_reasoning_effort":null})", R"({"profile":"saved-profile"})", "not-json"})
+            {
+                auto request = plain;
+                request.purpose = purpose;
+                request.model_selection = addon::Delegated_model_selection{"gpt-6-astra", "xhigh"};
+                request.context.launch_environment->effective_environment.set(
+                    "CODEX_FIXTURE_MANAGED_CONFIGURATION", addon::Json_value(configuration));
+                Context unavailable;
+                unavailable.input = {"effort", {"delegated-session", 3}, "prepare",
+                    addon::encode_delegated_prepare_request(request)};
+                codex::handle_preparation(unavailable);
+                const bool effort_mismatch = std::string_view(configuration).find("model_reasoning_effort") !=
+                    std::string_view::npos;
+                const char* expected = effort_mismatch ? "reasoning_effort_unavailable" :
+                    purpose == addon::Structured_purpose::READ_ONLY_REVIEW
+                        ? "read_only_review_unavailable" : "model_selection_unavailable";
+                require(!unavailable.succeeded && unavailable.output == addon::Json_value(expected),
+                    "Confirmed effort mismatch must be distinct from an unreadable or unresolved configuration");
+            }
+        }
+        for (const auto& profile_arguments : std::vector<std::vector<std::string>>{
+                {"-p", "review-profile"}, {"--profile=review-profile"}, {"-c", "profile=\"review-profile\""}})
+        {
+            const auto launcher = with_arguments(prepare, profile_arguments);
+            auto request = review;
+            request.context.launcher      = launcher.launcher;
+            request.context.launcher_argv = launcher.launcher_argv;
+            Context unavailable;
+            unavailable.input = {"profile-review", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(unavailable);
+            require(!unavailable.succeeded && unavailable.output == addon::Json_value("read_only_review_unavailable"),
+                "Review cannot drop a profile selector unsupported by the native configuration reader");
+
+            request.purpose = addon::Structured_purpose::IMPLEMENTATION;
+            request.model_selection = addon::Delegated_model_selection{std::nullopt, "xhigh"};
+            Context effort;
+            effort.input = {"profile-effort", {"delegated-session", 3}, "prepare",
+                addon::encode_delegated_prepare_request(request)};
+            codex::handle_preparation(effort);
+            require(!effort.succeeded && effort.output == addon::Json_value("model_selection_unavailable"),
+                "An effort override must not be acknowledged from another profile's configuration");
+        }
+        auto unsupported_review = plain;
+        unsupported_review.purpose = addon::Structured_purpose::READ_ONLY_REVIEW;
+        unsupported_review.context.launch_environment->effective_environment.set(
+            "CODEX_FIXTURE_NO_READ_ONLY", addon::Json_value("1"));
+        Context unavailable_review;
+        unavailable_review.input = {"review", {"delegated-session", 3}, "prepare",
+            addon::encode_delegated_prepare_request(unsupported_review)};
+        codex::handle_preparation(unavailable_review);
+        require(!unavailable_review.succeeded &&
+            unavailable_review.output == addon::Json_value("read_only_review_unavailable"),
+            "A CLI without the required read-only controls cannot advertise successful preparation");
+
         addon::Resume_prepare_request resume;
         resume.context.launcher           = prepare.launcher;
         resume.context.launcher_argv      = prepare.launcher_argv;

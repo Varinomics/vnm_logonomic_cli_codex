@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -33,6 +34,51 @@ constexpr const char* k_session = "019933a1-6e43-7102-a520-b3c8294cc763";
 
 Json object(std::initializer_list<addon::Json_member> values) { return Json(Json::Object(values)); }
 std::string text(const Json& value, const char* name) { const auto* item = value.find(name); return item && item->is_string() ? item->as_string() : std::string{}; }
+
+void set_configuration(Json& configuration, std::string_view key, const Json& value)
+{
+    const auto dot = key.find('.');
+    if (dot == std::string_view::npos) {
+        configuration.set(std::string(key), value);
+        return;
+    }
+    const auto parent = std::string(key.substr(0, dot));
+    if (!configuration.find(parent)) configuration.set(parent, Json::object());
+    set_configuration(*configuration.find(parent), key.substr(dot + 1), value);
+}
+
+void merge_configuration(Json& configuration, const Json& overlay)
+{
+    for (const auto& entry : overlay.as_object()) {
+        auto* selected = configuration.find(entry.name);
+        if (selected && selected->is_object() && entry.value.is_object()) {
+            merge_configuration(*selected, entry.value);
+        }
+        else {
+            configuration.set(entry.name, entry.value);
+        }
+    }
+}
+
+std::optional<Json> boolean_table(std::string_view value)
+{
+    if (!value.starts_with('{') || !value.ends_with('}')) return std::nullopt;
+    value.remove_prefix(1);
+    value.remove_suffix(1);
+    auto result = Json::object();
+    while (!value.empty()) {
+        const auto comma = value.find(',');
+        const auto entry = value.substr(0, comma);
+        const auto equal = entry.find('=');
+        if (equal == std::string_view::npos || equal == 0) return std::nullopt;
+        const auto selected = addon::parse_json(entry.substr(equal + 1), {}, nullptr);
+        if (!selected || !selected->is_boolean()) return std::nullopt;
+        result.set(std::string(entry.substr(0, equal)), *selected);
+        if (comma == std::string_view::npos) break;
+        value.remove_prefix(comma + 1);
+    }
+    return result;
+}
 
 void send_observation(const std::string& endpoint, const std::string& defect)
 {
@@ -136,6 +182,7 @@ int main(int argc, char** argv)
     bool quota_received = false;
     bool initialized = false;
     bool configured_exporter = false;
+    auto configuration = Json::object();
     std::string sqlite_home;
     if (const char* value = std::getenv("CODEX_FIXTURE_SQLITE_HOME")) sqlite_home = value;
     // Model an intrinsic producer defect across the isolated native probe.
@@ -164,7 +211,28 @@ int main(int argc, char** argv)
             // A build without the interactive positional PROMPT omits it from its usage.
             std::cout << (std::getenv("CODEX_FIXTURE_NO_PROMPT") ? "Usage: codex [OPTIONS] <COMMAND> [ARGS]\n"
                 : "Usage: codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]\n");
+            if (!std::getenv("CODEX_FIXTURE_NO_READ_ONLY")) {
+                std::cout << "--sandbox read-only --ignore-rules\n";
+            }
             return 0;
+        }
+        const auto equal = argument.find('=');
+        const auto key = argument.substr(0, equal);
+        if (equal != std::string::npos && (key == "features" || key.starts_with("features.") ||
+            key.starts_with("mcp_servers.") ||
+            key == "windows.sandbox" ||
+            key == "model_reasoning_effort" || key == "sandbox_mode" ||
+            key == "approval_policy" || key == "approvals_reviewer" || key == "notify" || key == "profile"))
+        {
+            const auto value = key == "features" ? boolean_table(argument.substr(equal + 1))
+                : addon::parse_json(argument.substr(equal + 1), {}, nullptr);
+            if (!value) return 31;
+            if (key == "features" && configuration.find("features")) {
+                merge_configuration(*configuration.find("features"), *value);
+            }
+            else {
+                set_configuration(configuration, key, *value);
+            }
         }
         if (argument == "fixture_exporter=true") configured_exporter = true;
         if (argument.starts_with("sqlite_home=")) {
@@ -251,6 +319,17 @@ int main(int argc, char** argv)
         }
         else if (method == "config/read") {
             result = object({{"config", object({{"fixture_observer", Json(defect)}, {"otel", object({{"exporter", Json(configured_exporter ? "existing" : "none")}})}})}});
+            if (const char* selected = std::getenv("CODEX_FIXTURE_CONFIGURATION")) {
+                const auto configured = addon::parse_json(selected, {}, nullptr);
+                if (!configured || !configured->is_object()) return 31;
+                merge_configuration(*result.find("config"), *configured);
+            }
+            merge_configuration(*result.find("config"), configuration);
+            if (const char* selected = std::getenv("CODEX_FIXTURE_MANAGED_CONFIGURATION")) {
+                const auto configured = addon::parse_json(selected, {}, nullptr);
+                if (!configured || !configured->is_object()) return 31;
+                merge_configuration(*result.find("config"), *configured);
+            }
             if (!sqlite_home.empty()) result.find("config")->set("sqlite_home", Json(sqlite_home));
             if (const char* managed = std::getenv("CODEX_FIXTURE_MANAGED_STORE")) result.find("config")->set("sqlite_home", Json(managed));
             if (const char* configured = std::getenv("CODEX_FIXTURE_TUI")) {

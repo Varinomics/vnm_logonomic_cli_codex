@@ -16,6 +16,14 @@ struct Native_launch_preparation
     std::optional<logonomic::cli_addon::Terminal_identity_preparation> terminal_identity;
 };
 
+// Resolves configuration using the selected executable, account and directory.
+// Runtime profile selectors unsupported by app-server remain unavailable.
+std::optional<logonomic::cli_addon::Json_value> read_native_configuration(
+    const Verified_launch& launch,
+    const std::vector<std::pair<std::string, std::string>>& environment,
+    const std::string& working_directory,
+    logonomic::cli_addon::Invocation_context& context);
+
 // Uses one native configuration read to retain title activity and pin the
 // state store for wake and conversation export. Preparation also runs when
 // wake was not requested. An unavailable offer never prevents ordinary launch.

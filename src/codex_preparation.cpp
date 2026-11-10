@@ -18,6 +18,7 @@
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -402,6 +403,198 @@ void prepare_resume(addon::Invocation_context& context)
     context.succeed(addon::encode_resume_prepare_result(result, 2));
 }
 
+constexpr std::string_view k_review_disabled_features[]{
+    "apps", "plugins", "browser_use", "browser_use_external", "in_app_browser", "computer_use",
+    "hooks", "codex_hooks", "plugin_hooks"};
+
+enum class Review_preparation_status
+{
+    READY,
+    UNAVAILABLE,
+    REASONING_EFFORT_UNAVAILABLE,
+};
+
+std::vector<std::string> delegated_arguments(
+    const Verified_launch& launch, bool review, const std::optional<addon::Delegated_model_selection>& selection)
+{
+    std::vector<std::string> arguments(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
+    for (std::size_t index = launch.prefix_size; index < launch.argv.size(); ++index) {
+        const auto& argument  = launch.argv[index];
+        const auto equal      = argument.find('=');
+        const auto name       = argument.substr(0, equal);
+        const bool model      = selection && selection->model && (name == "-m" || name == "--model");
+        const bool permission = review && (name == "-s" || name == "--sandbox" ||
+            name == "-a" || name == "--ask-for-approval" || name == "--add-dir" ||
+            ((argument.starts_with("-s") || argument.starts_with("-a")) && !argument.starts_with("--")));
+        if (model || permission) {
+            if (equal == std::string::npos &&
+                (name == "-m" || name == "--model" || name == "-s" || name == "--sandbox" || name == "--add-dir" ||
+                    name == "-a" || name == "--ask-for-approval"))
+            {
+                ++index;
+            }
+            continue;
+        }
+        if (review && (argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox")) {
+            continue;
+        }
+        if (review && (name == "--enable" || name == "--disable")) {
+            const auto feature = equal == std::string::npos ? launch.argv[index + 1] : argument.substr(equal + 1);
+            if (std::find(std::begin(k_review_disabled_features), std::end(k_review_disabled_features), feature) !=
+                std::end(k_review_disabled_features))
+            {
+                if (equal == std::string::npos) ++index;
+                continue;
+            }
+        }
+        arguments.push_back(argument);
+    }
+    return arguments;
+}
+
+std::optional<addon::Json_value> delegated_configuration(
+    const Verified_launch& launch,
+    const addon::Delegated_prepare_request& request,
+    const std::string& profile_path,
+    const std::vector<std::string>& arguments,
+    addon::Invocation_context& context)
+{
+    auto configured = launch;
+    configured.argv = arguments;
+    auto config = read_native_configuration(configured, launch_environment(
+        request.context.launch_environment->effective_environment, launch, profile_path),
+        request.context.working_directory, context);
+    // Legacy profiles override root settings after config/read's merge. The
+    // native reader also refuses runtime profile selectors it cannot inspect.
+    const auto* profile = config ? config->find("profile") : nullptr;
+    if (profile && !profile->is_null()) {
+        return std::nullopt;
+    }
+    return config;
+}
+
+bool requested_effort_applied(
+    const addon::Json_value& config, const std::optional<addon::Delegated_model_selection>& selection)
+{
+    if (!selection || !selection->reasoning_effort) return true;
+    const auto* effort = config.find("model_reasoning_effort");
+    return effort && *effort == addon::Json_value(*selection->reasoning_effort);
+}
+
+bool review_configuration_applied(const addon::Json_value& config)
+{
+    const auto equals = [&](std::string_view key, const char* value) {
+        const auto* item = config.find(key);
+        return item && *item == addon::Json_value(value);
+    };
+    if (!equals("sandbox_mode", "read-only") || !equals("approval_policy", "never") ||
+        !equals("approvals_reviewer", "user")) return false;
+#ifdef _WIN32
+    const auto* windows = config.find("windows");
+    if (!windows || !windows->find("sandbox") || *windows->find("sandbox") != addon::Json_value("unelevated")) {
+        return false;
+    }
+#endif
+    const auto* features = config.find("features");
+    for (const auto feature : k_review_disabled_features) {
+        const auto* enabled = features ? features->find(feature) : nullptr;
+        if (!enabled || *enabled != addon::Json_value(false)) return false;
+    }
+    const auto* notify = config.find("notify");
+    return notify && notify->is_array() && notify->as_array().empty();
+}
+
+Review_preparation_status review_configuration_status(
+    const std::optional<addon::Json_value>& config, const std::optional<addon::Delegated_model_selection>& selection)
+{
+    if (!config) return Review_preparation_status::UNAVAILABLE;
+    if (!requested_effort_applied(*config, selection)) return Review_preparation_status::REASONING_EFFORT_UNAVAILABLE;
+    return review_configuration_applied(*config)
+        ? Review_preparation_status::READY : Review_preparation_status::UNAVAILABLE;
+}
+
+void fail_review_preparation(addon::Invocation_context& context, Review_preparation_status status)
+{
+    const bool effort_unavailable = status == Review_preparation_status::REASONING_EFFORT_UNAVAILABLE;
+    context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+        context.cancel_requested() ? "cancelled" :
+        effort_unavailable ? "reasoning_effort_unavailable" : "read_only_review_unavailable",
+        effort_unavailable
+            ? "The selected Codex configuration cannot apply the requested reasoning effort exactly."
+            : "The selected Codex configuration cannot establish the requested read-only execution "
+              "with only the task's tools.");
+}
+
+bool review_servers_constrained(const addon::Json_value& config, const std::vector<std::string>& task_servers)
+{
+    const auto* servers = config.find("mcp_servers");
+    if (!servers || !servers->is_object()) return false;
+    for (const auto& name : task_servers) {
+        const auto* server = servers->find(name);
+        if (!server || !server->is_object()) return false;
+    }
+    return std::all_of(servers->as_object().begin(), servers->as_object().end(), [&](const auto& server) {
+        const auto* enabled = server.value.find("enabled");
+        return std::find(task_servers.begin(), task_servers.end(), server.name) != task_servers.end()
+            ? !enabled || *enabled == addon::Json_value(true)
+            : enabled && *enabled == addon::Json_value(false);
+    });
+}
+
+Review_preparation_status prepare_review_arguments(
+    const Verified_launch& launch,
+    const addon::Delegated_prepare_request& request,
+    const std::string& profile_path,
+    std::vector<std::string>& arguments,
+    addon::Invocation_context& context)
+{
+    const auto environment = launch_environment(
+        request.context.launch_environment->effective_environment, launch, profile_path);
+    auto probe = arguments;
+    probe.insert(probe.end(), {"exec", "--help"});
+    const auto help = run_probe(probe, environment, request.context.working_directory, 3000, context);
+    if (!help || help->output.find("--sandbox") == std::string::npos ||
+        help->output.find("read-only") == std::string::npos || help->output.find("--ignore-rules") == std::string::npos)
+    {
+        return Review_preparation_status::UNAVAILABLE;
+    }
+    // External tools do not run inside the command sandbox. Enumerate the
+    // selected native configuration before allowing only this task's servers.
+    std::string features = "features={";
+    for (const auto feature : k_review_disabled_features) {
+        if (features.back() != '{') features += ',';
+        features += std::string(feature) + "=false";
+    }
+    arguments.insert(arguments.end(), {"-c", features + '}'});
+    arguments.insert(arguments.end(), {"-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\"",
+        "-c", "approvals_reviewer=\"user\"", "-c", "notify=[]"});
+#ifdef _WIN32
+    // A read-only policy without a Windows sandbox can run commands without
+    // filesystem enforcement. Restricted tokens need no elevation or setup UI.
+    arguments.insert(arguments.end(), {"-c", "windows.sandbox=\"unelevated\""});
+#endif
+    const auto config = delegated_configuration(launch, request, profile_path, arguments, context);
+    const auto status = review_configuration_status(config, request.model_selection);
+    if (status != Review_preparation_status::READY) return status;
+    const auto* servers = config->find("mcp_servers");
+    if (!servers || servers->is_null()) return Review_preparation_status::READY;
+    if (!servers->is_object()) return Review_preparation_status::UNAVAILABLE;
+    for (const auto& server : servers->as_object()) {
+        if (!server.value.is_object() || server.name.empty() ||
+            !std::all_of(server.name.begin(), server.name.end(), [](unsigned char character) {
+                return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+                    (character >= '0' && character <= '9') || character == '_' || character == '-';
+            }))
+        {
+            return Review_preparation_status::UNAVAILABLE;
+        }
+        const auto* enabled = server.value.find("enabled");
+        if (enabled && *enabled == addon::Json_value(false)) continue;
+        arguments.insert(arguments.end(), {"-c", "mcp_servers." + server.name + ".enabled=false"});
+    }
+    return Review_preparation_status::READY;
+}
+
 void prepare_delegated(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -416,12 +609,9 @@ void prepare_delegated(addon::Invocation_context& context)
     }
     const auto profile = selected_profile(request->context, context);
     if (!profile) return;
-    if (request->purpose != addon::Structured_purpose::IMPLEMENTATION) {
-        context.fail(addon::Result_status::UNAVAILABLE, "purpose_unavailable");
-        return;
-    }
+    const bool review = request->purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
     if (request->prompt.empty() || !addon::path_from_utf8(request->context.working_directory).is_absolute()) {
-        context.fail(addon::Result_status::FAILED, "invalid_implementation_request");
+        context.fail(addon::Result_status::FAILED, review ? "invalid_review_request" : "invalid_implementation_request");
         return;
     }
     const auto literal = request->context.launcher.runner_key == addon::k_runner_direct
@@ -431,7 +621,7 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
         return;
     }
-    if (!approval.empty() && approval != "never") {
+    if (!review && !approval.empty() && approval != "never") {
         context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
         return;
     }
@@ -444,40 +634,52 @@ void prepare_delegated(addon::Invocation_context& context)
     }
     // `codex exec` refuses a directory outside a Git repository unless the
     // launcher's --yolo lifts its sandbox; its own message reaches only stderr.
-    if (std::none_of(launch->argv.begin() + static_cast<std::ptrdiff_t>(launch->prefix_size), launch->argv.end(),
+    if ((review || std::none_of(
+            launch->argv.begin() + static_cast<std::ptrdiff_t>(launch->prefix_size), launch->argv.end(),
             [](const auto& argument) {
                 return argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox";
-            }) &&
+            })) &&
         !inside_git_repository(addon::path_from_utf8(request->context.working_directory)))
     {
         context.fail(addon::Result_status::UNAVAILABLE, "untrusted_working_directory",
+            review ? "Codex read-only review requires a Git working directory." :
             "Codex runs a non-interactive task only inside a Git repository. Delegate the task into a Git "
             "working directory; a launcher that passes --yolo also lifts this check, and with it Codex's "
             "sandbox and approvals.");
         return;
     }
     addon::Delegated_prepare_result result;
-    result.profile_storage = request->context.profile_storage;
-    result.account_context = request->context.account_context;
+    result.profile_storage  = request->context.profile_storage;
+    result.account_context  = request->context.account_context;
+    result.model_selection  = request->model_selection;
 #ifdef _WIN32
     result.process.executable = "helpers/codex_launch_bridge.exe";
 #else
     result.process.executable = "helpers/codex_launch_bridge";
 #endif
-    // Keep the launcher's options verbatim. Native exec cannot ask for human
-    // approval; an explicit policy requiring it was refused above.
-    // The package's only grant is approval of its own Task tools below.
-    result.process.argv = launch->argv;
-    result.process.argv.insert(result.process.argv.end(), {"exec", "--json", "--ephemeral"});
-    if (approval == "never") {
+    result.process.argv = delegated_arguments(*launch, review, request->model_selection);
+    if (request->model_selection && request->model_selection->reasoning_effort) {
+        result.process.argv.insert(result.process.argv.end(),
+            {"-c", "model_reasoning_effort=" + toml_string(*request->model_selection->reasoning_effort)});
+    }
+    if (review) {
+        const auto status = prepare_review_arguments(*launch, *request, profile->profile_path, result.process.argv, context);
+        if (status != Review_preparation_status::READY) {
+            fail_review_preparation(context, status);
+            return;
+        }
+    }
+    if (approval == "never" && !review) {
         // Exec does not inherit the TUI's -a flag. Its default is never, but
         // automatic review can restore a configured policy. Preserve the
         // explicit flag's precedence over that configuration as well.
         result.process.argv.insert(result.process.argv.end(), {"-c", "approval_policy=\"never\""});
     }
+    std::vector<std::string> task_servers;
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();
-        const std::string key = "mcp_servers.logonomic_" + nonce + ".";
+        task_servers.push_back("logonomic_" + nonce);
+        const std::string key = "mcp_servers." + task_servers.back() + ".";
         const auto& connection = *request->control.connection;
         const std::vector<std::string> arguments{
             "--descriptor", connection.descriptor_path, "--server", server.server_id};
@@ -491,6 +693,36 @@ void prepare_delegated(addon::Invocation_context& context)
         overlay("required=true");
         overlay("enabled_tools=" + toml_array(server.actions));
         overlay("default_tools_approval_mode=\"approve\"");
+    }
+    // Native exec can replace root -c options with its own -c list. Keep every
+    // overlay at the root, and verify the complete configuration we will run.
+    if (review || (request->model_selection && request->model_selection->reasoning_effort)) {
+        const auto config = delegated_configuration(*launch, *request, profile->profile_path, result.process.argv, context);
+        if (review) {
+            auto status = review_configuration_status(config, request->model_selection);
+            if (status == Review_preparation_status::READY && !review_servers_constrained(*config, task_servers)) {
+                status = Review_preparation_status::UNAVAILABLE;
+            }
+            if (status != Review_preparation_status::READY) {
+                fail_review_preparation(context, status);
+                return;
+            }
+        }
+        else
+        if (!config || !requested_effort_applied(*config, request->model_selection)) {
+            context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+                context.cancel_requested() ? "cancelled" :
+                config ? "reasoning_effort_unavailable" : "model_selection_unavailable",
+                "The selected Codex configuration cannot apply the requested reasoning effort exactly.");
+            return;
+        }
+    }
+    result.process.argv.insert(result.process.argv.end(), {"exec", "--json", "--ephemeral"});
+    if (review) {
+        result.process.argv.insert(result.process.argv.end(), {"--sandbox", "read-only", "--ignore-rules"});
+    }
+    if (request->model_selection && request->model_selection->model) {
+        result.process.argv.insert(result.process.argv.end(), {"--model", *request->model_selection->model});
     }
     result.acknowledgment.connection_version = addon::k_delegated_connection_version;
     result.process.argv.push_back("-");
