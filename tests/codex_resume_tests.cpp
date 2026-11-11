@@ -4,6 +4,7 @@
 #include "codex_lifecycle.h"
 #include "codex_preparation.h"
 #include "codex_resume_record.h"
+#include "codex_session_wake.h"
 
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/ids.h>
@@ -179,17 +180,26 @@ void native_activation_facts(const fs::path& fixture)
 addon::Resume_inspect_request inspection_request(const fs::path& fixture)
 {
     const auto profile = addon::path_to_utf8(fixture / "profile");
-    // Native preparation publishes its verified state store with generic separators.
+    // Native preparation publishes its verified profile and store with generic
+    // separators; account discovery retains the Windows-native profile spelling.
+    const auto prepared_profile = (fixture / "profile").generic_u8string();
     const auto store = (fixture / "store").generic_u8string();
     addon::Resume_inspect_request request;
     request.context.launcher = {"codex", addon::k_runner_direct, {}};
     request.context.launcher_argv = {"codex"};
     request.context.working_directory = addon::path_to_utf8(fixture);
-    request.context.account_context = addon::Account_context{2, codex::profile_account_key(profile), profile};
     request.context.launch_environment = addon::Launch_environment{
         addon::host_platform_id(), Json::object(), std::nullopt};
+    request.context.launch_environment->effective_environment.set("CODEX_HOME", Json(profile));
+    std::string error;
+    const auto selected = codex::profile_selection(*request.context.launch_environment,
+        request.context.launcher, {}, request.context.working_directory, &error);
+    check(selected.has_value(), "production account selection: " + error);
+    request.context.account_context = addon::Account_context{
+        2, selected->adapter_account_key, selected->profile_path};
     request.context.launch_environment->effective_environment.set("CODEX_HOME", Json("/unrelated/current-profile"));
-    request.resume_record = *codex::bound_resume_record(k_session_a, profile,
+    request.resume_record = *codex::bound_resume_record(k_session_a,
+        std::string(prepared_profile.begin(), prepared_profile.end()),
         std::string(store.begin(), store.end()));
     return request;
 }
@@ -264,6 +274,9 @@ void native_history(const fs::path& fixture)
     expect(Availability::UNKNOWN, Content::UNKNOWN);
     request.resume_record = saved;
     request.context.account_context->profile_path = addon::path_to_utf8(fixture / "another-profile");
+    expect(Availability::UNKNOWN, Content::UNKNOWN);
+    request = inspection_request(fixture);
+    request.context.account_context->profile_path = addon::path_to_utf8(fixture / "PROFILE");
     expect(Availability::UNKNOWN, Content::UNKNOWN);
     request = inspection_request(fixture);
 #ifndef _WIN32
@@ -345,6 +358,21 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
     request.context.launch_environment->effective_environment.set("CODEX_FIXTURE_SQLITE_HOME",
         Json(addon::path_to_utf8(fixture / "changed-default-store")));
     request.resume_record = inspection.resume_record;
+    auto original_environment = request.context.launch_environment->effective_environment;
+    original_environment.set("CODEX_HOME", Json(*request.context.account_context->profile_path));
+    original_environment.set("CODEX_FIXTURE_SQLITE_HOME", Json(addon::path_to_utf8(fixture / "store")));
+    original_environment.set("CODEX_FIXTURE_VERSION", Json("0.167.1"));
+    Preparation_context preparation;
+    auto launch = codex::verified_launch(request.context.launcher, request.context.launcher_argv,
+        original_environment, request.context.working_directory, false, preparation);
+    check(launch.has_value(), "verify native preparation fixture");
+    const auto native = codex::prepare_native_launch(*launch, addon::environment_pairs(original_environment),
+        request.context.working_directory, preparation, true);
+    check(native.terminal_identity.has_value(), "production preparation captures native scope");
+    request.resume_record.set("native_store", *native.terminal_identity->context.find("native_store"));
+    check(codex::inspect_resume({request.context, request.resume_record}, {}).availability ==
+        addon::Resume_availability::AVAILABLE,
+        "production account spelling inspects the actual prepared native-store record");
     request.startup_observer = addon::Startup_observer_offer{1, "http-json-post", "http://127.0.0.1:32871/events",
         "Bearer " + std::string(64, 'd'), "prepared-identity"};
     Preparation_context context;
@@ -429,13 +457,15 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
         !fs::exists(fixture / "profile/archived_sessions/replacement.jsonl") &&
         codex::inspect_resume(inspection, {}).availability == addon::Resume_availability::UNKNOWN,
         "unknown inspection remains recoverable only by the exact native entry point and startup observer");
-    request.resume_record.find("native_store")->set("codex_home", Json(addon::path_to_utf8(fixture / "other-profile")));
-    Preparation_context mismatch;
-    mismatch.input = {"wrong-scope", {"interactive-resume", 2}, "prepare_resume",
-        addon::encode_resume_prepare_request(request, 2), 15000};
-    codex::handle_preparation(mismatch);
-    check(!mismatch.succeeded && mismatch.output == Json("resume_scope_unavailable"),
-        "unknown content does not relax an invalid profile/store scope");
+    for (const auto& profile : {fixture / "other-profile", fixture / "PROFILE"}) {
+        request.resume_record.find("native_store")->set("codex_home", Json(addon::path_to_utf8(profile)));
+        Preparation_context mismatch;
+        mismatch.input = {"wrong-scope", {"interactive-resume", 2}, "prepare_resume",
+            addon::encode_resume_prepare_request(request, 2), 15000};
+        codex::handle_preparation(mismatch);
+        check(!mismatch.succeeded && mismatch.output == Json("resume_scope_unavailable"),
+            "unknown content does not relax a different or case-distinct profile scope");
+    }
 }
 
 } // namespace
