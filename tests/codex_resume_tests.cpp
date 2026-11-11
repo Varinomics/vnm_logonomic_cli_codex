@@ -479,10 +479,28 @@ int main(int argc, char** argv)
     const auto fixture = fs::canonical(fs::temp_directory_path()) / ("codex-resume-" + addon::random_nonce_hex());
     try {
         fs::create_directories(fixture);
-        native_activation_facts(fixture);
-        native_history(fixture);
-        packaged_inspection(addon::path_from_utf8(argv[1]), fixture);
-        bound_preparation(fixture, addon::path_from_utf8(argv[2]), addon::path_from_utf8(argv[1]));
+        std::vector<fs::path> scopes{fixture / "drive"};
+#ifdef _WIN32
+        const auto spelling = fixture.native();
+        if (fixture.root_name().native().size() == 2 && spelling[1] == L':') {
+            const auto share = L"\\\\localhost\\" + spelling.substr(0, 1) + L"$" + spelling.substr(2);
+            std::error_code error;
+            if (fs::equivalent(fixture, fs::path(share), error) && !error) {
+                scopes.push_back(fs::path(share) / "unc");
+            }
+            else {
+                std::cout << "SKIP UNC integration: local administrative share is unavailable\n";
+            }
+        }
+#endif
+        for (const auto& scope : scopes) {
+            fs::create_directories(scope);
+            std::cout << "Profile scope: " << addon::path_to_utf8(scope) << std::endl;
+            native_activation_facts(scope);
+            native_history(scope);
+            packaged_inspection(addon::path_from_utf8(argv[1]), scope);
+            bound_preparation(scope, addon::path_from_utf8(argv[2]), addon::path_from_utf8(argv[1]));
+        }
         fs::remove_all(fixture);
         return 0;
     }

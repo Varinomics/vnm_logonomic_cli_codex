@@ -296,7 +296,9 @@ void prepare_resume(addon::Invocation_context& context)
         return;
     }
     if (!record->sqlite_home.empty()) {
-        if (addon::path_from_utf8(record->codex_home) != addon::path_from_utf8(profile->profile_path)) {
+        if (addon::path_from_utf8(record->codex_home).generic_u8string() !=
+            addon::path_from_utf8(profile->profile_path).generic_u8string())
+        {
             context.fail(addon::Result_status::UNAVAILABLE, "resume_scope_unavailable");
             return;
         }

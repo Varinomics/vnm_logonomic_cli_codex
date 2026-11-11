@@ -514,7 +514,8 @@ addon::Resume_inspect_result inspect_resume(
     // An old ID-only record does not identify the original store. Inspection is
     // reconstructed later and cannot recover a preparer's environment patch.
     if (!record || record->sqlite_home.empty() || !account || !account->profile_path ||
-        addon::path_from_utf8(*account->profile_path) != addon::path_from_utf8(record->codex_home) ||
+        addon::path_from_utf8(*account->profile_path).generic_u8string() !=
+            addon::path_from_utf8(record->codex_home).generic_u8string() ||
         account->adapter_account_key != profile_account_key(record->codex_home) ||
         (cancelled && cancelled()))
     {
