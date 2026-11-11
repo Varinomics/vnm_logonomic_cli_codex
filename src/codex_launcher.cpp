@@ -237,7 +237,7 @@ bool separate_option_value(std::string_view argument)
     return !argument.empty() && (argument == "-" || argument.front() != '-');
 }
 
-std::optional<Launcher_command> recognize(std::string_view script, int depth)
+std::optional<Launcher_command> recognize(std::string_view script, std::string_view runner, int depth)
 {
     if (depth == 0) return std::nullopt;
     Environment inherited;
@@ -246,7 +246,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
         line = addon::trim(line, Launcher_whitespace::ASCII);
         if (line.empty() || line.starts_with('#') || line.starts_with("//") ||
             lower(line).starts_with("rem ")) continue;
-        for (std::string segment : addon::launcher_segments(line, Launcher_whitespace::ASCII)) {
+        for (std::string segment : addon::launcher_segments(line, runner, Launcher_whitespace::ASCII)) {
             const std::string normalized = lower(segment);
             std::optional<std::pair<std::string, std::string>> standalone;
             if (normalized.starts_with("set ")) standalone = addon::environment_assignment(
@@ -268,7 +268,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                 environment.emplace_back(match[1].str(), addon::unquote(match[2].str(), Launcher_whitespace::ASCII));
                 segment.erase(0, match.length());
             }
-            const auto words = addon::launcher_tokens(segment);
+            const auto words = addon::launcher_tokens(segment, runner);
             std::size_t index = 0;
             while (index < words.size()) {
                 const auto value = addon::environment_assignment(words[index], Launcher_whitespace::ASCII);
@@ -309,7 +309,8 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                         if (!tail.empty()) tail += ' ';
                         tail += words[index];
                     }
-                    auto command = recognize(addon::unquote(tail, Launcher_whitespace::ASCII), depth - 1);
+                    auto command = recognize(addon::unquote(tail, Launcher_whitespace::ASCII),
+                        base == "cmd" ? "cmd" : base == "bash" || base == "sh" ? "bash" : "powershell", depth - 1);
                     if (command) {
                         command->environment.insert(command->environment.begin(), environment.begin(), environment.end());
                         return command;
@@ -324,9 +325,9 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
 
 } // namespace
 
-std::optional<Launcher_command> recognize_launcher(std::string_view script)
+std::optional<Launcher_command> recognize_launcher(std::string_view script, std::string_view runner)
 {
-    return recognize(script, 8);
+    return recognize(script, runner, 8);
 }
 
 std::optional<std::string> codex_profile_environment_text(std::string_view profile_path)
@@ -686,7 +687,7 @@ std::optional<Verified_launch> verified_launch(
     const addon::Json_value& effective_environment, std::string_view working_directory,
     bool delegated, addon::Invocation_context& context)
 {
-    const auto recognized = recognize_launcher(launcher.script_body);
+    const auto recognized = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!recognized || !recognized->prefix_arguments.empty() || launcher_argv.empty()) {
         return std::nullopt;
     }

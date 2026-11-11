@@ -52,7 +52,7 @@ std::optional<std::vector<std::string>> resolve_probe_launcher(
     std::string_view working_directory,
     bool direct_batch);
 
-std::optional<Launcher_command> recognize_launcher(std::string_view script);
+std::optional<Launcher_command> recognize_launcher(std::string_view script, std::string_view runner);
 std::optional<std::string> codex_profile_environment_text(std::string_view profile_path);
 std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
     const logonomic::cli_addon::Discover_request& request);

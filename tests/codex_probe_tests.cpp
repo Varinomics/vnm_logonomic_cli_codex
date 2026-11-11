@@ -1024,11 +1024,15 @@ void launcher_discovery_returns_authenticated_codex_profiles(
     check(addon::encode_candidates(codex::discover_launchers(pet_request)) == expected_pet_json,
         "Codex pet alone discovers the same Codex profiles");
     for (const auto* script : {"codex", "codex-pet", "codex-pet --model custom", "codex-pet.exe --yolo"}) {
-        const auto recognized = codex::recognize_launcher(script);
+        const auto recognized = codex::recognize_launcher(script, "bash");
         check(recognized && std::string_view(script).starts_with(recognized->program),
             "Explicit launcher recognition preserves the selected Codex program");
     }
-    const auto explicit_codex = codex::recognize_launcher("codex");
+    check(codex::recognize_launcher(R"cmd($env:CODEX_HOME="D:\profiles\work\"; codex)cmd",
+        "powershell").has_value(), "PowerShell quoted trailing profile path retains Codex recognition");
+    check(codex::recognize_launcher(R"cmd(codex --cd D:\src\)cmd", "cmd").has_value(),
+        "cmd trailing argument path retains Codex recognition");
+    const auto explicit_codex = codex::recognize_launcher("codex", "bash");
     auto both_environment = request.ambient_environment;
     both_environment.set("PATH", addon::Json_value(both_paths));
     const auto explicit_probe = codex::resolve_probe_launcher(
@@ -1481,7 +1485,7 @@ void quota_batch_dispatch_matches_powershell(
         for (const std::vector<std::string>& prefix : {
                 std::vector<std::string>{},
                 std::vector<std::string>{"--prefix", "space value", "trailing slash\\", "%CODEX_BATCH_EXPANSION%", "caret^value", "bang!value", ""},
-                codex::recognize_launcher("npx '@openai/codex@file:C:\\local\u00a0package'")->prefix_arguments})
+                codex::recognize_launcher("npx '@openai/codex@file:C:\\local\u00a0package'", "bash")->prefix_arguments})
         {
             codex::Launcher_command selected{addon::path_to_utf8(wrapper), prefix, {}};
             std::string baseline;

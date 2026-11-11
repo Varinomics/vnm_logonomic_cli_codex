@@ -45,7 +45,7 @@ void discovery(addon::Invocation_context& context)
             return;
         }
         addon::Launcher_recognition recognition;
-        recognition.recognized = codex::recognize_launcher(request->launcher.script_body).has_value();
+        recognition.recognized = codex::recognize_launcher(request->launcher.script_body, request->launcher.runner_key).has_value();
         if (recognition.recognized) recognition.display_name = "Codex";
         context.succeed(addon::encode_recognition(recognition));
     }

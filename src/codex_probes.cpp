@@ -243,7 +243,7 @@ void handle_probes(addon::Invocation_context& context)
         }
         const auto selected = selected_profile(request->context, context);
         if (!selected) return;
-        const auto command = recognize_launcher(request->context.launcher.script_body);
+        const auto command = recognize_launcher(request->context.launcher.script_body, request->context.launcher.runner_key);
         if (!command) { context.fail(addon::Result_status::UNAVAILABLE, "launcher_unrecognized"); return; }
         const auto& environment = *request->context.launch_environment;
         const bool current_account = !quota && request->observe_current_account;

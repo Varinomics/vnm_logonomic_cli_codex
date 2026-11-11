@@ -101,7 +101,7 @@ std::optional<Profile_selection> profile_selection(const addon::Launch_environme
     const addon::Launcher_request& launcher, std::string_view fallback,
     std::string_view normalization_directory, std::string* error)
 {
-    const auto command = recognize_launcher(launcher.script_body);
+    const auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!command) { *error = "launcher_unrecognized"; return std::nullopt; }
     return profile_from_environment(environment, fallback, normalization_directory, error);
 }
