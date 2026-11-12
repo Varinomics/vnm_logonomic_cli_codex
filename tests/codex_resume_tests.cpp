@@ -412,6 +412,9 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
     // that record with the same preparation offers the desktop sends on resume.
     for (const int offers : {1, 2, 3}) {
         auto offered = request;
+        // The host sends its allocated profile storage inside the request, so
+        // the directory acknowledgment names a request that includes it.
+        offered.context.profile_storage = invocation.profile_storage;
         const auto alternate = fixture / "non-git directory" / "nested";
         fs::create_directories(alternate);
         offered.context.working_directory = addon::path_to_utf8(alternate);
