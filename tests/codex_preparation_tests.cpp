@@ -1478,6 +1478,55 @@ int main(int argc, char** argv)
             std::count(identified->process.argv.begin(), identified->process.argv.end(),
                 R"(tui.terminal_title=["spinner","session-id","thread-name","thread"])") == 1,
             "Exact resume must prepare immediate identity without replacing its native UUID or display settings");
+        require(!identified->resume_directory,
+            "A host that did not negotiate directory selection keeps the original closed result shape");
+        const auto selected_directory = root / "non-git directory" / "nested";
+        fs::create_directories(selected_directory);
+        for (const auto& saved_directory : std::vector<std::vector<std::string>>{
+                {"-C", "/saved-directory"}, {"--cd", "/saved-directory"},
+                {"--cd=/saved-directory"}, {"-C=/saved-directory"}, {"-C/saved-directory"}})
+        {
+            const auto saved = with_arguments(prepare, saved_directory);
+            auto request = resume;
+            request.context.launcher = saved.launcher;
+            request.context.launcher_argv = saved.launcher_argv;
+            request.context.working_directory = utf8(selected_directory);
+            request.resume_directory = addon::Resume_directory_selection{addon::Resume_directory_source::EXPLICIT};
+            const auto original = addon::encode_resume_prepare_request(request);
+            Context selected;
+            selected.input = {"directory-selection", {"interactive-resume", 2}, "prepare_resume", original, 15000};
+            codex::handle_preparation(selected);
+            const auto result = addon::decode_resume_prepare_result(selected.output, &failure, 2);
+            require(selected.succeeded && result &&
+                addon::validate_resume_directory_acknowledgment(request, *result, &failure) &&
+                result->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763" &&
+                result->process.argv[result->process.argv.size() - 2] == utf8(selected_directory) &&
+                result->process.argv[result->process.argv.size() - 3] == "-C" &&
+                std::count(result->process.argv.begin(), result->process.argv.end(), "-C") == 1,
+                "Exact resume must acknowledge and select the nested non-Git directory after replacing saved Codex options");
+            require(std::none_of(result->process.argv.begin(), result->process.argv.end(), [](const auto& argument) {
+                    return argument.find("/saved-directory") != std::string::npos;
+                }) && result->patch.account_context && proposal->patch.account_context &&
+                addon::encode_account_context(*result->patch.account_context) ==
+                    addon::encode_account_context(*proposal->patch.account_context) &&
+                addon::encode_resume_prepare_request(request) == original,
+                "A directory override preserves original account, exact conversation and immutable source recipe");
+        }
+        for (const auto& invalid_directory : std::vector<std::vector<std::string>>{
+                {"-C"}, {"--cd="}, {"-C="}, {"-C", "/one", "--cd", "/two"}})
+        {
+            const auto saved = with_arguments(prepare, invalid_directory);
+            auto request = resume;
+            request.context.launcher = saved.launcher;
+            request.context.launcher_argv = saved.launcher_argv;
+            request.resume_directory = addon::Resume_directory_selection{addon::Resume_directory_source::LAST_CONFIRMED};
+            Context invalid;
+            invalid.input = {"invalid-directory-option", {"interactive-resume", 2}, "prepare_resume",
+                addon::encode_resume_prepare_request(request), 15000};
+            codex::handle_preparation(invalid);
+            require(!invalid.succeeded && invalid.output == addon::Json_value("resume_launcher_unsupported"),
+                "Malformed or ambiguous saved directory options must be refused before native preparation");
+        }
         for (const auto& arguments : k_permission_arguments) {
             const auto permission = with_arguments(prepare, arguments);
             auto request = resume;

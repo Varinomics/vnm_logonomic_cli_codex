@@ -46,6 +46,44 @@ activation identity at its native source. Host-initiated resume continues to pas
 `resume -C <host-selected-directory> <exact-id>`; this argument alone is not
 confirmation that Codex accepted that directory.
 
+### Host-selected exact Resume directory
+
+The optional `resume-directory@1` declaration lets an updated host bind its
+selected local cwd and selection source to inspection and preparation. The
+provider acknowledges the canonical complete preparation request as well as the
+original opaque resume record. Its native recipe remains
+`resume -C <selected-directory> <exact-id>` in the same `CODEX_HOME` and saved
+native store. A nested directory or a non-Git directory remains exact; no root,
+last-session or fork fallback is substituted.
+
+For a negotiated selection, preparation removes one saved Codex `-C`/`--cd`
+option before probing and preparing the launch, then supplies the selected
+directory on the native resume subcommand. Separate, `=` and compact `-C` forms
+are supported. Empty or duplicate saved directory options are refused. Model,
+permission, account, native-store and unrelated configuration remain intact.
+The original request is unchanged and its complete digest includes the saved
+launcher and selected directory. Older hosts receive the existing request/result
+shape, with no unsolicited directory acknowledgment.
+
+`SessionStart` remains the authoritative default-cwd source described above.
+Preparation and a ready process do not fabricate a confirmed cwd. An updated
+host waits for that activation's native observation; if it is missing or
+different, the host reports the unmet request while retaining the actual live
+conversation. The known delayed-hook boundary below still applies.
+
+Coordinated adoption requires the Logonomic SDK/host change before this provider
+source can compile against `resume-directory@1`. A new host with an older package
+refuses unsupported relocation; a new package with an older host uses the legacy
+shape. This adoption does not complete Codex's wider native selection/ownership
+work tracked in [#16](https://github.com/Varinomics/vnm_logonomic_cli_codex/issues/16)
+or the [host continuity tracker](https://github.com/Varinomics/logonomic/issues/257).
+
+Native qualification records the exact CLI and package revisions and verifies
+that a command with no per-command directory override runs in the reported
+default directory after Resume. Provider preparation fixtures exercise option
+selection and acknowledgment; they do not establish native command cwd. This
+requirement applies to Linux, Windows and macOS qualification.
+
 These are reporting hooks, with a specific native observation boundary. Source
 review at Codex `748ab55ca7de0b647d9a7a9d9a8e70e00f28666d` still shows
 [`SessionStart` dispatch during turn processing](https://github.com/openai/codex/blob/748ab55ca7de0b647d9a7a9d9a8e70e00f28666d/codex-rs/core/src/session/turn.rs)

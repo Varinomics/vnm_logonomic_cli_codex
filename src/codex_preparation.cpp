@@ -275,6 +275,45 @@ void prepare_interactive(addon::Invocation_context& context)
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
+std::optional<std::vector<std::string>> resume_arguments(
+    const std::vector<std::string>& arguments, bool selected_directory)
+{
+    if (!selected_directory) {
+        return supported_session_arguments(arguments, true)
+            ? std::optional(arguments) : std::nullopt;
+    }
+    // Codex owns this option grammar. Remove one saved directory option before
+    // inserting the selected directory on the exact native resume subcommand;
+    // neither native configuration nor a duplicate clap option can undo it.
+    std::vector<std::string> result;
+    bool directory_seen = false;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        const auto& argument = arguments[index];
+        const bool separate = argument == "-C" || argument == "--cd";
+        const bool attached = argument.starts_with("--cd=") ||
+            (argument.starts_with("-C") && argument.size() > 2);
+        if (index != 0 && (separate || attached)) {
+            if (std::exchange(directory_seen, true)) {
+                return std::nullopt;
+            }
+            if (separate) {
+                if (++index == arguments.size() || arguments[index].empty() || arguments[index].front() == '-') {
+                    return std::nullopt;
+                }
+            }
+            else {
+                const std::size_t offset = argument.starts_with("--cd=") ? 5 : argument.starts_with("-C=") ? 3 : 2;
+                if (argument.size() == offset) {
+                    return std::nullopt;
+                }
+            }
+            continue;
+        }
+        result.push_back(argument);
+    }
+    return supported_session_arguments(result, true) ? std::optional(std::move(result)) : std::nullopt;
+}
+
 void prepare_resume(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -305,6 +344,7 @@ void prepare_resume(addon::Invocation_context& context)
         // Inspection's digest accepts only read-only context. Keep preparation
         // offers on the original request for the resumed process to acknowledge.
         addon::Resume_inspect_request inspection_request{request->context, request->resume_record};
+        inspection_request.resume_directory = request->resume_directory;
         inspection_request.context.declared_assets.clear();
         inspection_request.context.codex_invocation.reset();
         inspection_request.context.session_wake.reset();
@@ -322,7 +362,8 @@ void prepare_resume(addon::Invocation_context& context)
     }
     const auto literal = request->context.launcher.runner_key == addon::k_runner_direct
         ? request->context.launcher_argv : addon::literal_argv(request->context.launcher.script_body);
-    if (!supported_session_arguments(literal, true)) {
+    const auto arguments = resume_arguments(literal, request->resume_directory.has_value());
+    if (!arguments) {
         context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unsupported");
         return;
     }
@@ -333,6 +374,8 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
         return;
     }
+    launch->argv.erase(launch->argv.begin() + launch->prefix_size, launch->argv.end());
+    launch->argv.insert(launch->argv.end(), arguments->begin() + 1, arguments->end());
     if (!record->sqlite_home.empty()) {
         // Resume the saved native scope even if the launcher's current defaults changed.
         launch->argv.insert(launch->argv.end(), {"-c", "sqlite_home=" + toml_string(record->sqlite_home)});
@@ -402,6 +445,10 @@ void prepare_resume(addon::Invocation_context& context)
     }
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(request->resume_record);
     result.startup_observer = request->startup_observer;
+    if (request->resume_directory) {
+        result.resume_directory = addon::Resume_directory_acknowledgment{
+            addon::resume_prepare_request_digest_hex(*request)};
+    }
     context.succeed(addon::encode_resume_prepare_result(result, 2));
 }
 

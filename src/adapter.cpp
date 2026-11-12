@@ -173,6 +173,7 @@ int main()
         {"interactive-resume", 2}, {"interactive-resume", 3}, {"interactive-resume", 4},
         {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_execution_context_capability_id, addon::k_execution_context_version},
+        {addon::k_resume_directory_capability_id, addon::k_resume_directory_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {addon::k_async_question_attention_capability_id, addon::k_async_question_attention_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
