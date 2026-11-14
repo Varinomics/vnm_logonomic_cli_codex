@@ -1482,6 +1482,33 @@ int main(int argc, char** argv)
             "A host that did not negotiate directory selection keeps the original closed result shape");
         const auto selected_directory = root / "non-git directory" / "nested";
         fs::create_directories(selected_directory);
+        auto separated_directory = utf8(selected_directory / ".." / "." / "nested") + "//";
+#ifdef _WIN32
+        std::replace(separated_directory.begin(), separated_directory.end(), '\\', '/');
+#endif
+        for (const bool negotiated_directory : {false, true}) {
+            auto request = resume;
+            request.context.working_directory = separated_directory;
+            if (negotiated_directory) {
+                request.resume_directory = addon::Resume_directory_selection{addon::Resume_directory_source::LAST_CONFIRMED};
+            }
+            const auto original = addon::encode_resume_prepare_request(request);
+            Context normalized;
+            normalized.input = {"directory-spelling", {"interactive-resume", 2}, "prepare_resume", original, 15000};
+            codex::handle_preparation(normalized);
+            const auto result = addon::decode_resume_prepare_result(normalized.output, &failure, 2);
+            require(normalized.succeeded && result &&
+                result->process.argv[result->process.argv.size() - 2] == utf8(selected_directory) &&
+                result->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763" &&
+                addon::validate_resume_acknowledgment(request.resume_record, result->acknowledgment, &failure) &&
+                addon::validate_resume_directory_acknowledgment(request, *result, &failure),
+                "Equivalent directory spelling selects the exact normalized workspace and acknowledges the original request");
+            const auto* wake_directory = result->patch.session_wake
+                ? result->patch.session_wake->binding.find("cwd") : nullptr;
+            require(result->patch.session_wake && result->patch.session_wake->available && wake_directory &&
+                *wake_directory == addon::Json_value(utf8(selected_directory)),
+                "Resume wake binding retains the normalized directory used by the launched session");
+        }
         for (const auto& saved_directory : std::vector<std::vector<std::string>>{
                 {"-C", "/saved-directory"}, {"--cd", "/saved-directory"},
                 {"--cd=/saved-directory"}, {"-C=/saved-directory"}, {"-C/saved-directory"}})

@@ -325,15 +325,15 @@ void prepare_resume(addon::Invocation_context& context)
     const auto record = decode_resume_record(request->resume_record);
     const auto profile = selected_profile(request->context, context);
     if (!profile) return;
-    const auto directory = addon::path_from_utf8(request->context.working_directory);
-    if (!record ||
-        !directory.is_absolute() || directory.lexically_normal() != directory || !request->startup_observer ||
+    const auto directory = addon::normalized_resume_directory(request->context.working_directory);
+    if (!record || !directory || !request->startup_observer ||
         request->startup_observer->confirmation != "prepared-identity")
     {
         context.fail(addon::Result_status::FAILED, "invalid_resume_request",
             "Exact Codex resume requires a canonical session UUID, workspace and private startup observer.");
         return;
     }
+    const auto working_directory = addon::path_to_utf8(*directory);
     if (!record->sqlite_home.empty()) {
         if (addon::path_from_utf8(record->codex_home).generic_u8string() !=
             addon::path_from_utf8(profile->profile_path).generic_u8string())
@@ -368,7 +368,7 @@ void prepare_resume(addon::Invocation_context& context)
         return;
     }
     auto launch = verified_launch(request->context.launcher, request->context.launcher_argv,
-        request->context.launch_environment->effective_environment, request->context.working_directory, false, context);
+        request->context.launch_environment->effective_environment, working_directory, false, context);
     if (!launch || !version_is_at_least(launch->version, 0, 146, 0)) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
@@ -382,7 +382,7 @@ void prepare_resume(addon::Invocation_context& context)
     }
     auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->context.launch_environment->effective_environment, *launch, profile->profile_path),
-        request->context.working_directory, context, request->context.terminal_identity.has_value());
+        working_directory, context, request->context.terminal_identity.has_value());
     if (!record->sqlite_home.empty() &&
         addon::environment_value(launch->environment, k_export_sqlite_home_environment) != record->sqlite_home)
     {
@@ -408,7 +408,7 @@ void prepare_resume(addon::Invocation_context& context)
     const auto environment = launch_environment(
         request->context.launch_environment->effective_environment, *launch, profile->profile_path);
     std::string error;
-    if (!startup_supported(*launch, configuration, environment, request->context.working_directory, context, &error)) {
+    if (!startup_supported(*launch, configuration, environment, working_directory, context, &error)) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "startup_observer_unavailable", error);
         return;
@@ -416,7 +416,7 @@ void prepare_resume(addon::Invocation_context& context)
     const auto configuration_end = launch->argv.size();
     launch->argv.insert(launch->argv.end(), {"-c", "otel.exporter={otlp-http={endpoint=" +
         toml_string(request->startup_observer->endpoint) + ",protocol=\"json\"}}", "-c", "otel.log_user_prompt=false",
-        "resume", "-C", request->context.working_directory, record->session_id});
+        "resume", "-C", working_directory, record->session_id});
     const bool title_applied = add_terminal_title(launch->argv, configuration_end, native_preparation.terminal_title);
     addon::Resume_prepare_result result;
 #ifdef _WIN32
