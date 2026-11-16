@@ -25,6 +25,12 @@ does not identify one.
 Compaction starts, internal events, and child starts cannot relabel the root.
 The model extension adds no lifecycle observation, attention event, or log row.
 
+On qualified Codex versions with the default identity title, title selection
+normally precedes the first turn's `SessionStart`. That normal launch path
+therefore remains unconfirmed. The supported start observation is available
+when the hook itself opens the activation; it does not complete model reporting
+for title-selected startup.
+
 ## Freshness boundary
 
 The shared SDK requires a source-captured activation nonce and source order for
@@ -32,6 +38,12 @@ an asynchronous observation. The current Codex command helper is short lived
 and has no such binding for later model hooks. The startup observer identifies
 conversations, and the wake binding identifies launch/profile/database scope;
 neither supplies the missing model activation capture.
+
+The native [root start input](https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/hooks/src/schema.rs#L497-L511)
+has no activation identifier or turn ID linking it to an earlier title
+selection. The native [title model field](https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/tui/src/chatwidget/status_surfaces.rs#L981-L988)
+uses a display name truncated to 32 graphemes, so it cannot supply the literal
+model identity either.
 
 Reading the host's current nonce when a delayed event arrives would attach old
 evidence to a later activation, especially after A → B → A. This implementation
@@ -48,6 +60,10 @@ isolation, and compaction/child exclusion. `codex_reply_tests.py` exercises the
 compiled helper and adapter transport with an account-free fake host wrapper.
 These component tests are distinct from a native Codex session or a rendered
 Logonomic timeline.
+
+Malformed optional values, including oversized strings and objects, are reduced
+to a bounded invalid marker before helper transport. Opted-in classification
+then reports `invalid_model_observation` while retaining the lifecycle event.
 
 The account-free `codex_native_wake_tests.py` harness uses a disposable native
 profile and a loopback Responses endpoint, but qualifies wake behavior rather

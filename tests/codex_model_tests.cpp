@@ -3,12 +3,14 @@
 
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/model_state.h>
 
 #include <exception>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -48,8 +50,18 @@ void native_start_model()
     require(decoded && decoded->model_updates == result->model_updates && !decoded->model_failure,
         "Optional model must round-trip through the actual carrier");
 
-    for (const auto& model : {Json(""), Json(std::string(513, 'm')), Json("model\ncontrol"), Json(17)}) {
-        request.event.body.set("model", model);
+    auto oversized_object = Json::object();
+    oversized_object.set("model", Json(std::string(48 * 1024, 'm')));
+    const std::vector<Json> malformed_models{
+        Json(""), Json(std::string(513, 'm')), Json(std::string(48 * 1024, 'm')),
+        std::move(oversized_object), Json("model\ncontrol"), Json(17), Json(),
+    };
+    for (const auto& model : malformed_models) {
+        auto malformed = native;
+        malformed.set("model", model);
+        request.event.body = codex::hook_metadata(malformed);
+        require(addon::serialize_json(request.event.body).size() < addon::limits::k_max_provider_event_bytes,
+            "Malformed optional model must not exceed the helper transport body limit");
         result = codex::classify_hook(request);
         require(result && result->classification == addon::Classification::TRANSITION &&
             result->observations.size() == 1 && result->model_updates.empty() && result->model_failure,

@@ -39,7 +39,7 @@ class Adapter:
         assert frame, "adapter closed before its response"
         return json.loads(frame)
 
-    def classify(self, delivery, *, attention=True, pending=None, epoch=2):
+    def classify(self, delivery, *, attention=True, pending=None, epoch=2, model=False):
         self.serial += 1
         request_id = "r" + str(self.serial)
         payload = {"event": delivery["event"], "transition_nonce": delivery["transition_nonce"],
@@ -47,6 +47,8 @@ class Adapter:
                 "kind": "start", "provider_session_id": "native-session", "nonce": "7" * 32}}}
         if pending is not None:
             payload["pending_conversational_request_id"] = pending
+        if model:
+            payload["model_state"] = {"version": 1}
         self.send({"type": "invoke", "request_id": request_id,
             "capability_id": "attention-kind" if attention else "helper-ingress",
             "version": 1 if attention else 2, "operation": "classify_event", "deadline_ms": 5000,
@@ -123,6 +125,24 @@ def reply_contract(helper, wrapper, executable, directory):
         classified = adapter.classify(delivery, attention=False)
         assert classified["observations"][0]["resume_record"] == expected_record
         assert adapter.classify(delivery, attention=False) == classified
+
+        model_start = {**start, "model": "gateway/model-current"}
+        model_delivery = deliver(model_start)
+        model_result = adapter.classify(model_delivery, model=True)
+        update = model_result["model_state"]["updates"][0]
+        assert update["model"] == model_start["model"] and not update.get("provider")
+        assert update["provider_session_id"] == session and update["agent_id"] == ""
+        assert update["transition_nonce"] == model_delivery["transition_nonce"] and update["sequence"] == "0"
+        assert "model_state" not in adapter.classify(model_delivery)
+        for invalid_model in ("m" * (48 * 1024), {"nested": "m" * (48 * 1024)}, "", None, 17):
+            malformed = deliver({**model_start, "model": invalid_model})
+            body = json.dumps(malformed["event"]["body"], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            assert len(body) <= 48 * 1024, "Optional model must fit the host's helper-ingress body limit"
+            result = adapter.classify(malformed, model=True)
+            assert result["classification"] == "transition" and len(result["observations"]) == 1
+            assert result["model_state"]["failure"]["reason_code"] == "invalid_model_observation"
+            assert "model_state" not in adapter.classify(malformed)
+
         del environment["VNM_CODEX_EXPORT_SQLITE_HOME"]
         assert "resume_record" not in deliver(start)["event"]["body"]
         compact = deliver({**start, "source": "compact"})

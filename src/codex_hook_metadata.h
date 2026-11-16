@@ -5,6 +5,7 @@
 #include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/model_state.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -131,7 +132,10 @@ inline logonomic::cli_addon::Json_value hook_metadata(const logonomic::cli_addon
     const auto* name = event.find("hook_event_name");
     if (name && *name == addon::Json_value("SessionStart") && !event.find("agent_id")) {
         if (const auto* model = event.find("model")) {
-            result.set("model", *model);
+            // Keep invalid optional evidence bounded so host ingress can still
+            // deliver the lifecycle event and classification can report its failure.
+            result.set("model", model->is_string() && addon::is_valid_model_label(model->as_string())
+                ? *model : addon::Json_value());
         }
     }
     if (const auto* cwd = event.find("cwd"); name && *name == addon::Json_value("SessionStart") &&
