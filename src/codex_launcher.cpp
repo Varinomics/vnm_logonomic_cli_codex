@@ -917,4 +917,30 @@ std::optional<Verified_launch> verified_launch(
     return Verified_launch{std::move(prefix), std::move(version), std::move(updates), std::move(file_names), prefix_size};
 }
 
+std::optional<addon::Json_value> file_evidence(const std::vector<std::string>& files)
+{
+    if (files.empty()) {
+        return std::nullopt;
+    }
+    auto result = addon::Json_value::array();
+    for (const auto& name : files) {
+        const auto path = addon::path_from_utf8(name);
+        std::error_code error;
+        const auto size = fs::file_size(path, error);
+        if (error) {
+            return std::nullopt;
+        }
+        const auto modified = fs::last_write_time(path, error);
+        if (error) {
+            return std::nullopt;
+        }
+        auto file = addon::Json_value::object();
+        file.set("path",     addon::Json_value(name));
+        file.set("size",     addon::Json_value(std::to_string(size)));
+        file.set("modified", addon::Json_value(addon::file_time_ticks_text(modified)));
+        result.push_back(std::move(file));
+    }
+    return result;
+}
+
 } // namespace codex

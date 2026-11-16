@@ -321,15 +321,14 @@ bool startup_supported(const Verified_launch& launch, const std::vector<std::str
         *error = "Exact Codex resume conflicts with the launcher's existing telemetry log exporter.";
         return false;
     }
+    // The proof below is remembered for this effective configuration and this
+    // executable chain. The chain is identified as the version probe and the
+    // wake binding identify it: by each file's path, size and modification time.
+    const auto chain = file_evidence(launch.files);
+    if (!chain) { *error = "The Codex executable chain could not be identified."; return false; }
     addon::Sha256 digest;
     digest.update(addon::serialize_json_canonical(*effective));
-    for (const auto& file : launch.files) {
-        std::ifstream input(addon::path_from_utf8(file), std::ios::binary);
-        std::array<char, 65536> buffer{};
-        if (!input) { *error = "The Codex executable chain could not be identified."; return false; }
-        while (input) { input.read(buffer.data(), buffer.size()); digest.update(buffer.data(), static_cast<std::size_t>(input.gcount())); }
-        if (!input.eof()) { *error = "The Codex executable chain could not be identified."; return false; }
-    }
+    digest.update(addon::serialize_json_canonical(*chain));
     const auto key = addon::to_hex(digest.finish());
     static std::mutex cache_mutex;
     static std::set<std::string> supported;

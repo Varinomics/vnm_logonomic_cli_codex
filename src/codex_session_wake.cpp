@@ -17,7 +17,6 @@ namespace codex {
 namespace {
 
 namespace addon = logonomic::cli_addon;
-namespace fs = std::filesystem;
 using Json = addon::Json_value;
 using Environment = std::vector<std::pair<std::string, std::string>>;
 
@@ -63,23 +62,6 @@ std::string normalized_absolute(std::string_view name)
     if (!path.is_absolute()) return {};
     const auto value = path.lexically_normal().generic_u8string();
     return {value.begin(), value.end()};
-}
-
-std::optional<Json> file_evidence(const std::vector<std::string>& files)
-{
-    if (files.empty()) return std::nullopt;
-    auto result = Json::array();
-    for (const auto& name : files) {
-        const auto path = addon::path_from_utf8(name);
-        std::error_code error;
-        const auto size = fs::file_size(path, error);
-        if (error) return std::nullopt;
-        const auto modified = fs::last_write_time(path, error);
-        if (error) return std::nullopt;
-        result.push_back(object({{"path", Json(name)}, {"size", Json(std::to_string(size))},
-            {"modified", Json(addon::file_time_ticks_text(modified))}}));
-    }
-    return result;
 }
 
 struct Rpc_response

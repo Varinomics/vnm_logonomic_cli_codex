@@ -1,5 +1,6 @@
 #pragma once
 
+#include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
 
@@ -72,5 +73,11 @@ std::optional<Verified_launch> verified_launch(
     std::string_view                working_directory,
     bool                            delegated,
     logonomic::cli_addon::Invocation_context&     context);
+
+// Identifies a verified launch's files by path, size and modification time.
+// Reading them is not needed to tell one executable chain from another, and
+// the native Codex image alone is hundreds of megabytes. Absent when the list
+// is empty or a file cannot be examined.
+std::optional<logonomic::cli_addon::Json_value> file_evidence(const std::vector<std::string>& files);
 
 } // namespace codex
