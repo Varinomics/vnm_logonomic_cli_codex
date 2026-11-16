@@ -306,19 +306,29 @@ bool chain_replaced_during_probe_is_not_remembered(const fs::path& fake_cli, con
     const Check_scope scope{root / "replaced", "gpt-5.1"};
     const auto chain    = install_chain(fake_cli, scope.directory / "installation");
     const auto launch   = verified(chain);
-    const auto previous = fs::last_write_time(chain.manifest);
-    const auto replaced = prove(scope, launch, chain.manifest);
-    const bool touched  = fs::last_write_time(chain.manifest) != previous;
-    const auto reproved   = prove(scope, launch);
-    const auto remembered = prove(scope, launch);
+    const auto original = fs::last_write_time(chain.manifest);
+    const auto refused  = prove(scope, launch, chain.manifest);
+    const auto replaced = fs::last_write_time(chain.manifest);
+    // The refused proof was started under the original chain's evidence, so
+    // that is the key it must not have left behind.
+    fs::last_write_time(chain.manifest, original);
+    const auto original_reproved = prove(scope, launch);
+    fs::last_write_time(chain.manifest, replaced);
+    const auto replaced_proved     = prove(scope, launch);
+    const auto replaced_remembered = prove(scope, launch);
     bool ok = true;
-    ok &= check(touched, "replaced during probe: the fixture did not replace the manifest during the probe");
-    ok &= check(replaced.probes == 1 && !replaced.supported && replaced.error == k_unidentified_chain,
-        "replaced during probe: a chain replaced while it was being proved must be refused" + described(replaced));
-    ok &= check(reproved.supported && reproved.probes == 1,
-        "replaced during probe: the refused proof must not be remembered for the replaced chain" + described(reproved));
-    ok &= check(remembered.supported && remembered.probes == 0,
-        "replaced during probe: the replaced chain's own proof must then be remembered" + described(remembered));
+    ok &= check(replaced != original, "replaced during probe: the fixture did not replace the manifest during the probe");
+    ok &= check(refused.probes == 1 && !refused.supported && refused.error == k_unidentified_chain,
+        "replaced during probe: a chain replaced while it was being proved must be refused" + described(refused));
+    ok &= check(original_reproved.supported && original_reproved.probes == 1,
+        "replaced during probe: the refused proof must not be remembered for the chain it started with" +
+            described(original_reproved));
+    ok &= check(replaced_proved.supported && replaced_proved.probes == 1,
+        "replaced during probe: the refused proof must not be remembered for the replaced chain" +
+            described(replaced_proved));
+    ok &= check(replaced_remembered.supported && replaced_remembered.probes == 0,
+        "replaced during probe: the replaced chain's own proof must then be remembered" +
+            described(replaced_remembered));
     return ok;
 }
 
