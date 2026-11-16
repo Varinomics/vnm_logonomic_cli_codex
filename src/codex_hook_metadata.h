@@ -129,6 +129,11 @@ inline logonomic::cli_addon::Json_value hook_metadata(const logonomic::cli_addon
         }
     }
     const auto* name = event.find("hook_event_name");
+    if (name && *name == addon::Json_value("SessionStart") && !event.find("agent_id")) {
+        if (const auto* model = event.find("model")) {
+            result.set("model", *model);
+        }
+    }
     if (const auto* cwd = event.find("cwd"); name && *name == addon::Json_value("SessionStart") &&
         !event.find("agent_id") && cwd && cwd->is_string() &&
         cwd->as_string().size() <= addon::limits::k_max_start_absolute_path_bytes)
