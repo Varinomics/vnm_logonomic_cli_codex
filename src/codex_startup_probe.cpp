@@ -390,6 +390,9 @@ bool startup_supported(const Verified_launch& launch, const std::vector<std::str
         *error = "Installed Codex did not confirm private startup-observer support before the probe deadline.";
         return false;
     }
+    // The proof belongs to the chain that ran the probe. A chain replaced
+    // meanwhile is neither remembered nor launched on it.
+    if (file_evidence(launch.files) != chain) { *error = "The Codex executable chain could not be identified."; return false; }
     std::lock_guard lock(cache_mutex);
     if (supported.size() >= 64) supported.clear();
     supported.insert(key);

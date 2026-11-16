@@ -74,10 +74,12 @@ std::optional<Verified_launch> verified_launch(
     bool                            delegated,
     logonomic::cli_addon::Invocation_context&     context);
 
-// Identifies a verified launch's files by path, size and modification time.
-// Reading them is not needed to tell one executable chain from another, and
-// the native Codex image alone is hundreds of megabytes. Absent when the list
-// is empty or a file cannot be examined.
+// Each verified launch file's path, size and modification time. Results
+// remembered for an executable chain are invalidated by a change in this
+// metadata; the files are not read, because the native Codex image alone is
+// hundreds of megabytes. The limit of that choice: contents replaced at the
+// same path with equal size and modification time give equal evidence.
+// Absent when the list is empty or a file cannot be examined.
 std::optional<logonomic::cli_addon::Json_value> file_evidence(const std::vector<std::string>& files);
 
 } // namespace codex

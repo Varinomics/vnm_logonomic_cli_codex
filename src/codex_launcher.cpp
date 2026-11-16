@@ -843,7 +843,14 @@ std::optional<Verified_launch> verified_launch(
     }
     std::vector<std::string> probe_argv = prefix;
     probe_argv.push_back("--version");
-    std::vector<std::pair<std::uintmax_t, fs::file_time_type>> identities;
+    std::vector<std::string> file_names;
+    for (const auto& file : files) {
+        file_names.push_back(path_to_utf8(file));
+    }
+    const auto evidence = file_evidence(file_names);
+    if (!evidence) {
+        return std::nullopt;
+    }
     addon::Sha256 digest;
     const auto append = [&](std::string_view value) {
         digest.update(std::to_string(value.size()));
@@ -858,23 +865,7 @@ std::optional<Verified_launch> verified_launch(
         append(name);
         append(value);
     }
-    std::vector<std::string> file_names;
-    for (const auto& file : files) {
-        std::error_code error;
-        const auto size = fs::file_size(file, error);
-        if (error) {
-            return std::nullopt;
-        }
-        const auto modified = fs::last_write_time(file, error);
-        if (error) {
-            return std::nullopt;
-        }
-        identities.emplace_back(size, modified);
-        file_names.push_back(path_to_utf8(file));
-        append(file_names.back());
-        append(std::to_string(size));
-        append(addon::file_time_ticks_text(modified));
-    }
+    append(addon::serialize_json_canonical(*evidence));
     const auto key = addon::to_hex(digest.finish());
     static std::mutex cache_mutex;
     static std::map<std::string, std::string> cache;
@@ -895,13 +886,8 @@ std::optional<Verified_launch> verified_launch(
         if (version.empty() || (!package_version.empty() && version != package_version)) {
             return std::nullopt;
         }
-        for (std::size_t index = 0; index < files.size(); ++index) {
-            std::error_code error;
-            if (fs::file_size(files[index], error) != identities[index].first || error ||
-                fs::last_write_time(files[index], error) != identities[index].second || error)
-            {
-                return std::nullopt;
-            }
+        if (file_evidence(file_names) != evidence) {
+            return std::nullopt;
         }
         std::lock_guard lock(cache_mutex);
         if (cache.size() >= 32) {
