@@ -42,54 +42,42 @@ observation while identity remains usable. The provider does not infer the
 default directory from a transcript, launch directory, tool-specific `workdir`,
 child shell, title or typed command. It does not emit later cwd-only observations:
 those require an authoritative default-directory signal captured with the
-activation identity at its native source. Host-initiated resume continues to pass
-`resume -C <host-selected-directory> <exact-id>`; this argument alone is not
+activation identity at its native source. Resume passes
+`resume -C <working-directory> <exact-id>`; this argument alone is not
 confirmation that Codex accepted that directory.
 
-### Host-selected exact Resume directory
+### Resume directory
 
-The optional `resume-directory@1` declaration lets an updated host bind its
-selected local cwd and selection source to inspection and preparation. The
-provider acknowledges the canonical complete preparation request as well as the
-original opaque resume record. Its native recipe remains
-`resume -C <selected-directory> <exact-id>` in the same `CODEX_HOME` and saved
-native store. A nested directory or a non-Git directory remains exact; no root,
-last-session or fork fallback is substituted.
+Logonomic resumes a conversation in the directory it is registered with. When
+that directory no longer exists, the user can choose another folder, and the
+host offers that choice only for a package declaring `resume-directory@2`. This
+package declares it: its exact native recipe is
+`resume -C <working-directory> <exact-id>` in the same `CODEX_HOME` and saved
+native store, and Codex finds the conversation by its ID in that store, not by
+directory. A nested directory or a non-Git directory remains exact; no root,
+last-session or fork fallback is substituted. The declaration has an empty
+payload; the request carries no directory member and the result no directory
+acknowledgment.
 
-For a negotiated selection, preparation removes one saved Codex `-C`/`--cd`
-option before probing and preparing the launch, then supplies the selected
-directory on the native resume subcommand. Separate, `=` and compact `-C` forms
-are supported. Empty or duplicate saved directory options are refused. Model,
-permission, account, native-store and unrelated configuration remain intact.
-The original request is unchanged and its complete digest includes the saved
-launcher and selected directory. Older hosts receive the existing request/result
-shape, with no unsolicited directory acknowledgment.
+Preparation removes one saved Codex `-C`/`--cd` option before probing and
+preparing the launch, then supplies the working directory on the native resume
+subcommand. Separate, `=` and compact `-C` forms are supported. Empty or
+duplicate saved directory options are refused. Model, permission, account,
+native-store and unrelated configuration remain intact.
 
 `SessionStart` remains the authoritative default-cwd source described above.
-Preparation and a ready process do not fabricate a confirmed cwd. Because this
-package declares `prepared-identity`, the host finishes the selected directory
-request with exact identity and worker readiness and does not wait for that
-observation, which Codex dispatches only with a turn (the delayed-hook boundary
-below). The request finishes on the prepared invocation; the conversation's
-current directory stays unknown until Codex reports it. A `SessionStart` that
-has already arrived when the host decides is judged against the request. One
-that arrives later supplies the actual cwd under its activation: a directory
-that differs from the request is recorded as the actual fact and does not
-reopen the finished request, and neither does a later conversation switch or
-the process ending.
+Preparation and a ready process do not fabricate a confirmed cwd; the
+conversation's current directory stays unknown until Codex reports it.
 
-Coordinated adoption requires the Logonomic SDK/host change before this provider
-source can compile against `resume-directory@1`. A new host with an older package
-refuses unsupported relocation; a new package with an older host uses the legacy
-shape. This adoption does not complete Codex's wider native selection/ownership
-work tracked in [#16](https://github.com/Varinomics/vnm_logonomic_cli_codex/issues/16)
+The declaration does not complete Codex's wider native selection/ownership work
+tracked in [#16](https://github.com/Varinomics/vnm_logonomic_cli_codex/issues/16)
 or the [host continuity tracker](https://github.com/Varinomics/logonomic/issues/257).
 
 Native qualification records the exact CLI and package revisions and verifies
-that a command with no per-command directory override runs in the reported
-default directory after Resume. Provider preparation fixtures exercise option
-selection and acknowledgment; they do not establish native command cwd. This
-requirement applies to Linux, Windows and macOS qualification.
+that a command with no per-command directory override runs in the working
+directory after Resume. Provider preparation fixtures exercise option selection;
+they do not establish native command cwd. This requirement applies to Linux,
+Windows and macOS qualification.
 
 These are reporting hooks, with a specific native observation boundary. Source
 review at Codex `748ab55ca7de0b647d9a7a9d9a8e70e00f28666d` still shows

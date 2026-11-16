@@ -358,8 +358,6 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
     request.context.launch_environment->effective_environment.set("CODEX_FIXTURE_SQLITE_HOME",
         Json(addon::path_to_utf8(fixture / "changed-default-store")));
     request.resume_record = inspection.resume_record;
-    request.resume_directory = addon::Resume_directory_selection{
-        addon::Resume_directory_source::LAST_CONFIRMED};
     auto original_environment = request.context.launch_environment->effective_environment;
     original_environment.set("CODEX_HOME", Json(*request.context.account_context->profile_path));
     original_environment.set("CODEX_FIXTURE_SQLITE_HOME", Json(addon::path_to_utf8(fixture / "store")));
@@ -391,9 +389,7 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
         result->process.argv[result->process.argv.size() - 2] == request.context.working_directory &&
         result->process.argv[result->process.argv.size() - 3] == "-C" &&
         result->acknowledgment.record_digest_hex == addon::resume_record_digest_hex(request.resume_record),
-        "host-selected location and original identity are prepared independently");
-    check(addon::validate_resume_directory_acknowledgment(request, *result, &failure),
-        "directory preparation acknowledges the exact inspected context and original native record");
+        "host working directory and original identity are prepared independently");
     check(std::find(result->patch.set.begin(), result->patch.set.end(),
         std::pair<std::string, std::string>{"VNM_CODEX_EXPORT_SQLITE_HOME", store}) != result->patch.set.end(),
         "preparation pins original store instead of current launcher defaults");
@@ -412,13 +408,11 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
     // that record with the same preparation offers the desktop sends on resume.
     for (const int offers : {1, 2, 3}) {
         auto offered = request;
-        // The host sends its allocated profile storage inside the request, so
-        // the directory acknowledgment names a request that includes it.
+        // The host sends its allocated profile storage inside the request.
         offered.context.profile_storage = invocation.profile_storage;
         const auto alternate = fixture / "non-git directory" / "nested";
         fs::create_directories(alternate);
         offered.context.working_directory = addon::path_to_utf8(alternate);
-        offered.resume_directory->source = addon::Resume_directory_source::EXPLICIT;
         offered.context.launcher_argv.insert(offered.context.launcher_argv.end(),
             {"-c", "model=\"retained-model\"", "--sandbox", "read-only", "--cd", "/old-saved-location"});
         if (offers & 1) {
@@ -440,11 +434,10 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
             prepared->patch.account_context &&
             prepared->patch.account_context->profile_path == offered.context.account_context->profile_path,
             "bound resume preserves exact conversation, account and owned storage");
-        check(prepared && addon::validate_resume_directory_acknowledgment(offered, *prepared, &failure) &&
-            prepared->process.argv[prepared->process.argv.size() - 2] == offered.context.working_directory &&
+        check(prepared && prepared->process.argv[prepared->process.argv.size() - 2] == offered.context.working_directory &&
             std::find(prepared->process.argv.begin(), prepared->process.argv.end(), "--cd") == prepared->process.argv.end() &&
             std::find(prepared->process.argv.begin(), prepared->process.argv.end(), "/old-saved-location") == prepared->process.argv.end(),
-            "exact nested non-Git choice replaces the saved Codex directory option before preparation");
+            "a nested non-Git working directory replaces the saved Codex directory option before preparation");
         check(std::find(prepared->process.argv.begin(), prepared->process.argv.end(),
                 "model=\"retained-model\"") != prepared->process.argv.end() &&
             std::find(prepared->process.argv.begin(), prepared->process.argv.end(),
@@ -464,15 +457,6 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
         }
     }
     check(host.shutdown(1000, nullptr), "packaged resume adapter exits");
-    auto legacy_request = request;
-    legacy_request.resume_directory.reset();
-    Preparation_context legacy;
-    legacy.input = {"legacy-resume", {"interactive-resume", 2}, "prepare_resume",
-        addon::encode_resume_prepare_request(legacy_request, 2), 15000};
-    codex::handle_preparation(legacy);
-    const auto legacy_result = addon::decode_resume_prepare_result(legacy.output, &failure, 2);
-    check(legacy.succeeded && legacy_result && !legacy_result->resume_directory,
-        "old hosts receive the original closed resume result without an unsolicited directory field");
     fs::remove(fixture / "profile/archived_sessions/replacement.jsonl");
     Preparation_context missing;
     missing.input = context.input;

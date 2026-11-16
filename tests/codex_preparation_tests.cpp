@@ -1478,20 +1478,15 @@ int main(int argc, char** argv)
             std::count(identified->process.argv.begin(), identified->process.argv.end(),
                 R"(tui.terminal_title=["spinner","session-id","thread-name","thread"])") == 1,
             "Exact resume must prepare immediate identity without replacing its native UUID or display settings");
-        require(!identified->resume_directory,
-            "A host that did not negotiate directory selection keeps the original closed result shape");
         const auto selected_directory = root / "non-git directory" / "nested";
         fs::create_directories(selected_directory);
         auto separated_directory = utf8(selected_directory / ".." / "." / "nested") + "//";
 #ifdef _WIN32
         std::replace(separated_directory.begin(), separated_directory.end(), '\\', '/');
 #endif
-        for (const bool negotiated_directory : {false, true}) {
+        {
             auto request = resume;
             request.context.working_directory = separated_directory;
-            if (negotiated_directory) {
-                request.resume_directory = addon::Resume_directory_selection{addon::Resume_directory_source::LAST_CONFIRMED};
-            }
             const auto original = addon::encode_resume_prepare_request(request);
             Context normalized;
             normalized.input = {"directory-spelling", {"interactive-resume", 2}, "prepare_resume", original, 15000};
@@ -1500,9 +1495,8 @@ int main(int argc, char** argv)
             require(normalized.succeeded && result &&
                 result->process.argv[result->process.argv.size() - 2] == utf8(selected_directory) &&
                 result->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763" &&
-                addon::validate_resume_acknowledgment(request.resume_record, result->acknowledgment, &failure) &&
-                addon::validate_resume_directory_acknowledgment(request, *result, &failure),
-                "Equivalent directory spelling selects the exact normalized workspace and acknowledges the original request");
+                addon::validate_resume_acknowledgment(request.resume_record, result->acknowledgment, &failure),
+                "Equivalent directory spelling resumes the exact conversation in the normalized working directory");
             const auto* wake_directory = result->patch.session_wake
                 ? result->patch.session_wake->binding.find("cwd") : nullptr;
             require(result->patch.session_wake && result->patch.session_wake->available && wake_directory &&
@@ -1518,19 +1512,17 @@ int main(int argc, char** argv)
             request.context.launcher = saved.launcher;
             request.context.launcher_argv = saved.launcher_argv;
             request.context.working_directory = utf8(selected_directory);
-            request.resume_directory = addon::Resume_directory_selection{addon::Resume_directory_source::EXPLICIT};
             const auto original = addon::encode_resume_prepare_request(request);
             Context selected;
             selected.input = {"directory-selection", {"interactive-resume", 2}, "prepare_resume", original, 15000};
             codex::handle_preparation(selected);
             const auto result = addon::decode_resume_prepare_result(selected.output, &failure, 2);
             require(selected.succeeded && result &&
-                addon::validate_resume_directory_acknowledgment(request, *result, &failure) &&
                 result->process.argv.back() == "019933a1-6e43-7102-a520-b3c8294cc763" &&
                 result->process.argv[result->process.argv.size() - 2] == utf8(selected_directory) &&
                 result->process.argv[result->process.argv.size() - 3] == "-C" &&
                 std::count(result->process.argv.begin(), result->process.argv.end(), "-C") == 1,
-                "Exact resume must acknowledge and select the nested non-Git directory after replacing saved Codex options");
+                "Exact resume must run in the working directory, a nested non-Git one included, after replacing saved Codex options");
             require(std::none_of(result->process.argv.begin(), result->process.argv.end(), [](const auto& argument) {
                     return argument.find("/saved-directory") != std::string::npos;
                 }) && result->patch.account_context && proposal->patch.account_context &&
@@ -1546,7 +1538,6 @@ int main(int argc, char** argv)
             auto request = resume;
             request.context.launcher = saved.launcher;
             request.context.launcher_argv = saved.launcher_argv;
-            request.resume_directory = addon::Resume_directory_selection{addon::Resume_directory_source::LAST_CONFIRMED};
             Context invalid;
             invalid.input = {"invalid-directory-option", {"interactive-resume", 2}, "prepare_resume",
                 addon::encode_resume_prepare_request(request), 15000};
