@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 #include <chrono>
@@ -253,6 +254,20 @@ int main(int argc, char** argv)
         const auto* id = message->find("id");
         if (!id) continue;
         const auto method = text(*message, "method");
+        // Startup-proof tests count the private probes from these records.
+        if (const char* path = std::getenv("CODEX_FIXTURE_PROBE_LOG")) {
+            std::ofstream log(addon::path_from_utf8(path), std::ios::app | std::ios::binary);
+            log << method << '\n';
+        }
+        // Replace a chain file's modification time while the private probe
+        // is still running, before its result can be remembered.
+        if (const char* path = std::getenv("CODEX_FIXTURE_PROBE_TOUCH"); path && method == "thread/resume") {
+            const auto file = addon::path_from_utf8(path);
+            std::error_code error;
+            const auto modified = std::filesystem::last_write_time(file, error);
+            if (!error) std::filesystem::last_write_time(file, modified + std::chrono::minutes(1), error);
+            if (error) return 32;
+        }
         const char* wake_scenario = std::getenv("CODEX_FIXTURE_WAKE");
         if (const char* path = std::getenv("CODEX_FIXTURE_WAKE_LOG")) {
             Json record = object({{"method", Json(method)}, {"request", *message}, {"sqlite_home", Json(sqlite_home)}});
