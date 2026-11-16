@@ -66,10 +66,17 @@ launcher and selected directory. Older hosts receive the existing request/result
 shape, with no unsolicited directory acknowledgment.
 
 `SessionStart` remains the authoritative default-cwd source described above.
-Preparation and a ready process do not fabricate a confirmed cwd. An updated
-host waits for that activation's native observation; if it is missing or
-different, the host reports the unmet request while retaining the actual live
-conversation. The known delayed-hook boundary below still applies.
+Preparation and a ready process do not fabricate a confirmed cwd. Because this
+package declares `prepared-identity`, the host finishes the selected directory
+request with exact identity and worker readiness and does not wait for that
+observation, which Codex dispatches only with a turn (the delayed-hook boundary
+below). The request finishes on the prepared invocation; the conversation's
+current directory stays unknown until Codex reports it. A `SessionStart` that
+has already arrived when the host decides is judged against the request. One
+that arrives later supplies the actual cwd under its activation: a directory
+that differs from the request is recorded as the actual fact and does not
+reopen the finished request, and neither does a later conversation switch or
+the process ending.
 
 Coordinated adoption requires the Logonomic SDK/host change before this provider
 source can compile against `resume-directory@1`. A new host with an older package
