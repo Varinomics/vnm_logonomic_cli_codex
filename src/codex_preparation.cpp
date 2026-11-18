@@ -452,7 +452,7 @@ enum class Review_preparation_status
     REASONING_EFFORT_UNAVAILABLE,
 };
 
-std::vector<std::string> delegated_arguments(
+std::vector<std::string> session_arguments(
     const Verified_launch& launch, bool review, const std::optional<addon::Delegated_model_selection>& selection)
 {
     std::vector<std::string> arguments(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
@@ -490,9 +490,9 @@ std::vector<std::string> delegated_arguments(
     return arguments;
 }
 
-std::optional<addon::Json_value> delegated_configuration(
+std::optional<addon::Json_value> session_configuration(
     const Verified_launch& launch,
-    const addon::Delegated_prepare_request& request,
+    const addon::Structured_prepare_request& request,
     const std::string& profile_path,
     const std::vector<std::string>& arguments,
     addon::Invocation_context& context)
@@ -566,7 +566,8 @@ void fail_review_preparation(addon::Invocation_context& context, Review_preparat
 bool review_servers_constrained(const addon::Json_value& config, const std::vector<std::string>& task_servers)
 {
     const auto* servers = config.find("mcp_servers");
-    if (!servers || !servers->is_object()) return false;
+    if (!servers || servers->is_null()) return task_servers.empty();
+    if (!servers->is_object()) return false;
     for (const auto& name : task_servers) {
         const auto* server = servers->find(name);
         if (!server || !server->is_object()) return false;
@@ -581,7 +582,8 @@ bool review_servers_constrained(const addon::Json_value& config, const std::vect
 
 Review_preparation_status prepare_review_arguments(
     const Verified_launch& launch,
-    const addon::Delegated_prepare_request& request,
+    const addon::Structured_prepare_request& request,
+    const std::optional<addon::Delegated_model_selection>& selection,
     const std::string& profile_path,
     std::vector<std::string>& arguments,
     addon::Invocation_context& context)
@@ -611,8 +613,8 @@ Review_preparation_status prepare_review_arguments(
     // filesystem enforcement. Restricted tokens need no elevation or setup UI.
     arguments.insert(arguments.end(), {"-c", "windows.sandbox=\"unelevated\""});
 #endif
-    const auto config = delegated_configuration(launch, request, profile_path, arguments, context);
-    const auto status = review_configuration_status(config, request.model_selection);
+    const auto config = session_configuration(launch, request, profile_path, arguments, context);
+    const auto status = review_configuration_status(config, selection);
     if (status != Review_preparation_status::READY) return status;
     const auto* servers = config->find("mcp_servers");
     if (!servers || servers->is_null()) return Review_preparation_status::READY;
@@ -633,27 +635,19 @@ Review_preparation_status prepare_review_arguments(
     return Review_preparation_status::READY;
 }
 
-void prepare_delegated(addon::Invocation_context& context)
+void prepare_session(addon::Invocation_context& context, const addon::Structured_prepare_request& request,
+    const addon::Delegated_control* control, const std::optional<addon::Delegated_model_selection>& selection)
 {
     addon::Contract_failure failure;
-    const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure);
-    if (!request) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
-        return;
-    }
-    if (!request->control.connection) {
-        context.fail(addon::Result_status::UNAVAILABLE, "task_server_connection_unavailable");
-        return;
-    }
-    const auto profile = selected_profile(request->context, context);
+    const auto profile = selected_profile(request.context, context);
     if (!profile) return;
-    const bool review = request->purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
-    if (request->prompt.empty() || !addon::path_from_utf8(request->context.working_directory).is_absolute()) {
+    const bool review = request.purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
+    if (request.prompt.empty() || !addon::path_from_utf8(request.context.working_directory).is_absolute()) {
         context.fail(addon::Result_status::FAILED, review ? "invalid_review_request" : "invalid_implementation_request");
         return;
     }
-    const auto literal = request->context.launcher.runner_key == addon::k_runner_direct
-        ? request->context.launcher_argv : addon::literal_argv(request->context.launcher.script_body);
+    const auto literal = request.context.launcher.runner_key == addon::k_runner_direct
+        ? request.context.launcher_argv : addon::literal_argv(request.context.launcher.script_body);
     std::string approval;
     if (!supported_session_arguments(literal, false, &approval)) {
         context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
@@ -663,8 +657,8 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
         return;
     }
-    const auto launch = verified_launch(request->context.launcher, request->context.launcher_argv,
-        request->context.launch_environment->effective_environment, request->context.working_directory, true, context);
+    const auto launch = verified_launch(request.context.launcher, request.context.launcher_argv,
+        request.context.launch_environment->effective_environment, request.context.working_directory, true, context);
     if (!launch) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
@@ -677,7 +671,7 @@ void prepare_delegated(addon::Invocation_context& context)
             [](const auto& argument) {
                 return argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox";
             })) &&
-        !inside_git_repository(addon::path_from_utf8(request->context.working_directory)))
+        !inside_git_repository(addon::path_from_utf8(request.context.working_directory)))
     {
         context.fail(addon::Result_status::UNAVAILABLE, "untrusted_working_directory",
             review ? "Codex read-only review requires a Git working directory." :
@@ -686,22 +680,22 @@ void prepare_delegated(addon::Invocation_context& context)
             "sandbox and approvals.");
         return;
     }
-    addon::Delegated_prepare_result result;
-    result.profile_storage  = request->context.profile_storage;
-    result.account_context  = request->context.account_context;
-    result.model_selection  = request->model_selection;
+    addon::Structured_prepare_result result;
+    addon::Delegated_acknowledgment acknowledgment;
+    result.profile_storage  = request.context.profile_storage;
+    result.account_context  = request.context.account_context;
 #ifdef _WIN32
     result.process.executable = "helpers/codex_launch_bridge.exe";
 #else
     result.process.executable = "helpers/codex_launch_bridge";
 #endif
-    result.process.argv = delegated_arguments(*launch, review, request->model_selection);
-    if (request->model_selection && request->model_selection->reasoning_effort) {
+    result.process.argv = session_arguments(*launch, review, selection);
+    if (selection && selection->reasoning_effort) {
         result.process.argv.insert(result.process.argv.end(),
-            {"-c", "model_reasoning_effort=" + toml_string(*request->model_selection->reasoning_effort)});
+            {"-c", "model_reasoning_effort=" + toml_string(*selection->reasoning_effort)});
     }
     if (review) {
-        const auto status = prepare_review_arguments(*launch, *request, profile->profile_path, result.process.argv, context);
+        const auto status = prepare_review_arguments(*launch, request, selection, profile->profile_path, result.process.argv, context);
         if (status != Review_preparation_status::READY) {
             fail_review_preparation(context, status);
             return;
@@ -714,30 +708,33 @@ void prepare_delegated(addon::Invocation_context& context)
         result.process.argv.insert(result.process.argv.end(), {"-c", "approval_policy=\"never\""});
     }
     std::vector<std::string> task_servers;
-    for (const auto& server : request->control.servers) {
-        const auto nonce = addon::random_nonce_hex();
-        task_servers.push_back("logonomic_" + nonce);
-        const std::string key = "mcp_servers." + task_servers.back() + ".";
-        const auto& connection = *request->control.connection;
-        const std::vector<std::string> arguments{
-            "--descriptor", connection.descriptor_path, "--server", server.server_id};
-        result.acknowledgment.server_ids.push_back(server.server_id);
-        const auto overlay = [&](std::string value) {
-            result.process.argv.push_back("-c");
-            result.process.argv.push_back(key + std::move(value));
-        };
-        overlay("command=" + toml_string(connection.relay_program));
-        overlay("args=" + toml_array(arguments));
-        overlay("required=true");
-        overlay("enabled_tools=" + toml_array(server.actions));
-        overlay("default_tools_approval_mode=\"approve\"");
+    if (control) {
+        acknowledgment.connection_version = addon::k_delegated_connection_version;
+        for (const auto& server : control->servers) {
+            const auto nonce = addon::random_nonce_hex();
+            task_servers.push_back("logonomic_" + nonce);
+            const std::string key = "mcp_servers." + task_servers.back() + ".";
+            const auto& connection = *control->connection;
+            const std::vector<std::string> arguments{
+                "--descriptor", connection.descriptor_path, "--server", server.server_id};
+            acknowledgment.server_ids.push_back(server.server_id);
+            const auto overlay = [&](std::string value) {
+                result.process.argv.push_back("-c");
+                result.process.argv.push_back(key + std::move(value));
+            };
+            overlay("command=" + toml_string(connection.relay_program));
+            overlay("args=" + toml_array(arguments));
+            overlay("required=true");
+            overlay("enabled_tools=" + toml_array(server.actions));
+            overlay("default_tools_approval_mode=\"approve\"");
+        }
     }
     // Native exec can replace root -c options with its own -c list. Keep every
     // overlay at the root, and verify the complete configuration we will run.
-    if (review || (request->model_selection && request->model_selection->reasoning_effort)) {
-        const auto config = delegated_configuration(*launch, *request, profile->profile_path, result.process.argv, context);
+    if (review || (selection && selection->reasoning_effort)) {
+        const auto config = session_configuration(*launch, request, profile->profile_path, result.process.argv, context);
         if (review) {
-            auto status = review_configuration_status(config, request->model_selection);
+            auto status = review_configuration_status(config, selection);
             if (status == Review_preparation_status::READY && !review_servers_constrained(*config, task_servers)) {
                 status = Review_preparation_status::UNAVAILABLE;
             }
@@ -747,7 +744,7 @@ void prepare_delegated(addon::Invocation_context& context)
             }
         }
         else
-        if (!config || !requested_effort_applied(*config, request->model_selection)) {
+        if (!config || !requested_effort_applied(*config, selection)) {
             context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
                 context.cancel_requested() ? "cancelled" :
                 config ? "reasoning_effort_unavailable" : "model_selection_unavailable",
@@ -759,13 +756,12 @@ void prepare_delegated(addon::Invocation_context& context)
     if (review) {
         result.process.argv.insert(result.process.argv.end(), {"--sandbox", "read-only", "--ignore-rules"});
     }
-    if (request->model_selection && request->model_selection->model) {
-        result.process.argv.insert(result.process.argv.end(), {"--model", *request->model_selection->model});
+    if (selection && selection->model) {
+        result.process.argv.insert(result.process.argv.end(), {"--model", *selection->model});
     }
-    result.acknowledgment.connection_version = addon::k_delegated_connection_version;
     result.process.argv.push_back("-");
     result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
-    result.process.stdin_payload  = request->prompt;
+    result.process.stdin_payload  = request.prompt;
     result.process.environment    = launch->environment;
     result.process.environment.emplace_back("CODEX_HOME", profile->profile_path);
     result.process.environment_names = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "SystemRoot", "WINDIR", "TEMP", "TMP", "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "NODE_OPTIONS", "NODE_PATH", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS"};
@@ -775,12 +771,46 @@ void prepare_delegated(addon::Invocation_context& context)
     });
     result.inspection.incremental    = true;
     result.inspection.protocol_state = initial_implementation_state();
-    auto payload = addon::encode_delegated_prepare_result(result);
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    auto payload = control
+        ? addon::encode_delegated_prepare_result({std::move(result.process), std::move(acknowledgment), {},
+              std::move(result.inspection), result.profile_storage, result.account_context, selection})
+        : addon::encode_structured_prepare_result(result);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
     context.succeed(std::move(payload));
+}
+
+void prepare_structured(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    const auto request = addon::decode_structured_prepare_request(context.request().payload, &failure);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+        return;
+    }
+    prepare_session(context, *request, nullptr, std::nullopt);
+}
+
+void prepare_delegated(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+        return;
+    }
+    if (!request->control.connection) {
+        context.fail(addon::Result_status::UNAVAILABLE, "task_server_connection_unavailable");
+        return;
+    }
+    prepare_session(context, {request->purpose, std::move(request->context), std::move(request->prompt)},
+        &request->control, request->model_selection);
 }
 
 } // namespace
@@ -940,7 +970,11 @@ void handle_preparation(addon::Invocation_context& context)
         prepare_interactive(context);
         return;
     }
-    context.fail(addon::Result_status::UNAVAILABLE, "delegated_control_required");
+    if (context.request().capability.capability_id == "structured-session") {
+        prepare_structured(context);
+        return;
+    }
+    context.reject_unknown_operation();
 }
 
 } // namespace codex
