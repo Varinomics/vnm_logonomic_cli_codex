@@ -99,10 +99,11 @@ bool hidden_entry(const fs::directory_entry& entry)
 #endif
 }
 
-void visit_rollouts(const fs::path& profile, const std::function<bool()>& cancelled,
+bool visit_rollouts(const fs::path& profile, const std::function<bool()>& cancelled,
     const std::function<void(const fs::path&)>& consume)
 {
     require(fs::is_directory(profile), "usage_sessions_unavailable");
+    bool incomplete = false;
     for (const auto* name : {"sessions", "archived_sessions"}) {
         check_cancel(cancelled);
         const auto root = profile / name;
@@ -118,11 +119,20 @@ void visit_rollouts(const fs::path& profile, const std::function<bool()>& cancel
                 continue;
             }
             const auto filename = addon::ascii_lowercase(entry.path().filename().string());
-            if (entry.is_regular_file() && filename.starts_with("rollout-") && filename.ends_with(".jsonl")) {
+            if (!filename.starts_with("rollout-") || !entry.is_regular_file()) continue;
+            if (filename.ends_with(".jsonl")) {
                 consume(entry.path());
+            }
+            else if (filename.ends_with(".jsonl.zst")) {
+                // Codex prefers the plain sibling during a compression transition.
+                // A compressed-only source can contain turns we have never accepted.
+                auto plain = entry.path();
+                plain.replace_extension();
+                if (!fs::is_regular_file(plain) || hidden_entry(fs::directory_entry(plain))) incomplete = true;
             }
         }
     }
+    return incomplete;
 }
 
 bool read_line(std::istream& input, std::string* line)
@@ -1465,7 +1475,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     Record_sorter unindexed_rollouts(work, "unindexed-run", limits.sort_run_bytes, working, spool_key(), false);
     std::uint64_t ordinal = 0;
     progress.begin("Reading Codex sessions");
-    visit_rollouts(vendor_profile, working, [&](const fs::path& path) {
+    const bool compressed_only = visit_rollouts(vendor_profile, working, [&](const fs::path& path) {
         const auto source = path_text(fs::absolute(path).lexically_normal());
         auto rollout = addon::Json_value::object();
         rollout.set("source", addon::Json_value(source));
@@ -1478,7 +1488,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     bool reparsed = false;
     bool incomplete = reconcile_rollouts(work, accepted_rollouts, found_rollouts_path,
         request.mode != "incremental", parsed, rollout_peers, unindexed_rollouts,
-        progress, working, &metadata_changed, &reparsed, !incremental);
+        progress, working, &metadata_changed, &reparsed, !incremental) || compressed_only;
     if (reordered_rollouts) {
         accepted_rollouts.reset();
         fs::remove(*reordered_rollouts);
