@@ -485,7 +485,10 @@ void selected_cache_preserves_accepted_cache_write_coverage(const fs::path& fixt
     fs::create_directory(storage);
     const auto path = profile / "sessions" / "rollout-cache-write.jsonl";
     const auto history = [](int total) {
-        return metadata() + start("first") + tokens(total, ",\"cache_write_input_tokens\":9") + complete("first");
+        // The preceding native observation proves that growth belongs to this
+        // turn so the scanner may replace its total.
+        return metadata() + tokens(0, ",\"cache_write_input_tokens\":0") + start("first") +
+            tokens(total, ",\"cache_write_input_tokens\":9") + complete("first");
     };
     write(path, history(35));
     addon::Usage_scan_request request;
