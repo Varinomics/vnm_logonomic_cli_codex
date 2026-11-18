@@ -334,8 +334,8 @@ has exited.
 
 Authentication, quota, account discovery and per-turn usage scanning preserve the
 native integration's semantics. Historical account, resume and usage imports
-match the exact `codex` provider attribution. Lifecycle support requires Codex 0.146.0 or newer; delegated
-implementation requires 0.150.1 or newer. Version checks have no upper bound,
+match the exact `codex` provider attribution. Lifecycle support requires Codex
+0.146.0 or newer. Structured execution requires 0.150.1 or newer. Version checks have no upper bound,
 and accepted protocol records still undergo structural and identity validation.
 
 With `current-account@1` negotiated, authentication uses the selected launcher's

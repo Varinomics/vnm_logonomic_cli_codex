@@ -26,7 +26,8 @@ with CTest. Run them from the configured build directory after building the
 corresponding targets.
 
 To check standalone execution against an installed native Codex, run
-`python tests/codex_native_structured_tests.py --package <indexed-package> --codex <native-executable>`.
+`python tests/codex_native_structured_tests.py --package <indexed-package> --codex <native-executable> --scratch-root <test-directory>`.
+Choose a scratch directory readable by the native command sandbox.
 The test uses disposable profiles and a loopback Responses server. Each run
 checks a shell read, verifies whether the native sandbox allowed the repository
 write, and inspects the final Codex output through the packaged adapter.
