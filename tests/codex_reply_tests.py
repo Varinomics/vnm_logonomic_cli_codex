@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 
 
@@ -39,18 +40,21 @@ class Adapter:
         assert frame, "adapter closed before its response"
         return json.loads(frame)
 
-    def classify(self, delivery, *, attention=True, pending=None, epoch=2, model=False):
-        self.serial += 1
-        request_id = "r" + str(self.serial)
+    def classify(self, delivery, *, attention=True, pending=None, epoch=2, model=False,
+                 ledger=None, title=None, capability=None):
         payload = {"event": delivery["event"], "transition_nonce": delivery["transition_nonce"],
-            "ledger": {"current_epoch": epoch, "current_transition": {
+            "ledger": ledger or {"current_epoch": epoch, "current_transition": {
                 "kind": "start", "provider_session_id": "native-session", "nonce": "7" * 32}}}
         if pending is not None:
             payload["pending_conversational_request_id"] = pending
         if model:
             payload["model_state"] = {"version": 1}
+        if title is not None:
+            payload["terminal_identity"] = title
+        self.serial += 1
+        request_id = "r" + str(self.serial)
         self.send({"type": "invoke", "request_id": request_id,
-            "capability_id": "attention-kind" if attention else "helper-ingress",
+            "capability_id": capability or ("attention-kind" if attention else "helper-ingress"),
             "version": 1 if attention else 2, "operation": "classify_event", "deadline_ms": 5000,
             "payload": payload})
         while True:
@@ -63,6 +67,147 @@ class Adapter:
         self.send({"type": "shutdown", "grace_ms": 5000})
         self.process.stdin.close()
         assert self.process.wait(timeout=10) == 0
+
+
+class Model_host:
+    """Return the running adapter's classification receipt to the synchronous helper."""
+
+    def __init__(self, executable, directory, title_first=True):
+        self.directory = Path(directory)
+        self.directory.mkdir(exist_ok=True)
+        self.adapter = Adapter(executable)
+        self.title_first = title_first
+        self.title = None
+        self.epoch = 0
+        self.session = None
+        self.nonce = None
+        self.kind = None
+        self.updates = []
+        self.deliveries = []
+        self.stopped = threading.Event()
+        self.failure = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stopped.set()
+        self.thread.join(5)
+        self.adapter.close()
+        if self.failure:
+            raise self.failure
+
+    def ledger(self):
+        transition = {"provider_session_id": self.session, "nonce": self.nonce, "kind": self.kind}
+        return {"current_epoch": self.epoch, "current_transition": transition if self.epoch else None}
+
+    def select(self, session):
+        self.title = {"version": 1, "context": {"version": 1, "native_version": "0.169.0",
+            "native_store": {"version": 1, "codex_home": str(self.directory), "sqlite_home": str(self.directory)}},
+            "terminal_event": {"terminal_id": "1", "generation": "1", "source": "logonomic_terminal_worker",
+                "stream": "terminal", "stream_index": 0, "timestamp": 1,
+                "payload": {"kind": "terminal_title_changed", "title_sequence": str(self.epoch + 1),
+                    "title": session[:29] + "... | " + session}}}
+        delivery = {"event": {"name": "NativeSignal", "body": {"origin": "host_terminal"}},
+            "transition_nonce": uuid.uuid4().hex}
+        result = self.adapter.classify(delivery, ledger=self.ledger(), title=self.title,
+            capability="terminal-identity")
+        assert result["terminal_identity"]["provider_session_id"] == session, result
+        self.commit(delivery, result)
+
+    def commit(self, delivery, result):
+        if result["classification"] == "transition":
+            self.session = result["observations"][0]["provider_session_id"]
+            self.nonce = delivery["transition_nonce"]
+            self.kind = result["transition"]["kind"]
+            self.epoch += 1
+
+    def serve(self):
+        try:
+            while not self.stopped.is_set():
+                for path in self.directory.glob("*.request"):
+                    delivery = json.loads(path.read_text(encoding="utf-8"))
+                    path.unlink()
+                    event = delivery["event"]
+                    if self.title_first and not self.epoch and event["name"] == "SessionStart":
+                        self.select(event["body"]["session_id"])
+                    result = self.adapter.classify(delivery, model=True, title=self.title, ledger=self.ledger())
+                    self.commit(delivery, result)
+                    self.deliveries.append((delivery, result))
+                    self.updates.extend(result.get("model_state", {}).get("updates", []))
+                    response = {"accepted": True, "epoch": self.epoch}
+                    if result.get("helper_response") is not None:
+                        response["helper_response"] = result["helper_response"]
+                    pending = path.with_suffix(".replying")
+                    pending.write_text(json.dumps(response), encoding="utf-8")
+                    pending.replace(path.with_suffix(".response"))
+                self.stopped.wait(0.005)
+        except Exception as error:
+            self.failure = error
+
+
+def model_source_contract(executable, directory, environment, deliver):
+    root = "019933a1-6e43-7102-a520-b3c8294cc763"
+    child = "019944b2-7f54-7203-b631-c4d93a5dd874"
+    other = "019955c3-8065-7304-a742-d5ea4b6ee985"
+    turns = [f"019955c3-8065-7304-a742-{index:012x}" for index in range(1, 6)]
+
+    def rollout(actor):
+        return str(directory / f"rollout-session-{actor}.jsonl")
+
+    start = {"hook_event_name": "SessionStart", "session_id": root, "source": "startup",
+        "transcript_path": rollout(root), "model": "gateway/start"}
+    prompt = {"hook_event_name": "UserPromptSubmit", "session_id": root, "transcript_path": rollout(root)}
+    child_start = {"hook_event_name": "SubagentStart", "session_id": root, "agent_id": child,
+        "agent_type": "explorer", "transcript_path": rollout(child), "turn_id": turns[0], "model": "gateway/child"}
+    for title_first in (True, False):
+        carrier = directory / ("title-first" if title_first else "hook-first")
+        scratch = directory / "Modèles-工作" / carrier.name
+        scratch.mkdir(parents=True)
+        environment["CODEX_TEST_CLASSIFIER_DIRECTORY"] = str(carrier)
+        environment["VNM_CODEX_MODEL_SOURCE"] = str(scratch / "receipt.sqlite")
+        with Model_host(executable, carrier, title_first) as host:
+            initial = deliver(start)
+            assert host.epoch == 1 and host.session == root
+            assert host.deliveries[-1][1]["helper_response"] == {"model_activation": host.nonce}
+            assert (initial["transition_nonce"] != host.nonce) == title_first
+            assert [update["model"] for update in host.updates] == ([] if title_first else [start["model"]])
+            expected = len(host.updates)
+
+            first = deliver({**prompt, "turn_id": turns[0], "model": "gateway/first"})
+            deliver(child_start)
+            deliver({**prompt, "agent_id": child, "turn_id": turns[1],
+                "transcript_path": rollout(child), "model": "gateway/child-next"})
+            deliver({**prompt, "turn_id": turns[2], "model": "gateway/next"})
+            actual = [(u["agent_id"], u["model"], u["sequence"]) for u in host.updates[expected:]]
+            assert actual == [("", "gateway/first", "1"), (child, "gateway/child", "1"),
+                (child, "gateway/child-next", "2"), ("", "gateway/next", "2")], actual
+            assert all(u["provider_session_id"] == root and u["transition_nonce"] == host.nonce
+                and not u.get("provider") for u in host.updates)
+            expected = len(host.updates)
+            for event in (
+                {**prompt, "turn_id": turns[1], "model": "older"},
+                {**prompt, "turn_id": turns[2], "model": "duplicate"},
+                {**prompt, "turn_id": turns[3], "model": "foreign-rollout", "transcript_path": rollout(other)},
+                {**prompt, "turn_id": turns[3], "model": "foreign-actor", "agent_id": child},
+                {**prompt, "turn_id": turns[3], "model": "foreign-root", "session_id": other},
+                {**prompt, "turn_id": turns[3], "model": "ambiguous-actor", "agent_id": root},
+            ):
+                deliver(event)
+            assert len(host.updates) == expected
+            old_nonce = host.nonce
+            host.select(other)
+            host.select(root)
+            assert host.nonce != old_nonce
+            replay = host.adapter.classify(first, ledger=host.ledger(), model=True)
+            assert "model_state" not in replay
+            deliver(start)
+            assert not host.deliveries[-1][1].get("helper_response")
+            delivered = deliver({**prompt, "turn_id": turns[4], "model": "retired"})
+            assert delivered["event"]["body"]["model_state"]["updates"][0]["transition_nonce"] == old_nonce
+            assert len(host.updates) == expected
 
 
 def reply_contract(helper, wrapper, executable, directory):
@@ -216,6 +361,7 @@ def reply_contract(helper, wrapper, executable, directory):
         assert "attention_kind" not in adapter.classify(answer)
     finally:
         adapter.close()
+    model_source_contract(executable, directory, environment, deliver)
 
 
 if __name__ == "__main__":

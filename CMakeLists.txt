@@ -83,6 +83,7 @@ add_library(codex_provider STATIC
     src/codex_launcher.cpp
     src/codex_launcher_approval.cpp
     src/codex_lifecycle.cpp
+    src/codex_model_source.cpp
     src/codex_preparation.cpp
     src/codex_probes.cpp
     src/codex_quota_exchange.cpp
@@ -173,6 +174,7 @@ add_executable(codex_adapter src/adapter.cpp)
 target_link_libraries(codex_adapter PRIVATE codex_provider)
 codex_target(codex_adapter)
 add_executable(codex_helper src/codex_helper.cpp)
+target_link_libraries(codex_helper PRIVATE codex_provider)
 codex_target(codex_helper)
 add_executable(codex_pet_helper src/codex_pet_helper.cpp src/codex_pet_inspection.cpp)
 codex_target(codex_pet_helper)

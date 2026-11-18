@@ -5,6 +5,7 @@
 #include "codex_terminal_identity.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/model_state.h>
@@ -429,6 +430,28 @@ std::optional<addon::Classify_event_result> classify_hook(
     if (std::find(supported.begin(), supported.end(), *name) == supported.end()) {
         return result;
     }
+    if (request.model_state_version == addon::k_model_state_version && !request.model_failure &&
+        (*name == "UserPromptSubmit" || *name == "SubagentStart") && body.find("model_state"))
+    {
+        addon::decode_model_updates(body, result.model_updates, result.model_failure);
+        const auto& transition = request.ledger.current_transition;
+        const auto actor = addon::json::text(body, "agent_id");
+        if (result.model_updates.size() != 1 || !transition ||
+            (*name == "SubagentStart" && actor.empty()) || (body.find("agent_id") && actor.empty()))
+        {
+            result.model_updates.clear();
+        }
+        else {
+            const auto& sample = result.model_updates.front();
+            if (sample.provider_session_id != addon::json::text(body, "session_id") ||
+                sample.provider_session_id != transition->provider_session_id || sample.transition_nonce != transition->nonce ||
+                sample.agent_id != actor || sample.sequence == 0 || sample.status != addon::Model_status::CONFIRMED ||
+                sample.source != "codex." + *name || !sample.provider.empty() || sample.reasoning_effort)
+            {
+                result.model_updates.clear();
+            }
+        }
+    }
     if (*name != "SubagentStart" && *name != "SubagentStop" && body.find("agent_id")) {
         return result;
     }
@@ -467,6 +490,16 @@ std::optional<addon::Classify_event_result> classify_hook(
         result.classification = addon::Classification::TRANSITION;
         result.transition = source && *source == "resume" ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
         observation.session_source = source.value_or("");
+        // Enrol only the first, newly-created native root. The committed
+        // response reaches its synchronous hook before Codex samples turns.
+        if (request.model_state_version == addon::k_model_state_version && !request.model_failure &&
+            source == "startup" && canonical_session_id(*session) &&
+            ((!request.ledger.current_transition && request.ledger.current_epoch == 0) ||
+             (already_selected && request.ledger.current_epoch == 1)))
+        {
+            const auto& nonce = already_selected ? request.ledger.current_transition->nonce : request.transition_nonce;
+            result.helper_response = addon::json::object({{"model_activation", addon::Json_value(nonce)}});
+        }
         if (!already_selected && request.model_state_version == addon::k_model_state_version &&
             !request.model_failure)
         {

@@ -4,6 +4,7 @@
 #include "codex_conversation.h"
 #include "codex_conversation_source.h"
 #include "codex_launcher.h"
+#include "codex_model_source.h"
 #include "codex_startup_probe.h"
 #include "codex_session_wake.h"
 #include "codex_resume_record.h"
@@ -247,6 +248,12 @@ void prepare_interactive(addon::Invocation_context& context)
     addon::Launch_patch patch;
     patch.set             = launch->environment;
     patch.set.emplace_back("CODEX_HOME", profile->profile_path);
+    if (auto path = model_source_path()) {
+        patch.set.emplace_back(k_model_source_environment, std::move(*path));
+    }
+    else {
+        patch.unset.emplace_back(k_model_source_environment);
+    }
     patch.argv            = launch->argv;
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
@@ -423,6 +430,7 @@ void prepare_resume(addon::Invocation_context& context)
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
     result.patch.set = launch->environment;
     result.patch.set.emplace_back("CODEX_HOME", profile->profile_path);
+    result.patch.unset.emplace_back(k_model_source_environment);
     std::string authorization = request->startup_observer->authorization;
     std::string encoded;
     for (const char character : authorization) encoded += character == ' ' ? "%20" : std::string(1, character);
