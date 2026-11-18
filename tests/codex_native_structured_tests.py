@@ -60,6 +60,7 @@ class Local_model(BaseHTTPRequestHandler):
 def run(purpose, package, executable, root):
     home = root / "profile"
     workspace = root / "repository"
+    temporary = root / "temp"
     if os.name == "nt":
         # Model a normal repository with its parent directory's inherited
         # access rules. Python 3.13 otherwise creates a private temporary ACL.
@@ -67,6 +68,7 @@ def run(purpose, package, executable, root):
                        capture_output=True, check=True)
     home.mkdir(mode=0o700)
     workspace.mkdir()
+    temporary.mkdir()
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     (workspace / "read-control").write_text("VISIBLE", encoding="utf-8")
     (workspace / "probe.py").write_text(
@@ -89,9 +91,10 @@ def run(purpose, package, executable, root):
         '[model_providers.local]\nname="test"\n'
         f'base_url="http://127.0.0.1:{server.server_port}/v1"\n'
         'wire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n', encoding="utf-8")
-    env = {key: os.environ[key] for key in ("PATH", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP")
+    env = {key: os.environ[key] for key in ("PATH", "PATHEXT", "SystemRoot", "WINDIR")
            if key in os.environ}
     env.update({"HOME": str(root), "USERPROFILE": str(root), "CODEX_HOME": str(home),
+                "TEMP": str(temporary), "TMP": str(temporary),
                 "PATH": str(executable.parent) + os.pathsep + str(Path(sys.executable).parent) +
                         os.pathsep + env.get("PATH", "")})
     platform = "windows-x86_64" if os.name == "nt" else ("macos-arm64" if sys.platform == "darwin" else "linux-x86_64")
