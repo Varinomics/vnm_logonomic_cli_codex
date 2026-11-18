@@ -279,6 +279,12 @@ void prepare_interactive(addon::Invocation_context& context)
             "The launch with the initial prompt is not a valid replacement: " + failure.detail);
         return;
     }
+    // Native configuration is optional, so its interrupted probe can still
+    // leave a valid patch. Cancellation withdraws the whole launch.
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 

@@ -55,8 +55,12 @@ public:
     bool done = false;
     std::string failure_detail;
     std::optional<std::chrono::steady_clock::time_point> cancel_at;
+    fs::path cancel_when_created;
     const addon::Invoke_request& request() const override { return input; }
-    bool cancel_requested() const override { return cancel_at && std::chrono::steady_clock::now() >= *cancel_at; }
+    bool cancel_requested() const override {
+        return (cancel_at && std::chrono::steady_clock::now() >= *cancel_at) ||
+            (!cancel_when_created.empty() && fs::exists(cancel_when_created));
+    }
     bool wait_for_cancel(int timeout) override { std::this_thread::sleep_for(std::chrono::milliseconds(timeout)); return false; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
     void succeed(addon::Json_value value) override { succeeded = true; done = true; output = std::move(value); }
@@ -900,6 +904,14 @@ int main(int argc, char** argv)
         account.adapter_account_key = codex::profile_account_key(utf8(root));
         account.profile_path        = utf8(root);
         prepare.account_context     = account;
+        auto interrupted = prepare;
+        Context cancelled_configuration;
+        cancelled_configuration.cancel_when_created = root / "cancel-config-read.jsonl";
+        interrupted.launch_environment->effective_environment.set("CODEX_FIXTURE_WAKE_LOG",
+            addon::Json_value(utf8(cancelled_configuration.cancel_when_created)));
+        prepare_launch(cancelled_configuration, interrupted);
+        require(!cancelled_configuration.succeeded && cancelled_configuration.output == addon::Json_value("cancelled"),
+            "Cancellation during native configuration must withdraw the launch");
         title_configuration_launches(prepare, root);
         identity_title_launches(prepare, root);
         title_configuration_bounds(prepare);
