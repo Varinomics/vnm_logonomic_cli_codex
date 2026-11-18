@@ -25,6 +25,12 @@ implementation-protocol, account/probe and usage contract fixtures are registere
 with CTest. Run them from the configured build directory after building the
 corresponding targets.
 
+To check standalone execution against an installed native Codex, run
+`python tests/codex_native_structured_tests.py --package <indexed-package> --codex <native-executable>`.
+The test uses disposable profiles and a loopback Responses server. Each run
+checks a shell read, verifies whether the native sandbox allowed the repository
+write, and inspects the final Codex output through the packaged adapter.
+
 `codex_terminal_identity_tests` is a standalone provider contract target with
 the real provider and SQLite dependencies. Its idle `/clear` regression does
 not require a packaged artifact or a model turn. Passing it does not establish
