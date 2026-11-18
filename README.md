@@ -20,7 +20,7 @@ and reasoning effort for that invocation; read-only review constrains command
 execution and external tools. Native executable and stock npm launcher chains are
 verified before interactive or delegated preparation.
 
-Lifecycle support requires Codex 0.146.0 or newer; delegated implementation
+Lifecycle support requires Codex 0.146.0 or newer. Structured execution
 requires 0.150.1 or newer. These minimums are capability requirements, not an
 upper compatibility limit. Required native options and protocol records are
 still validated.
