@@ -368,9 +368,9 @@ sanitized observations, and the host owns cancellation, each observation deadlin
 and final retirement. Hosts without the shared capability also keep the separate
 quota and AUTH processes.
 
-## Delegated implementation permissions
+## Structured implementation permissions
 
-A delegated implementation runs as `codex <launcher options> exec`. Its sandbox
+A standalone or delegated implementation runs as `codex <launcher options> exec`. Its sandbox
 comes from the launcher's explicit sandbox flags, `--yolo`, configuration and
 profile under native precedence. Native `exec` cannot request human approval,
 so preparation refuses an explicit `--ask-for-approval on-request` instead of
@@ -387,6 +387,11 @@ needs a launcher or configuration that allows writes, for example
 `-c sandbox_mode="workspace-write"`. Without `--yolo`, `codex exec` runs only
 inside a Git repository, so preparation refuses another working directory with
 `untrusted_working_directory`.
+
+Standalone implementation and review use the frozen launcher, workspace and
+prompt. An explicit account selects its granted profile. With no account
+selection, the add-on resolves the profile from the frozen launch environment.
+Only delegated sessions receive task-control MCP servers.
 
 ## Delegated model selection and read-only review
 

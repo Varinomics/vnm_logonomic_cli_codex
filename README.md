@@ -8,8 +8,8 @@ is installed separately.
 
 The package recognizes Codex launchers and selected `CODEX_HOME` accounts,
 prepares interactive launches and exact resume, supplies authenticated hooks,
-and supports delegated implementation and read-only review, authentication,
-quota and per-turn usage.
+and supports standalone and delegated implementation and read-only review.
+It also reports authentication, quota and per-turn usage.
 
 ## Use with Logonomic
 
