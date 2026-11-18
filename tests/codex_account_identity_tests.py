@@ -84,7 +84,14 @@ def check_profiles(adapter, root):
     upper = root / "Work"
     lower = root / "work"
     if os.name == "nt":
-        check_win32_profile_selection(adapter, root)
+        alias_root = root.parent / "profile-selectors"
+        alias_root.mkdir()
+        try:
+            check_win32_profile_selection(adapter, alias_root)
+        finally:
+            # The ordinary account tests need an empty directory to enable
+            # per-directory case sensitivity. Remove literal names verbatim.
+            shutil.rmtree("\\\\?\\" + str(alias_root))
         ordinary = root.parent / "Ordinary"
         ordinary.mkdir()
         expected = "profile-" + hashlib.sha256(ordinary.as_posix().lower().encode()).hexdigest()
@@ -130,12 +137,6 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve() / "profiles"
             parent.mkdir()
-            try:
-                sys.exit(check_profiles(adapter, parent))
-            finally:
-                if os.name == "nt":
-                    # Literal trailing-dot/space directories need a namespace
-                    # path for removal, just as they did for creation.
-                    shutil.rmtree("\\\\?\\" + str(parent))
+            sys.exit(check_profiles(adapter, parent))
     finally:
         adapter.close()
