@@ -82,11 +82,14 @@ void handle_account_pet(addon::Invocation_context& context)
         return;
     }
     const auto& account = request->account_context;
-    if (!account.profile_path || !account_matches_profile(account, *account.profile_path)) {
+    const auto selected = granted_profile(account, account.profile_path.value_or(""));
+    if (!selected) {
         context.fail(addon::Result_status::UNAVAILABLE, "account_context_mismatch");
         return;
     }
-    auto inspected = inspect_with_helper(*request, context);
+    auto resolved = *request;
+    resolved.account_context.profile_path = selected->profile_path;
+    auto inspected = inspect_with_helper(resolved, context);
     if (context.cancel_requested()) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
@@ -97,6 +100,7 @@ void handle_account_pet(addon::Invocation_context& context)
         unavailable.unavailable_reason = "pet_inspection_unavailable";
         inspected = std::move(unavailable);
     }
+    inspected->account_context = account;
     context.succeed(addon::encode_account_pet_inspect_result(*inspected));
 }
 
