@@ -14,7 +14,10 @@ entry point, Node runtime, package versions and native platform binary.
 Codex profile IDs follow the native directory's case rules on Windows.
 Ordinary case-insensitive profiles retain their issued IDs. A saved account
 with its original profile path can still identify that exact directory after
-a case-sensitive lookup becomes available. On POSIX a `CODEX_HOME` containing
+a case-sensitive lookup becomes available. Windows account discovery and
+history reads use the same directory children that Codex opens for an ordinary
+or namespace-prefixed profile selector, including names ending in a space or
+period. On POSIX a `CODEX_HOME` containing
 `..` after a directory symlink follows the same parent as the native CLI.
 
 ## Hooks and guidance

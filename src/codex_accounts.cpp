@@ -40,10 +40,54 @@ std::string ascii_lower(std::string text)
     return text;
 }
 
+#ifdef _WIN32
+fs::path win32_full_path(const fs::path& path)
+{
+    const auto size = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (!size) return {};
+    std::wstring name(size, L'\0');
+    const auto length = GetFullPathNameW(path.c_str(), size, name.data(), nullptr);
+    if (!length || length >= size) return {};
+    name.resize(length);
+    return name;
+}
+
+fs::path dos_path(const fs::path& path)
+{
+    const auto& name = path.native();
+    if (!name.starts_with(LR"(\\?\)") && !name.starts_with(LR"(\\.\)")) return path;
+    if (name.substr(4, 4) == L"UNC\\") return L"\\\\" + name.substr(8);
+    return name.size() >= 7 && name[5] == L':' && name[6] == L'\\' ? fs::path(name.substr(4)) : path;
+}
+
+fs::path windows_profile(const fs::path& path)
+{
+    // Codex canonicalizes the supplied directory, strips a drive/UNC namespace
+    // prefix, then opens its children. Win32 applies different rules to a final
+    // component and the same component followed by a child.
+    const auto input = win32_full_path(fs::path(path).make_preferred());
+    if (input.empty()) return {};
+    std::error_code error;
+    const auto canonical = fs::canonical(input, error);
+    const auto ordinary = dos_path(error ? input : canonical);
+    if (error) return win32_full_path(ordinary) == ordinary ? ordinary : input;
+    const auto child = win32_full_path(ordinary / L"config.toml");
+    if (child.empty()) return {};
+    const auto directory = child.parent_path();
+    if (win32_full_path(directory) == directory) return directory;
+    // Preserve an exact name such as a trailing space when CODEX_HOME is
+    // subsequently passed to Codex as a directory selector again.
+    const auto& name = directory.native();
+    return name.starts_with(L"\\\\") ? LR"(\\?\UNC\)" + name.substr(2) : LR"(\\?\)" + name;
+}
+#endif
+
 fs::path normalized_profile(const fs::path& path)
 {
     if (!path.is_absolute()) return {};
-#ifndef _WIN32
+#ifdef _WIN32
+    return windows_profile(path);
+#else
     // Native lookup traverses a directory symlink before applying a following
     // "..". Keep prospective leaf names while resolving that existing prefix.
     auto suffix = path.end();
@@ -58,8 +102,8 @@ fs::path normalized_profile(const fs::path& path)
         for (; suffix != path.end(); ++suffix) resolved /= *suffix;
         return resolved.lexically_normal();
     }
-#endif
     return path.lexically_normal();
+#endif
 }
 
 std::string account_key(std::optional<std::string> identity)
@@ -119,15 +163,20 @@ std::string profile_account_key(std::string_view absolute_path)
     return account_key(addon::native_account_profile_identity(path));
 }
 
-bool account_matches_profile(const addon::Account_context& account, std::string_view selected_path)
+std::optional<Profile_selection> granted_profile(const addon::Account_context& account, std::string_view selected_path)
 {
-    if (!account.profile_path || account.adapter_account_key.empty()) return false;
+    if (!account.profile_path || account.adapter_account_key.empty()) return {};
+    const auto original = addon::path_from_utf8(*account.profile_path).lexically_normal();
     const auto granted  = normalized_profile(addon::path_from_utf8(*account.profile_path));
     const auto selected = normalized_profile(addon::path_from_utf8(selected_path));
-    if (!addon::same_native_account_profile(granted, selected)) return false;
-    if (account.adapter_account_key == account_key(addon::native_account_profile_identity(selected))) return true;
-    return account.version == 2 &&
-        account.adapter_account_key == account_key(addon::historical_account_profile_identity(granted, selected));
+    if (granted.empty() || selected.empty() || !addon::same_native_account_profile(granted, selected)) return {};
+    const bool current = account.adapter_account_key == account_key(addon::native_account_profile_identity(selected));
+    // Old keys were issued from the spelling in the grant. Its selected
+    // native root has already been checked against the independent locator.
+    const bool historical = !current && account.version == 2 &&
+        account.adapter_account_key == account_key(addon::historical_account_profile_identity(original, original));
+    if (!current && !historical) return {};
+    return Profile_selection{account.adapter_account_key, path_text(selected)};
 }
 
 std::optional<Profile_selection> profile_selection(const addon::Launch_environment& environment,
@@ -158,7 +207,7 @@ std::optional<Profile_selection> profile_from_environment(const addon::Launch_en
     if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;
     path = normalized_profile(path);
     if (!path.is_absolute()) { *error = "profile_path_invalid"; return std::nullopt; }
-    Profile_selection selected{profile_account_key(path_text(path)), path_text(path)};
+    Profile_selection selected{account_key(addon::native_account_profile_identity(path)), path_text(path)};
     if (selected.adapter_account_key.empty()) { *error = "profile_path_invalid"; return std::nullopt; }
     return selected;
 }
@@ -170,8 +219,8 @@ std::optional<Profile_selection> selected_profile(const addon::Session_launch_co
         context.fail(addon::Result_status::UNAVAILABLE, "account_profile_unavailable");
         return std::nullopt;
     }
-    Profile_selection selected{request.account_context->adapter_account_key, *request.account_context->profile_path};
-    if (!account_matches_profile(*request.account_context, selected.profile_path)) {
+    const auto selected = granted_profile(*request.account_context, *request.account_context->profile_path);
+    if (!selected) {
         context.fail(addon::Result_status::UNAVAILABLE, "account_context_mismatch");
         return std::nullopt;
     }

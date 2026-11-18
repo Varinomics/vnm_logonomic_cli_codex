@@ -1,8 +1,10 @@
 """Verify packaged Codex account discovery against native directory lookup."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,10 +39,52 @@ def discover(adapter, root, home):
     return account
 
 
+def check_win32_profile_selection(adapter, root):
+    def extended(path):
+        return Path("\\\\?\\" + str(path))
+
+    for suffix, label in (("", "plain"), (" ", "space"), (".", "dot")):
+        directory = extended(root / ("Alpha" + suffix))
+        (directory / "sessions").mkdir(parents=True)
+        history = [{"type": "session_meta", "payload": {"id": "native-alias"}},
+                   {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                        "content": "profile-marker-" + label}}]
+        (directory / "sessions" / "rollout-native-alias.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in history), encoding="utf-8")
+    keys = {}
+    for suffix, verbatim, expected in (("", False, "plain"), ("", True, "plain"),
+                                       (" ", False, "plain"), (" ", True, "space"),
+                                       (".", False, "plain"), (".", True, "plain")):
+        selector = root / ("Alpha" + suffix)
+        if verbatim:
+            selector = extended(selector)
+        account = discover(adapter, root, selector)
+        key = account["adapter_account_key"]
+        assert account["status"] == "available"
+        assert keys.setdefault(expected, key) == key
+        current = {"version": 2, "profile_path": account["profile_path"], "adapter_account_key": key}
+        historical = {"version": 2, "profile_path": str(selector),
+                      "adapter_account_key": "profile-" + hashlib.sha256(selector.as_posix().lower().encode()).hexdigest()}
+        for grant in (current, historical):
+            with tempfile.TemporaryDirectory(dir=root) as output:
+                response = invoke(adapter, "conversation-export", 1, "export", {
+                    "provider_session_id": "native-alias", "working_directory": str(root),
+                    "launch_environment": {"platform": "windows-x86_64", "effective_environment": {}},
+                    "format": "text", "output_directory": output, "account_context": grant})
+                assert response["status"] == "success" and response["payload"]["account_context"] == grant, response
+                text = (Path(output) / response["payload"]["file_name"]).read_text(encoding="utf-8")
+                assert "profile-marker-" + expected in text, (selector, text)
+    assert keys["plain"] != keys["space"]
+    pending = root / "Pending"
+    assert discover(adapter, root, str(pending) + " ")["adapter_account_key"] == discover(
+        adapter, root, pending)["adapter_account_key"]
+
+
 def check_profiles(adapter, root):
     upper = root / "Work"
     lower = root / "work"
     if os.name == "nt":
+        check_win32_profile_selection(adapter, root)
         ordinary = root.parent / "Ordinary"
         ordinary.mkdir()
         expected = "profile-" + hashlib.sha256(ordinary.as_posix().lower().encode()).hexdigest()
@@ -86,6 +130,12 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve() / "profiles"
             parent.mkdir()
-            sys.exit(check_profiles(adapter, parent))
+            try:
+                sys.exit(check_profiles(adapter, parent))
+            finally:
+                if os.name == "nt":
+                    # Literal trailing-dot/space directories need a namespace
+                    # path for removal, just as they did for creation.
+                    shutil.rmtree("\\\\?\\" + str(parent))
     finally:
         adapter.close()
