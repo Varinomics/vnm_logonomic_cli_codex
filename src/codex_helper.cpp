@@ -1,4 +1,5 @@
 #include "codex_hook_metadata.h"
+#include "codex_model_source.h"
 #include "codex_conversation_source.h"
 #include "codex_resume_record.h"
 
@@ -100,6 +101,7 @@ int main()
     const auto key   = addon::random_nonce_hex();
     const auto nonce = addon::random_nonce_hex();
     auto metadata = codex::hook_metadata(*event);
+    codex::capture_turn_model(*event, metadata);
     if (name->as_string() == "SessionStart" && !event->find("agent_id")) {
         const auto* session = event->find("session_id");
         const auto* profile = std::getenv("CODEX_HOME");
@@ -120,6 +122,11 @@ int main()
     }
     if (!outcome.committed || !outcome.accepted) {
         std::fputs("Codex hook delivery was not accepted.\n", stderr);
+    }
+    if (outcome.committed && outcome.accepted && outcome.epoch == 1 && outcome.helper_response &&
+        name->as_string() == "SessionStart")
+    {
+        codex::arm_model_source(*event, addon::json::text(*outcome.helper_response, "model_activation"));
     }
     bool title_accepted = true;
     if (!event->find("agent_id") &&

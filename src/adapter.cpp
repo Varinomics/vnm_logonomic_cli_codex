@@ -177,6 +177,7 @@ int main()
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {addon::k_async_question_attention_capability_id, addon::k_async_question_attention_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
+        {addon::k_model_state_capability_id, addon::k_model_state_version},
         {"accounts", 2}, {"auth-status", 2}, {"quota", 2}, {"usage-scan", 3},
         {addon::k_account_pet_capability_id, addon::k_account_pet_version},
         {"current-account", 1},

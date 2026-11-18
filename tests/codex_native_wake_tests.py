@@ -17,9 +17,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class Native:
-    def __init__(self, program, home, cwd, args=()):
+    def __init__(self, program, home, cwd, args=(), *, environment_overrides=None):
         environment = {k: v for k, v in os.environ.items() if not k.upper().startswith(('CODEX_', 'OPENAI_', 'LOGONOMIC_', 'VNM_CONTROL', 'OTEL_'))}
         environment['CODEX_HOME'] = str(home)
+        if environment_overrides:
+            environment.update(environment_overrides)
         self.process = subprocess.Popen([program, *args, 'app-server'], cwd=cwd, env=environment,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
