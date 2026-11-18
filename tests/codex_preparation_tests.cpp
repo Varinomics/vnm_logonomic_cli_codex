@@ -655,9 +655,8 @@ void initial_prompt_launches(
     require_refusal(absent, text, brief, "An unverified Codex program cannot carry the initial prompt");
     Context unverified;
     prepare_launch(unverified, absent);
-    require(!unverified.succeeded && unverified.output.is_string() &&
-        unverified.output.as_string() == addon::reason::k_launcher_program_unavailable,
-        "An unverified launch without an initial prompt keeps its refusal");
+    require(!unverified.succeeded && unverified.output == addon::Json_value("launcher_program_not_found"),
+        "An absent executable must be reported before starting the session");
 
     // Launcher options that fill the argument bounds: the launch fits without
     // the prompt and exceeds them with it. The launcher record's own bound
