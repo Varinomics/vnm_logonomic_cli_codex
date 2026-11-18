@@ -1215,6 +1215,35 @@ int main(int argc, char** argv)
         review.context.launcher_argv = review_launcher.launcher_argv;
         review.context.launch_environment->effective_environment.set("CODEX_FIXTURE_CONFIGURATION",
             addon::Json_value(R"({"mcp_servers":{"external-server":{"enabled":true,"token":"private-canary"}}})"));
+        for (const auto* source : {&plain, &review}) {
+            addon::Structured_prepare_request request{source->purpose, source->context, "Review or implement.\nSecond line."};
+            request.context.profile_storage = addon::Profile_storage_context{1, utf8(root)};
+            Context standalone;
+            standalone.input = {"standalone", {"structured-session", 3}, "prepare",
+                addon::encode_structured_prepare_request(request)};
+            codex::handle_preparation(standalone);
+            const auto spec = addon::decode_structured_prepare_result(standalone.output, &failure);
+            require(standalone.succeeded && spec && addon::validate_structured_process_proposal(spec->process, &failure) &&
+                spec->process.stdin_payload == request.prompt && spec->inspection.incremental &&
+                !spec->inspection.protocol_state.empty() && spec->account_context && spec->profile_storage &&
+                spec->profile_storage->root == utf8(root) &&
+                addon::encode_account_context(*spec->account_context) == addon::encode_account_context(*request.context.account_context),
+                "Standalone preparation binds the selected context, exact prompt and incremental inspection");
+            const auto& arguments = spec->process.argv;
+            require(std::none_of(arguments.begin(), arguments.end(), [](const auto& argument) {
+                return argument.find("mcp_servers.logonomic_") != argument.npos;
+            }), "A standalone process must not receive Task servers");
+            const bool is_review = source->purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
+            require((std::find(arguments.begin(), arguments.end(), "--ignore-rules") != arguments.end()) == is_review &&
+                (!is_review || std::find(arguments.begin(), arguments.end(), "mcp_servers.external-server.enabled=false") != arguments.end()),
+                "Standalone review verifies its read-only ceiling and disables external servers");
+            Context cancelled;
+            cancelled.cancel_at = std::chrono::steady_clock::now();
+            cancelled.input = standalone.input;
+            codex::handle_preparation(cancelled);
+            require(!cancelled.succeeded && cancelled.output == addon::Json_value("cancelled"),
+                "Cancelled standalone preparation cannot publish a process");
+        }
         Context reviewed;
         reviewed.input = {"review", {"delegated-session", 3}, "prepare",
             addon::encode_delegated_prepare_request(review)};
