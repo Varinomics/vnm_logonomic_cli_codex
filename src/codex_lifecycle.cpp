@@ -7,6 +7,7 @@
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/model_state.h>
 #include <logonomic_cli_addon/provider_event_diagnostic.h>
 
 #include <array>
@@ -421,6 +422,7 @@ std::optional<addon::Classify_event_result> classify_hook(
             body.find("hook_event_name"), {}, "matches_event_name"));
     }
     addon::Classify_event_result result;
+    result.model_failure = request.model_failure;
     constexpr std::array<std::string_view, 9> supported{
         "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt", "PermissionRequest",
         "SubagentStart", "SubagentStop", "PostCompact"};
@@ -465,6 +467,29 @@ std::optional<addon::Classify_event_result> classify_hook(
         result.classification = addon::Classification::TRANSITION;
         result.transition = source && *source == "resume" ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
         observation.session_source = source.value_or("");
+        if (!already_selected && request.model_state_version == addon::k_model_state_version &&
+            !request.model_failure)
+        {
+            if (const auto* model = body.find("model")) {
+                addon::Model_update update;
+                update.provider_session_id = *session;
+                update.transition_nonce    = request.transition_nonce;
+                update.status              = addon::Model_status::CONFIRMED;
+                update.source              = "codex.SessionStart";
+                if (model->is_string()) {
+                    update.model = model->as_string();
+                }
+                // The native start supplies its own live model. No backend is
+                // identified, and the joint transition owns sequence zero.
+                if (addon::is_valid_model_update(update)) {
+                    result.model_updates.push_back(std::move(update));
+                }
+                else {
+                    result.model_failure = addon::Contract_failure{
+                        "invalid_model_observation", "Codex SessionStart model is malformed"};
+                }
+            }
+        }
         if (const auto* record = body.find("resume_record")) {
             const auto decoded = decode_resume_record(*record);
             if (decoded && decoded->session_id == *session && !decoded->sqlite_home.empty()) {
