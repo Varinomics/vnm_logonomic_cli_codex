@@ -126,10 +126,10 @@ struct Cumulative_category
     bool observed = false;
 
     void reset() { pending = 0; complete = true; observed = false; }
-    addon::Usage_amount amount() const
+    addon::Usage_amount amount(std::optional<std::uint64_t> uncovered_sum = 0) const
     {
         const bool covered = complete && observed;
-        return {true, covered ? pending : 0, addon::Usage_field_coverage{
+        return {true, covered ? std::optional(pending) : uncovered_sum, addon::Usage_field_coverage{
             covered ? 1u : 0u, 1, false, covered ? addon::Usage_support::SUPPORTED : addon::Usage_support::UNKNOWN}};
     }
     void accumulate(const addon::Json_value& value, bool active, bool preceding_total, bool total_reset)
@@ -206,7 +206,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
     std::string rollout, session_cwd, cwd, turn, model;
     std::int64_t started_ms = 0;
     std::uint64_t latest = 0, pending = 0;
-    Cumulative_category input_tokens, output_tokens, cache_tokens;
+    Cumulative_category input_tokens, output_tokens, cache_tokens, cache_write_tokens;
     Repository_memo repository;
     bool have_identity = false, have_total = false, forked = false, local_activity = false;
     bool complete_turn_event = false, saw_turn_sample = false;
@@ -278,6 +278,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
             input_tokens.accumulate(member(usage, "input_tokens"), !turn.empty(), have_total, reset);
             output_tokens.accumulate(member(usage, "output_tokens"), !turn.empty(), have_total, reset);
             cache_tokens.accumulate(member(usage, "cached_input_tokens"), !turn.empty(), have_total, reset);
+            cache_write_tokens.accumulate(member(usage, "cache_write_input_tokens"), !turn.empty(), have_total, reset);
             latest = *total;
             have_total = true;
             return true;
@@ -301,7 +302,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
         record.usage.input = input_tokens.amount();
         record.usage.output = output_tokens.amount();
         record.usage.cache_read = cache_tokens.amount();
-        record.usage.cache_creation = {false, std::nullopt, addon::Usage_field_coverage{0, 1, false, addon::Usage_support::UNSUPPORTED}};
+        record.usage.cache_creation = cache_write_tokens.amount(std::nullopt);
         record.usage.coverage_unit = addon::Usage_coverage_unit::SESSIONS;
         if (!model.empty()) record.usage.model = model;
         record.usage.counter_field = "total_token_usage.total_tokens";
@@ -325,7 +326,7 @@ bool read_rollout_usage(std::istream& input, const fs::path& path,
         pending = 0;
         complete_turn_event = false;
         saw_turn_sample = false;
-        input_tokens.reset(); output_tokens.reset(); cache_tokens.reset();
+        input_tokens.reset(); output_tokens.reset(); cache_tokens.reset(); cache_write_tokens.reset();
         turn.clear();
         return true;
     });

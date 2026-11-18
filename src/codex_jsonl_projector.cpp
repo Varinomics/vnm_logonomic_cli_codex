@@ -73,6 +73,7 @@ enum class Projection_target
     USAGE_INPUT_TOKENS,
     USAGE_OUTPUT_TOKENS,
     USAGE_CACHED_INPUT_TOKENS,
+    USAGE_CACHE_WRITE_INPUT_TOKENS,
 };
 
 enum class Token_kind
@@ -231,6 +232,9 @@ Projection_target target_for_key(
         if (key == "cached_input_tokens") {
             return Projection_target::USAGE_CACHED_INPUT_TOKENS;
         }
+        if (key == "cache_write_input_tokens") {
+            return Projection_target::USAGE_CACHE_WRITE_INPUT_TOKENS;
+        }
         break;
     case Container_path::NONE:
     case Container_path::LAST_TOKEN_USAGE:
@@ -314,6 +318,8 @@ std::string target_key(Projection_target target)
         return "output_tokens";
     case Projection_target::USAGE_CACHED_INPUT_TOKENS:
         return "cached_input_tokens";
+    case Projection_target::USAGE_CACHE_WRITE_INPUT_TOKENS:
+        return "cache_write_input_tokens";
     case Projection_target::NONE:
         break;
     }
@@ -413,7 +419,8 @@ struct Codex_jsonl_projector::Impl final
         case Projection_target::USAGE_TOTAL_TOKENS:
         case Projection_target::USAGE_INPUT_TOKENS:
         case Projection_target::USAGE_OUTPUT_TOKENS:
-        case Projection_target::USAGE_CACHED_INPUT_TOKENS: {
+        case Projection_target::USAGE_CACHED_INPUT_TOKENS:
+        case Projection_target::USAGE_CACHE_WRITE_INPUT_TOKENS: {
             addon::Json_value payload = object_member(projected, "payload");
             addon::Json_value info = object_member(payload, "info");
             const auto* usage_key = target == Projection_target::CONTEXT_USED_TOKENS

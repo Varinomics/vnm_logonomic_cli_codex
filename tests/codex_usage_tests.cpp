@@ -152,8 +152,40 @@ void reducer_keeps_turn_deltas_resets_and_fork_baselines(const fs::path& path)
         records[0].usage.input.coverage->covered_records == 0 && records[0].usage.input.coverage->total_records == 1 &&
         records[0].usage.input.coverage->support == addon::Usage_support::UNKNOWN,
         "missing intermediate category remains unknown coverage rather than unsupported or a fabricated count");
-    check(records[0].usage.cache_creation.coverage->support == addon::Usage_support::UNSUPPORTED,
-        "cache creation retains the native unsupported category");
+    check(records[0].usage.cache_creation.applicable && !records[0].usage.cache_creation.value &&
+        records[0].usage.cache_creation.coverage->support == addon::Usage_support::UNKNOWN,
+        "older rollouts without a cache-write counter retain unknown coverage");
+}
+
+void reducer_accounts_for_native_cache_writes(const fs::path& path)
+{
+    // Codex 0.170.0 emitted these cumulative categories for one Responses turn.
+    // Both cache counts are already included in its 31 input tokens.
+    const auto native_categories =
+        R"(,"input_tokens":31,"output_tokens":4,"cached_input_tokens":6,"cache_write_input_tokens":9)";
+    const auto records = reduce(metadata("cache-writes") +
+        start("native") + tokens(35, native_categories) + complete("native") +
+        start("no-writes") + tokens(40, R"(,"cache_write_input_tokens":9)") + complete("no-writes") +
+        start("gap") + tokens(43) + tokens(45, R"(,"cache_write_input_tokens":13)") + complete("gap") +
+        start("restored") + tokens(50, R"(,"cache_write_input_tokens":15)") + complete("restored") +
+        start("reset") + tokens(5, R"(,"cache_write_input_tokens":1)") + complete("reset") +
+        start("reported-zero") + tokens(3, R"(,"cache_write_input_tokens":0)") + complete("reported-zero"), path);
+    check(records.size() == 6, "cache-write accounting preserves each completed turn");
+    const auto& native = records.front().usage;
+    check(native.total_tokens == 35 && native.input.value == 31 && native.output.value == 4 &&
+        native.cache_read.value == 6 && native.cache_creation.value == 9 &&
+        native.cache_creation.coverage->support == addon::Usage_support::SUPPORTED,
+        "reported cache writes contribute a breakdown without increasing the native total");
+    check(records[1].usage.cache_creation.value == 0 && records[1].usage.cache_creation.coverage->covered_records == 1,
+        "an unchanged reported cache-write counter establishes a known zero");
+    check(!records[2].usage.cache_creation.value &&
+        records[2].usage.cache_creation.coverage->support == addon::Usage_support::UNKNOWN,
+        "a missing intermediate counter cannot establish a cache-write amount");
+    check(records[3].usage.cache_creation.value == 2 && records[4].usage.cache_creation.value == 1,
+        "later continuous and reset native samples establish their own cache-write deltas");
+    check(records[5].usage.cache_creation.value == 0 &&
+        records[5].usage.cache_creation.coverage->support == addon::Usage_support::SUPPORTED,
+        "the native zero counter is covered");
 }
 
 void reducer_preserves_fork_turn_precision(const fs::path& path)
@@ -2958,6 +2990,7 @@ int main(int argc, char** argv)
         }
         projector_does_not_retain_ignored_large_payloads();
         reducer_keeps_turn_deltas_resets_and_fork_baselines(fixture.path / "rollout-fixture.jsonl");
+        reducer_accounts_for_native_cache_writes(fixture.path / "rollout-fixture.jsonl");
         reducer_preserves_fork_turn_precision(fixture.path / "rollout-fixture.jsonl");
         reducer_keeps_categories_across_interrupted_turns(fixture.path / "rollout-fixture.jsonl");
         selected_cache_reparses_previous_parser_revision(fixture.path);
