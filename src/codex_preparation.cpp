@@ -165,7 +165,7 @@ bool takes_initial_prompt(
 {
     std::vector<std::string> argv(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
     argv.push_back("--help");
-    const auto output = run_probe(argv, environment, working_directory, 3000, context);
+    const auto output = probe_cli_options(argv, environment, working_directory, context);
     return output && output->output.find("[PROMPT]") != std::string::npos;
 }
 
@@ -600,7 +600,7 @@ Review_preparation_status prepare_review_arguments(
         request.context.launch_environment->effective_environment, launch, profile_path);
     auto probe = arguments;
     probe.insert(probe.end(), {"exec", "--help"});
-    const auto help = run_probe(probe, environment, request.context.working_directory, 3000, context);
+    const auto help = probe_cli_options(probe, environment, request.context.working_directory, context);
     if (!help || help->output.find("--sandbox") == std::string::npos ||
         help->output.find("read-only") == std::string::npos || help->output.find("--ignore-rules") == std::string::npos)
     {

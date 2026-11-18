@@ -77,9 +77,10 @@ void require_root_configuration(const std::vector<std::string>& arguments)
 }
 
 // One launch-preparation@3 prepare through the production dispatch.
-void prepare_launch(Context& context, const addon::Prepare_request& request)
+void prepare_launch(Context& context, const addon::Prepare_request& request,
+    int deadline_ms = addon::limits::k_launch_prepare_deadline_ms)
 {
-    context.input = {"interactive", {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3)};
+    context.input = {"interactive", {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3), deadline_ms};
     codex::handle_preparation(context);
 }
 
@@ -959,6 +960,18 @@ int main(int argc, char** argv)
             utf8(root / "npm pet installation" / "node_modules" / "@imakris" / "codex-pet" / "bin" / "codex.js"),
         };
         codex_invocation_launches(npm_pet, npm_pet_prefix, probe_environment, root, false);
+        auto cold = through_powershell(npm_pet);
+        cold.launch_environment->effective_environment.set("CODEX_FIXTURE_SLOW_CLI_START", addon::Json_value("1"));
+        Context short_call;
+        prepare_launch(short_call, cold, 100);
+        require(!short_call.succeeded, "A short caller deadline must still bound the native version check");
+        cold.initial_prompt = addon::Initial_prompt_request{"Read the brief.", utf8(root / "brief.md")};
+        Context cold_call;
+        prepare_launch(cold_call, cold);
+        const auto cold_patch = addon::decode_launch_patch(cold_call.output, &failure, 3);
+        require(cold_call.succeeded && cold_patch &&
+            addon::validate_initial_prompt_acknowledgment(cold.initial_prompt, *cold_patch, &failure),
+            "Slow native version and help checks must prepare the saved npm launcher within the host budget");
         addon::Discover_request npm_discovery;
         npm_discovery.platform_id = environment.platform_id;
         npm_discovery.ambient_environment = npm_pet.launch_environment->effective_environment;

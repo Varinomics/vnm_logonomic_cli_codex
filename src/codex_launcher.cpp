@@ -438,6 +438,17 @@ std::optional<addon::Probe_output> run_probe(
     return addon::probe(argv, environment, working_directory, timeout_ms, context, exchange);
 }
 
+std::optional<addon::Probe_output> probe_cli_options(
+    const std::vector<std::string>& argv, const Environment& environment,
+    std::string_view working_directory, addon::Invocation_context& context)
+{
+    // Even --version and --help start the native binary through the selected
+    // launcher. The host cancels the whole preparation at its original deadline.
+    const auto timeout_ms = std::min<std::int64_t>(
+        context.request().deadline_ms, addon::limits::k_launch_prepare_deadline_ms);
+    return run_probe(argv, environment, working_directory, static_cast<int>(timeout_ms), context);
+}
+
 std::optional<std::vector<std::string>> resolve_probe_launcher(
     const Launcher_command& command, const std::vector<std::string>& operation_arguments,
     const addon::Json_value& effective_environment, std::string_view working_directory,
@@ -878,7 +889,7 @@ std::optional<Verified_launch> verified_launch(
         }
     }
     if (version.empty()) {
-        const auto output = run_probe(probe_argv, environment, working_directory, 3000, context);
+        const auto output = probe_cli_options(probe_argv, environment, working_directory, context);
         if (!output) {
             return std::nullopt;
         }

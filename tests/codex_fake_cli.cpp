@@ -203,6 +203,9 @@ int main(int argc, char** argv)
 #endif
         if (argument == "--fixture-ignore-stdin") { std::this_thread::sleep_for(std::chrono::seconds(30)); return 0; }
         if (argument == "--fixture-overflow") { std::cout << std::string(65537, 'x') << std::flush; return 0; }
+        if ((argument == "--version" || argument == "--help") && std::getenv("CODEX_FIXTURE_SLOW_CLI_START")) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+        }
         if (argument == "--version") {
             const char* version = std::getenv("CODEX_FIXTURE_VERSION");
             std::cout << "codex-cli " << (version ? version : "0.150.1") << '\n';
