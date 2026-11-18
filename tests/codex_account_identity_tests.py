@@ -46,6 +46,7 @@ def check_win32_profile_selection(adapter, root):
     for suffix, label in (("", "plain"), (" ", "space"), (".", "dot")):
         directory = extended(root / ("Alpha" + suffix))
         (directory / "sessions").mkdir(parents=True)
+        (directory / "auth.json").write_text("{}", encoding="utf-8")
         history = [{"type": "session_meta", "payload": {"id": "native-alias"}},
                    {"type": "response_item", "payload": {"type": "message", "role": "user",
                                                         "content": "profile-marker-" + label}}]
@@ -75,6 +76,19 @@ def check_win32_profile_selection(adapter, root):
                 text = (Path(output) / response["payload"]["file_name"]).read_text(encoding="utf-8")
                 assert "profile-marker-" + expected in text, (selector, text)
     assert keys["plain"] != keys["space"]
+    literal = extended(root / "Alpha ")
+    assert discover(adapter, root, literal.as_posix())["adapter_account_key"] == keys["plain"]
+    assert discover(adapter, root, literal.as_posix() + "/")["adapter_account_key"] == keys["space"]
+    # The selected launcher must reproduce the same native profile after the
+    # host parses its environment assignment, including its verbatim prefix.
+    (root / "codex.exe").touch()
+    discovered = invoke(adapter, "launcher-discovery", 1, "discover", {
+        "platform": "windows-x86_64", "default_home_fallback": str(root),
+        "ambient_environment": {"CODEX_HOME": str(literal), "PATH": str(root)}})
+    selected, = (candidate for candidate in discovered["payload"]["candidates"] if candidate["default"])
+    assert selected["environment_text"] == "CODEX_HOME=" + str(literal) + "\\", selected
+    launcher_home = selected["environment_text"].split("=", 1)[1].strip()
+    assert discover(adapter, root, launcher_home)["adapter_account_key"] == keys["space"]
     pending = root / "Pending"
     assert discover(adapter, root, str(pending) + " ")["adapter_account_key"] == discover(
         adapter, root, pending)["adapter_account_key"]

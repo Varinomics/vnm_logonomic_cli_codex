@@ -50,6 +50,18 @@ std::string path_text(const fs::path& path)
     return std::string(bytes.begin(), bytes.end());
 }
 
+std::string profile_selector(const fs::path& profile)
+{
+#ifdef _WIN32
+    if (profile.native().starts_with(LR"(\\?\)")) {
+        // Rust accepts a verbatim selector with a trailing separator. It
+        // preserves the namespace and protects a final space in environment text.
+        return path_to_utf8(profile / "");
+    }
+#endif
+    return path_text(profile);
+}
+
 std::string profile_display_name(const fs::path& profile)
 {
     std::string name = path_text(profile.filename());
@@ -76,7 +88,7 @@ std::string profile_display_name(const fs::path& profile)
 
 struct Configured_codex_home
 {
-    fs::path scan_path;
+    fs::path sibling_directory;
     fs::path identity_path;
 };
 
@@ -86,20 +98,15 @@ std::optional<Configured_codex_home> configured_codex_home(
     addon::Launch_environment environment;
     environment.platform_id           = request.platform_id;
     environment.effective_environment = request.ambient_environment;
-    std::string profile_error;
-    const auto selected = profile_from_environment(environment, native_home_fallback(), {}, &profile_error);
-    if (!selected) {
+    auto configured = configured_profile_directory(environment, native_home_fallback());
+    const auto selected = canonical_profile_directory(configured);
+    if (selected.empty()) {
         return std::nullopt;
     }
-    const fs::path path = addon::path_from_utf8(selected->profile_path);
-    Configured_codex_home home;
-    home.scan_path = path.lexically_normal();
-    std::error_code error;
-    home.identity_path = fs::weakly_canonical(path, error);
-    if (error) {
-        home.identity_path = home.scan_path;
-    }
-    return home;
+    // Sibling profiles live beside the configured selector, including when it
+    // is a symlink to a profile outside that directory.
+    if (!configured.has_filename() && configured.has_relative_path()) configured = configured.parent_path();
+    return Configured_codex_home{configured.parent_path(), selected};
 }
 
 bool has_codex_auth_file(const fs::path& profile)
@@ -136,18 +143,11 @@ std::vector<fs::path> authenticated_codex_profiles(
         if (profiles.size() == addon::limits::k_max_discovery_candidates) {
             return;
         }
-        if (!has_codex_auth_file(candidate)) {
+        auto normalized = canonical_profile_directory(candidate);
+        if (normalized.empty() || !has_codex_auth_file(normalized) || !safe_for_environment_line(normalized)) {
             return;
         }
-        std::error_code error;
-        fs::path normalized = fs::weakly_canonical(candidate, error);
-        if (error) {
-            normalized = candidate.lexically_normal();
-        }
-        if (!safe_for_environment_line(normalized)) {
-            return;
-        }
-        if (!codex_profile_environment_text_impl(path_text(normalized))) {
+        if (!codex_profile_environment_text_impl(profile_selector(normalized))) {
             return;
         }
         const bool already_present = std::ranges::any_of(
@@ -166,10 +166,10 @@ std::vector<fs::path> authenticated_codex_profiles(
         }
     };
 
-    append_if_authenticated(selected_home.scan_path);
+    append_if_authenticated(selected_home.identity_path);
     std::error_code error;
     fs::directory_iterator entry(
-        selected_home.scan_path.parent_path(),
+        selected_home.sibling_directory,
         fs::directory_options::skip_permission_denied,
         error);
     const fs::directory_iterator end;
@@ -379,7 +379,7 @@ std::vector<addon::Launcher_candidate> discover_launchers(
         if (candidates.size() == addon::limits::k_max_discovery_candidates) {
             break;
         }
-        const std::string profile = path_text(profiles[index]);
+        const std::string profile = profile_selector(profiles[index]);
         const std::optional<std::string> environment_text =
             codex_profile_environment_text(profile);
         if (!environment_text) {

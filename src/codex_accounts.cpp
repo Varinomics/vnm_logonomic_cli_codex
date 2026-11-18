@@ -66,7 +66,7 @@ fs::path windows_profile(const fs::path& path)
     // prefix, then opens its children. Win32 applies different rules to a final
     // component and the same component followed by a child.
     const auto preferred = fs::path(path).make_preferred();
-    const auto& spelling = preferred.native();
+    const auto& spelling = path.native();
     // GetFullPathNameW trims the final component even in a device path.
     // Native directory handles open an explicit device spelling verbatim.
     const auto input = spelling.starts_with(LR"(\\?\)") || spelling.starts_with(LR"(\\.\)")
@@ -196,6 +196,18 @@ std::optional<Profile_selection> profile_selection(const addon::Launch_environme
 std::optional<Profile_selection> profile_from_environment(const addon::Launch_environment& environment,
     std::string_view fallback, std::string_view normalization_directory, std::string* error)
 {
+    auto path = configured_profile_directory(environment, fallback);
+    if (path.empty()) { *error = "profile_unavailable"; return std::nullopt; }
+    if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;
+    path = normalized_profile(path);
+    if (!path.is_absolute()) { *error = "profile_path_invalid"; return std::nullopt; }
+    Profile_selection selected{account_key(addon::native_account_profile_identity(path)), path_text(path)};
+    if (selected.adapter_account_key.empty()) { *error = "profile_path_invalid"; return std::nullopt; }
+    return selected;
+}
+
+fs::path configured_profile_directory(const addon::Launch_environment& environment, std::string_view fallback)
+{
     const bool windows = environment.platform_id.starts_with("windows-");
     // Shell assignments have already been expanded in the host's frozen environment.
     std::string profile = environment_value(environment.effective_environment, "CODEX_HOME", windows).value_or("");
@@ -205,16 +217,22 @@ std::optional<Profile_selection> profile_from_environment(const addon::Launch_en
         if (home.empty()) {
             home = fallback;
         }
-        if (home.empty()) { *error = "profile_unavailable"; return std::nullopt; }
-        profile = path_text(addon::path_from_utf8(home) / ".codex");
+        if (home.empty()) return {};
+        return addon::path_from_utf8(home) / ".codex";
     }
-    fs::path path = addon::path_from_utf8(profile);
-    if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;
-    path = normalized_profile(path);
-    if (!path.is_absolute()) { *error = "profile_path_invalid"; return std::nullopt; }
-    Profile_selection selected{account_key(addon::native_account_profile_identity(path)), path_text(path)};
-    if (selected.adapter_account_key.empty()) { *error = "profile_path_invalid"; return std::nullopt; }
-    return selected;
+    return addon::path_from_utf8(profile);
+}
+
+fs::path canonical_profile_directory(const fs::path& path)
+{
+    if (!path.is_absolute()) return {};
+#ifdef _WIN32
+    return windows_profile(path);
+#else
+    std::error_code error;
+    const auto canonical = fs::weakly_canonical(path, error);
+    return error ? fs::path{} : canonical;
+#endif
 }
 
 std::optional<Profile_selection> selected_profile(const addon::Session_launch_context& request,
