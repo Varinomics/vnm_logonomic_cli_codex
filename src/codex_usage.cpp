@@ -74,7 +74,10 @@ std::string digest(std::string_view value)
 
 std::string cache_key(std::string_view source)
 {
-    return digest(profile_account_key(source));
+    // A sealed rollout keeps its source spelling even after the file or its
+    // parent disappears. Native turn IDs reconcile copies and path aliases.
+    require(!source.empty(), "usage_cache_invalid");
+    return digest(source);
 }
 
 std::string nonce()
@@ -690,9 +693,9 @@ addon::Usage_scan_page page_at(const fs::path& snapshot, const std::string& iden
 class Accepted_rollouts final
 {
 public:
-    explicit Accepted_rollouts(const fs::path& source)
+    explicit Accepted_rollouts(const fs::path& file)
     :
-        m_lines(source / "rollouts", std::ios::binary)
+        m_lines(file, std::ios::binary)
     {
         require(static_cast<bool>(m_lines), "usage_cache_unavailable");
         advance();
@@ -728,6 +731,26 @@ private:
     std::optional<std::string>       m_key;
     std::optional<addon::Json_value> m_metadata;
 };
+
+void reorder_accepted_rollouts(const fs::path& source, const fs::path& destination,
+    const Usage_scan_limits& limits, const std::function<bool()>& cancelled)
+{
+    const auto source_key = [](const std::string& line) {
+        const auto metadata = addon::parse_json(line, {}, nullptr);
+        require(metadata && metadata->is_object(), "usage_cache_invalid");
+        return cache_key(string_member(*metadata, "source"));
+    };
+    Record_sorter sorter(destination.parent_path(), "accepted-source-run", limits.sort_run_bytes,
+        cancelled, source_key, false);
+    std::ifstream input(source, std::ios::binary);
+    require(static_cast<bool>(input), "usage_cache_unavailable");
+    std::string line;
+    while (read_line(input, &line)) {
+        check_cancel(cancelled);
+        sorter.add({source_key(line), std::move(line)});
+    }
+    sorter.finish(destination);
+}
 
 // A sorted record file read one record at a time.
 class Record_stream final
@@ -1383,6 +1406,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     std::optional<addon::Usage_cache_manifest> accepted_manifest;
     bool metadata_only = false;
     bool accepted_incomplete = false;
+    std::optional<fs::path> reordered_rollouts;
     if (selection.accepted) {
         accepted_manifest = incremental
             ? addon::validate_usage_cache_manifest(
@@ -1407,7 +1431,17 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
         accepted_incomplete = member(*snapshot, "incomplete").as_boolean();
         const auto state = read_json(source / "cache-state");
         require(state.has_value(), "usage_cache_unavailable");
-        accepted_rollouts.emplace(source);
+        const auto order = state->find("rollout_order");
+        require(!order || *order == addon::Json_value("source-path"), "usage_cache_unavailable");
+        auto rollouts = source / "rollouts";
+        if (!order) {
+            // Earlier metadata was ordered by the filesystem profile key.
+            // Reindex the verified lines without reading the original files.
+            reordered_rollouts = work / "accepted-source-order";
+            reorder_accepted_rollouts(rollouts, *reordered_rollouts, limits, working);
+            rollouts = *reordered_rollouts;
+        }
+        accepted_rollouts.emplace(rollouts);
         if (!incremental && accepted->format == k_piece_cache_format) {
             flatten_record_pieces(*accepted, source, work, limits, working);
             accepted_records = work / "accepted-records";
@@ -1437,6 +1471,10 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     bool incomplete = reconcile_rollouts(work, accepted_rollouts, found_rollouts_path,
         request.mode != "incremental", parsed, rollout_peers, unindexed_rollouts,
         progress, working, &metadata_changed, &reparsed, !incremental);
+    if (reordered_rollouts) {
+        accepted_rollouts.reset();
+        fs::remove(*reordered_rollouts);
+    }
     fs::remove(found_rollouts_path);
     if (reparsed) {
         const auto unindexed_path = work / "unindexed-rollouts";
@@ -1464,7 +1502,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     if (request.mode == "incremental" && accepted_incomplete) {
         incomplete = true;
     }
-    if (metadata_only && !metadata_changed && incomplete == accepted_incomplete) {
+    if (metadata_only && !reordered_rollouts && !metadata_changed && incomplete == accepted_incomplete) {
         // The host already owns this accounting generation. Examining source
         // metadata does not require replaying or republishing its records.
         fs::remove(work / "rollouts");
@@ -1511,6 +1549,7 @@ std::optional<addon::Usage_scan_page> scan_selected_cache(
     auto state = addon::Json_value::object();
     state.set("request_sha256", addon::Json_value(request_hash));
     state.set("snapshot_id", addon::Json_value(identifier));
+    state.set("rollout_order", addon::Json_value("source-path"));
     write_json(work / "cache-state", state);
     auto page = page_at(work, identifier, 0, request.context.account_context, working, request, incremental);
     page.account_context = request.context.account_context;

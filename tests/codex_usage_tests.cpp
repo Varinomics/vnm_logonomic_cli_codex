@@ -2,6 +2,7 @@
 #include "codex_usage.h"
 #include "codex_usage_records.h"
 #include "codex_accounts.h"
+#include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
@@ -351,6 +352,97 @@ void select_cache(addon::Usage_scan_request& request, const fs::path& storage,
     request.snapshot_id.reset();
     request.cursor.reset();
     request.cache_selection = addon::Usage_cache_selection{std::move(accepted), addon::path_to_utf8(candidate)};
+}
+
+void selected_cache_preserves_previous_rollout_order(const fs::path& fixture)
+{
+    const auto profile = fixture / "rollout-order-profile";
+    const auto storage = fixture / "rollout-order-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto hash = [](std::string_view value) { return addon::to_hex(addon::Sha256::digest(value)); };
+    std::map<std::string, fs::path> paths;
+    std::vector<std::string> stable_order;
+    // Select a real prior ordering that differs from ordering by source alone.
+    // The absolute temporary root is part of each digest.
+    for (int index = 0; index < 100 && std::is_sorted(stable_order.begin(), stable_order.end()); ++index) {
+        const auto path = profile / "sessions" / ("rollout-order-" + std::to_string(index) + ".jsonl");
+        auto identity = addon::historical_account_profile_identity(path, path);
+        check(identity.has_value(), "derive the preexisting rollout key");
+#ifdef _WIN32
+        std::replace(identity->begin(), identity->end(), '\\', '/');
+#endif
+        paths.emplace(hash("profile-" + hash(*identity)), path);
+        stable_order.clear();
+        for (const auto& entry : paths) stable_order.push_back(hash(addon::path_to_utf8(entry.second)));
+    }
+    check(!std::is_sorted(stable_order.begin(), stable_order.end()), "exercise a changed rollout-key order");
+    int index = 0;
+    for (const auto& entry : paths) {
+        const auto session = "order-session-" + std::to_string(++index);
+        write(entry.second, metadata(session) + start("turn-a") + tokens(13) + complete("turn-a"));
+    }
+    addon::Usage_scan_request request;
+    request.mode = "incremental";
+    request.context.account_context = addon::Account_context{1, "order-account"};
+    select_cache(request, storage, "initial");
+    std::string error;
+    const auto scan = [&] { return codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error); };
+    const auto initial = scan();
+    check(initial && initial->records.size() == paths.size(), "read one native turn per rollout");
+
+    const auto source = storage / "initial";
+    const auto historical = storage / "historical";
+    fs::create_directory(historical);
+    for (const auto* name : {"records", "snapshot"}) fs::copy_file(source / name, historical / name);
+    std::ifstream state_file(source / "cache-state", std::ios::binary);
+    std::string line;
+    std::getline(state_file, line);
+    auto state = addon::parse_json(line, {}, nullptr);
+    check(state.has_value(), "read the cache state");
+    state->erase("rollout_order");
+    write(historical / "cache-state", addon::serialize_json(*state) + '\n');
+    std::map<fs::path, std::string> metadata_by_path;
+    std::ifstream rollout_file(source / "rollouts", std::ios::binary);
+    while (std::getline(rollout_file, line)) {
+        const auto row = addon::parse_json(line, {}, nullptr);
+        check(row && row->find("source") && row->find("source")->is_string(), "read rollout metadata");
+        metadata_by_path.emplace(addon::path_from_utf8(row->find("source")->as_string()), line);
+    }
+    std::string old_lines;
+    for (const auto& entry : paths) old_lines += metadata_by_path.at(entry.second) + '\n';
+    write(historical / "rollouts", old_lines);
+    addon::Contract_failure failure;
+    const auto accepted = addon::seal_usage_cache_candidate(addon::path_to_utf8(historical),
+        addon::path_to_utf8(storage), request.context.account_context, initial->snapshot_id,
+        "codex-rollout-cache@3", [] { return false; }, &failure);
+    check(accepted.has_value(), "seal the genuine prior source order");
+#ifdef _WIN32
+    const auto alias = fixture / "ROLLOUT-ORDER-PROFILE";
+#else
+    const auto alias = fixture / "profile-alias";
+    fs::create_directory_symlink(profile, alias);
+#endif
+    std::error_code alias_error;
+    if (fs::equivalent(profile, alias, alias_error)) {
+        select_cache(request, storage, "aliased", accepted);
+        const auto rediscovered = codex::scan_usage(request, alias, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(rediscovered && rediscovered->records.size() == paths.size(),
+            "a newly spelled account prefix does not duplicate the original native turns");
+    }
+    for (const auto& entry : paths) fs::remove(entry.second);
+    select_cache(request, storage, "migrated", accepted);
+    const auto migrated = scan();
+    check(migrated && migrated->records.size() == paths.size() && migrated->cache_candidate,
+        error.empty() ? "retain every turn after removal of the original rollout files" : error.c_str());
+    select_cache(request, storage, "reused", migrated->cache_candidate);
+    const auto reused = scan();
+    check(reused && reused->records.size() == paths.size(), "reuse the migrated rollout order");
+    for (std::size_t row = 0; row < initial->records.size(); ++row) {
+        check(reused->records[row].record_id == initial->records[row].record_id &&
+            reused->records[row].total_tokens == 13, "keep the original turn and amount through reindexing");
+    }
 }
 
 void selected_cache_reparses_previous_parser_revision(const fs::path& fixture)
@@ -2869,6 +2961,7 @@ int main(int argc, char** argv)
         reducer_preserves_fork_turn_precision(fixture.path / "rollout-fixture.jsonl");
         reducer_keeps_categories_across_interrupted_turns(fixture.path / "rollout-fixture.jsonl");
         selected_cache_reparses_previous_parser_revision(fixture.path);
+        selected_cache_preserves_previous_rollout_order(fixture.path);
         reducer_attributes_resumed_turns(fixture.path);
         scanner_keeps_per_turn_repositories(fixture.path);
         selected_cache_repairs_turn_repository(fixture.path);

@@ -40,7 +40,7 @@ std::optional<fs::path> source_profile(
 {
     if (request.account_context) {
         const auto& account = *request.account_context;
-        if (!account.profile_path || account.adapter_account_key != profile_account_key(*account.profile_path)) {
+        if (!account.profile_path || !account_matches_profile(account, *account.profile_path)) {
             fail(failure, "conversation_profile_mismatch", "The selected Codex account does not name its profile.");
             return {};
         }
@@ -513,10 +513,7 @@ addon::Resume_inspect_result inspect_resume(
     const auto& account = request.context.account_context;
     // An old ID-only record does not identify the original store. Inspection is
     // reconstructed later and cannot recover a preparer's environment patch.
-    if (!record || record->sqlite_home.empty() || !account || !account->profile_path ||
-        addon::path_from_utf8(*account->profile_path).generic_u8string() !=
-            addon::path_from_utf8(record->codex_home).generic_u8string() ||
-        account->adapter_account_key != profile_account_key(record->codex_home) ||
+    if (!record || record->sqlite_home.empty() || !account || !account_matches_profile(*account, record->codex_home) ||
         (cancelled && cancelled()))
     {
         return result;

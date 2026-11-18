@@ -735,21 +735,25 @@ std::optional<Verified_launch> verified_launch(
     std::string package_version;
     const bool pet = addon::base_name(literal.front(), Launcher_whitespace::ASCII) == "codex-pet";
 #ifdef _WIN32
-    const bool npm = lower(selected->extension().string()) == ".cmd";
+    const auto extension = lower(selected->extension().string());
+    const bool npm = extension == ".cmd" || extension == ".ps1";
 #else
-    const bool npm = pet && selected->filename() == "codex.js";
+    const bool npm = selected->filename() == "codex.js";
 #endif
     if (npm) {
-        const auto directory = selected->parent_path();
         const auto package_name = pet ? "@imakris/codex-pet" : "@openai/codex";
 #ifdef _WIN32
-        const auto root = directory / "node_modules" / package_name;
+        const auto directory  = selected->parent_path();
+        const auto javascript = addon::npm_node_shim_entry(*selected);
 #else
-        const auto root = directory.parent_path();
+        const auto& javascript = selected;
 #endif
-        const auto javascript = regular_file(root / "bin" / "codex.js");
-        const auto manifest   = regular_file(root / "package.json");
-        if (!javascript || !manifest) {
+        if (!javascript || javascript->filename() != "codex.js" || javascript->parent_path().filename() != "bin") {
+            return std::nullopt;
+        }
+        const auto root = javascript->parent_path().parent_path();
+        const auto manifest = regular_file(root / "package.json");
+        if (!manifest) {
             return std::nullopt;
         }
 #ifdef _WIN32

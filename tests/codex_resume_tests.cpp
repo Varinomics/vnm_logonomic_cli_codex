@@ -204,6 +204,16 @@ addon::Resume_inspect_request inspection_request(const fs::path& fixture)
     return request;
 }
 
+bool same_profile_spelling(const fs::path& first, const fs::path& second)
+{
+#ifdef _WIN32
+    std::error_code error;
+    return fs::equivalent(first, second, error) && !error;
+#else
+    return first == second;
+#endif
+}
+
 void native_history(const fs::path& fixture)
 {
     auto request = inspection_request(fixture);
@@ -277,7 +287,12 @@ void native_history(const fs::path& fixture)
     expect(Availability::UNKNOWN, Content::UNKNOWN);
     request = inspection_request(fixture);
     request.context.account_context->profile_path = addon::path_to_utf8(fixture / "PROFILE");
-    expect(Availability::UNKNOWN, Content::UNKNOWN);
+    if (same_profile_spelling(fixture / "profile", fixture / "PROFILE")) {
+        expect(Availability::AVAILABLE, Content::NONEMPTY);
+    }
+    else {
+        expect(Availability::UNKNOWN, Content::UNKNOWN);
+    }
     request = inspection_request(fixture);
 #ifndef _WIN32
     const auto inaccessible = fixture / "inaccessible-store";
@@ -472,8 +487,13 @@ void bound_preparation(const fs::path& fixture, const fs::path& native_fixture, 
         mismatch.input = {"wrong-scope", {"interactive-resume", 2}, "prepare_resume",
             addon::encode_resume_prepare_request(request, 2), 15000};
         codex::handle_preparation(mismatch);
-        check(!mismatch.succeeded && mismatch.output == Json("resume_scope_unavailable"),
-            "unknown content does not relax a different or case-distinct profile scope");
+        if (same_profile_spelling(fixture / "profile", profile)) {
+            check(mismatch.succeeded, "an equivalent native spelling retains the selected resume scope");
+        }
+        else {
+            check(!mismatch.succeeded && mismatch.output == Json("resume_scope_unavailable"),
+                "unknown content does not relax a different profile scope");
+        }
     }
 }
 

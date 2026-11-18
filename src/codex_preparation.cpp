@@ -331,9 +331,7 @@ void prepare_resume(addon::Invocation_context& context)
     }
     const auto working_directory = addon::path_to_utf8(*directory);
     if (!record->sqlite_home.empty()) {
-        if (addon::path_from_utf8(record->codex_home).generic_u8string() !=
-            addon::path_from_utf8(profile->profile_path).generic_u8string())
-        {
+        if (!account_matches_profile(*request->context.account_context, record->codex_home)) {
             context.fail(addon::Result_status::UNAVAILABLE, "resume_scope_unavailable");
             return;
         }

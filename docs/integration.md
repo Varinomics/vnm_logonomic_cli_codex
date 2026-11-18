@@ -7,6 +7,16 @@ servers. Native executable and stock npm launcher chains are verified before
 interactive or delegated preparation. Package runners can be recognized without
 being admitted as interactive launch chains.
 
+The official npm installation can be selected through its global command or
+its project-local `node_modules/.bin` launcher. The add-on verifies the npm
+entry point, Node runtime, package versions and native platform binary.
+
+Codex profile IDs follow the native directory's case rules on Windows.
+Ordinary case-insensitive profiles retain their issued IDs. A saved account
+with its original profile path can still identify that exact directory after
+a case-sensitive lookup becomes available. On POSIX a `CODEX_HOME` containing
+`..` after a directory symlink follows the same parent as the native CLI.
+
 ## Hooks and guidance
 
 Codex hooks carry session, turn, attention and subagent facts through the SDK's

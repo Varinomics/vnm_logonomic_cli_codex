@@ -40,6 +40,42 @@ std::string ascii_lower(std::string text)
     return text;
 }
 
+fs::path normalized_profile(const fs::path& path)
+{
+    if (!path.is_absolute()) return {};
+#ifndef _WIN32
+    // Native lookup traverses a directory symlink before applying a following
+    // "..". Keep prospective leaf names while resolving that existing prefix.
+    auto suffix = path.end();
+    while (suffix != path.begin()) {
+        if (*--suffix != "..") continue;
+        ++suffix;
+        fs::path prefix;
+        for (auto part = path.begin(); part != suffix; ++part) prefix /= *part;
+        std::error_code error;
+        auto resolved = fs::canonical(prefix, error);
+        if (error) return {};
+        for (; suffix != path.end(); ++suffix) resolved /= *suffix;
+        return resolved.lexically_normal();
+    }
+#endif
+    return path.lexically_normal();
+}
+
+std::string account_key(std::optional<std::string> identity)
+{
+    if (!identity) return {};
+#ifdef _WIN32
+    // Codex issued keys with generic separators. Use a bijection so the
+    // SDK's opaque filesystem identity, including binary data, stays distinct.
+    for (char& byte : *identity) {
+        if (byte == '\\') byte = '/';
+        else if (byte == '/') byte = '\\';
+    }
+#endif
+    return "profile-" + addon::to_hex(addon::Sha256::digest(*identity));
+}
+
 std::optional<std::string> environment_value(const addon::Json_value& environment, std::string_view name, bool windows)
 {
     for (const auto& item : environment.as_object()) {
@@ -79,22 +115,19 @@ std::string native_home_fallback()
 
 std::string profile_account_key(std::string_view absolute_path)
 {
-    fs::path path = addon::path_from_utf8(absolute_path).lexically_normal();
-#if defined(_WIN32)
-    std::wstring wide = path.generic_wstring();
-    const int size = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, wide.data(),
-        static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr, 0);
-    if (size == 0) return {};
-    std::wstring folded(static_cast<std::size_t>(size), L'\0');
-    if (!LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, wide.data(),
-            static_cast<int>(wide.size()), folded.data(), size, nullptr, nullptr, 0))
-    {
-        return {};
-    }
-    path = fs::path(folded);
-#endif
-    const auto bytes = path.generic_u8string();
-    return "profile-" + addon::to_hex(addon::Sha256::digest(std::string(bytes.begin(), bytes.end())));
+    const auto path = normalized_profile(addon::path_from_utf8(absolute_path));
+    return account_key(addon::native_account_profile_identity(path));
+}
+
+bool account_matches_profile(const addon::Account_context& account, std::string_view selected_path)
+{
+    if (!account.profile_path || account.adapter_account_key.empty()) return false;
+    const auto granted  = normalized_profile(addon::path_from_utf8(*account.profile_path));
+    const auto selected = normalized_profile(addon::path_from_utf8(selected_path));
+    if (!addon::same_native_account_profile(granted, selected)) return false;
+    if (account.adapter_account_key == account_key(addon::native_account_profile_identity(selected))) return true;
+    return account.version == 2 &&
+        account.adapter_account_key == account_key(addon::historical_account_profile_identity(granted, selected));
 }
 
 std::optional<Profile_selection> profile_selection(const addon::Launch_environment& environment,
@@ -123,7 +156,7 @@ std::optional<Profile_selection> profile_from_environment(const addon::Launch_en
     }
     fs::path path = addon::path_from_utf8(profile);
     if (!path.is_absolute()) path = addon::path_from_utf8(normalization_directory) / path;
-    path = path.lexically_normal();
+    path = normalized_profile(path);
     if (!path.is_absolute()) { *error = "profile_path_invalid"; return std::nullopt; }
     Profile_selection selected{profile_account_key(path_text(path)), path_text(path)};
     if (selected.adapter_account_key.empty()) { *error = "profile_path_invalid"; return std::nullopt; }
@@ -138,7 +171,7 @@ std::optional<Profile_selection> selected_profile(const addon::Session_launch_co
         return std::nullopt;
     }
     Profile_selection selected{request.account_context->adapter_account_key, *request.account_context->profile_path};
-    if (selected.adapter_account_key != profile_account_key(selected.profile_path)) {
+    if (!account_matches_profile(*request.account_context, selected.profile_path)) {
         context.fail(addon::Result_status::UNAVAILABLE, "account_context_mismatch");
         return std::nullopt;
     }

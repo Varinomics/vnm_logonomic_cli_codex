@@ -745,21 +745,28 @@ addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const 
     const auto directory = root / (pet ? "npm pet installation" : "npm installation");
     const auto package_name = pet ? "@imakris/codex-pet" : "@openai/codex";
     const auto package = directory / "node_modules" / package_name;
-    const auto platform = pet ? package : directory / "node_modules" / "@openai" / "codex-win32-x64";
 #ifdef _WIN32
-    const auto image = platform / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe";
-    const auto node = directory / "node.exe";
+    const std::string platform_name = "win32-x64";
+    const auto target = "x86_64-pc-windows-msvc";
 #elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-    const auto image = platform / "vendor" / "aarch64-apple-darwin" / "bin" / "codex";
-    const auto node = directory / "node";
+    const std::string platform_name = "darwin-arm64";
+    const auto target = "aarch64-apple-darwin";
 #elif defined(__APPLE__)
-    const auto image = platform / "vendor" / "x86_64-apple-darwin" / "bin" / "codex";
-    const auto node = directory / "node";
+    const std::string platform_name = "darwin-x64";
+    const auto target = "x86_64-apple-darwin";
 #elif defined(__aarch64__)
-    const auto image = platform / "vendor" / "aarch64-unknown-linux-musl" / "bin" / "codex";
-    const auto node = directory / "node";
+    const std::string platform_name = "linux-arm64";
+    const auto target = "aarch64-unknown-linux-musl";
 #else
-    const auto image = platform / "vendor" / "x86_64-unknown-linux-musl" / "bin" / "codex";
+    const std::string platform_name = "linux-x64";
+    const auto target = "x86_64-unknown-linux-musl";
+#endif
+    const auto platform = pet ? package : directory / "node_modules" / "@openai" / ("codex-" + platform_name);
+#ifdef _WIN32
+    const auto image = platform / "vendor" / target / "bin" / "codex.exe";
+    const auto node = directory / "node.exe";
+#else
+    const auto image = platform / "vendor" / target / "bin" / "codex";
     const auto node = directory / "node";
 #endif
     fs::create_directories(package / "bin");
@@ -775,12 +782,18 @@ addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const 
     };
 #ifdef _WIN32
     const std::string command_name = pet ? "codex-pet.cmd" : "codex.cmd";
-    write(directory / command_name, pet
-        ? "@echo off\r\n\"%~dp0node.exe\" \"%~dp0node_modules\\@imakris\\codex-pet\\bin\\codex.js\" %*\r\n"
-        :
-        "@echo off\r\n\"%~dp0node.exe\" \"%~dp0node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n");
+    const auto launch_directory = pet ? directory : directory / "node_modules/.bin";
+    fs::create_directories(launch_directory);
+    const auto entry = (package / "bin/codex.js").lexically_relative(launch_directory);
+    write(launch_directory / command_name,
+        "@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\n"
+        "IF EXIST \"%dp0%\\node.exe\" (\n  SET \"_prog=%dp0%\\node.exe\"\n) ELSE (\n  SET \"_prog=node\"\n"
+        "  SET PATHEXT=%PATHEXT:;.JS;=;%\n)\n\n"
+        "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\" +
+        utf8(entry) + "\" %*\n");
 #else
-    const std::string command_name = "codex-pet";
+    const auto& launch_directory = directory;
+    const std::string command_name = pet ? "codex-pet" : "codex";
     fs::create_symlink(package / "bin" / "codex.js", directory / command_name);
 #endif
     write(package / "bin" / "codex.js", "#!/usr/bin/env node\n// Verified npm entry point fixture.\n");
@@ -791,13 +804,14 @@ addon::Prepare_request npm_launcher(const addon::Prepare_request& native, const 
         ? "{\"name\":\"@imakris/codex-pet\",\"version\":\"0.150.1-pet.46.1\",\"bin\":{\"codex-pet\":\"bin/codex.js\"}}"
         :
         "{\"name\":\"@openai/codex\",\"version\":\"0.150.1\",\"bin\":{\"codex\":\"bin/codex.js\"},"
-            "\"optionalDependencies\":{\"@openai/codex-win32-x64\":\"npm:@openai/codex@0.150.1-win32-x64\"}}");
+            "\"optionalDependencies\":{\"@openai/codex-" + platform_name +
+            "\":\"npm:@openai/codex@0.150.1-" + platform_name + "\"}}");
     if (!pet) {
-        write(platform / "package.json", "{\"name\":\"@openai/codex\",\"version\":\"0.150.1-win32-x64\"}");
+        write(platform / "package.json", "{\"name\":\"@openai/codex\",\"version\":\"0.150.1-" + platform_name + "\"}");
     }
 
     auto request = native;
-    request.launcher_argv.front() = utf8(directory / command_name);
+    request.launcher_argv.front() = utf8(launch_directory / command_name);
     request.launch_environment->effective_environment.set("PATH", addon::Json_value(utf8(directory)));
     return request;
 }
@@ -940,14 +954,16 @@ int main(int argc, char** argv)
         pet.launcher_argv.front() = utf8(pet_program);
         const std::vector<std::string> pet_prefix{utf8(pet_program)};
         codex_invocation_launches(pet, pet_prefix, probe_environment, root, false);
-#ifdef _WIN32
         const auto npm = npm_launcher(prepare, root);
         const std::vector<std::string> npm_prefix{
+#ifdef _WIN32
             utf8(root / "npm installation" / "node.exe"),
+#else
+            utf8(root / "npm installation" / "node"),
+#endif
             utf8(root / "npm installation" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"),
         };
         codex_invocation_launches(npm, npm_prefix, probe_environment, root);
-#endif
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
         const auto npm_pet = npm_launcher(pet, root, true);
         const std::vector<std::string> npm_pet_prefix{
@@ -1572,12 +1588,11 @@ int main(int argc, char** argv)
         pet_resume.context.launcher      = pet.launcher;
         pet_resume.context.launcher_argv = pet.launcher_argv;
         codex_invocation_resume(pet_resume, pet_prefix);
-#ifdef _WIN32
         auto npm_resume = resume;
         npm_resume.context.launcher      = npm.launcher;
         npm_resume.context.launcher_argv = npm.launcher_argv;
+        npm_resume.context.launch_environment = npm.launch_environment;
         codex_invocation_resume(npm_resume, npm_prefix);
-#endif
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
         auto npm_pet_resume = resume;
         npm_pet_resume.context.launcher      = npm_pet.launcher;

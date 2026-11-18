@@ -82,9 +82,7 @@ void handle_account_pet(addon::Invocation_context& context)
         return;
     }
     const auto& account = request->account_context;
-    if (!account.profile_path ||
-        account.adapter_account_key != profile_account_key(*account.profile_path))
-    {
+    if (!account.profile_path || !account_matches_profile(account, *account.profile_path)) {
         context.fail(addon::Result_status::UNAVAILABLE, "account_context_mismatch");
         return;
     }

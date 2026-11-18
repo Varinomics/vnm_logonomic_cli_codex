@@ -306,6 +306,10 @@ set_tests_properties(codex_usage_host_tests PROPERTIES TIMEOUT 120)
 add_test(NAME codex_package_validation COMMAND logonomic_cli_addon_validate "${CODEX_PACKAGE_DIRECTORY}" --platform "${CODEX_PLATFORM}")
 add_test(NAME codex_package_conformance COMMAND logonomic_cli_addon_conformance "${CODEX_PACKAGE_DIRECTORY}")
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME codex_account_identity_tests COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/codex_account_identity_tests.py"
+    "${CODEX_PACKAGE_DIRECTORY}/adapter/codex_adapter${CODEX_EXECUTABLE_SUFFIX}")
+set_tests_properties(codex_account_identity_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(codex_fake_vnmctl tests/codex_fake_vnmctl.cpp)
 codex_target(codex_fake_vnmctl)
 add_test(NAME codex_reply_helper_tests COMMAND "${Python3_EXECUTABLE}"

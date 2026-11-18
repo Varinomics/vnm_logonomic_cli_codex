@@ -16,6 +16,7 @@ struct Profile_selection
 };
 
 std::string profile_account_key(std::string_view absolute_path);
+bool account_matches_profile(const logonomic::cli_addon::Account_context& account, std::string_view selected_path);
 // Live selection uses Codex's OS fallback; retained exports use only frozen inputs.
 std::string native_home_fallback();
 std::optional<Profile_selection> profile_from_environment(

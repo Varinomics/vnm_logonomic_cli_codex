@@ -16,7 +16,11 @@ Accounting, cache acceptance and progress follow the independently versioned
 Host-selected usage caches use `codex-rollout-cache@3`, whose records retain
 usage-scan@3 native counter provenance. A candidate keeps one metadata line per
 rollout in `rollouts` beside the sorted `records`, so it holds the same four
-files however many rollouts a home has. An incremental scan parses rollouts whose
+files however many rollouts a home has. Rollout metadata is ordered by its
+recorded source spelling. Older sealed indexes are reordered from their saved
+metadata, including entries whose native files have disappeared. Native turn
+IDs keep copies and account-directory aliases from adding a second debit.
+An incremental scan parses rollouts whose
 size or modification time changed, or whose optional temporal evidence has not
 been examined, and streams the selected cache's records for the others; repair
 and reset parse every rollout. When a source is parsed, unchanged current copies
