@@ -986,6 +986,35 @@ void scanner_accepts_new_profiles_and_retains_transient_empty_history(const fs::
         "missing profile itself remains invalid");
 }
 
+void scanner_marks_compressed_only_history(const fs::path& fixture)
+{
+    const auto profile = fixture / "compressed-profile";
+    const auto storage = fixture / "compressed-cache";
+    const auto plain = profile / "archived_sessions" / "rollout-cold.jsonl";
+    const auto compressed = plain.parent_path() / "rollout-cold.jsonl.zst";
+    fs::create_directories(plain.parent_path());
+    fs::create_directory(storage);
+    write(compressed, std::string("\x28\xb5\x2f\xfd\x20\x00\x01\x00\x00", 9));
+    addon::Usage_scan_request request;
+    std::string error;
+    select_cache(request, storage, "fresh");
+    auto page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    check(page && page->complete && page->records.empty() && page->incomplete_historical_coverage,
+        "a compressed-only rollout leaves historical coverage incomplete");
+
+    write(plain, metadata() + start("cold") + tokens(17) + complete("cold"));
+    select_cache(request, storage, "mixed");
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    check(page && page->records.size() == 1 && page->records.front().total_tokens == 17 &&
+        !page->incomplete_historical_coverage, "the native plain sibling takes precedence during compression");
+
+    fs::remove(plain);
+    select_cache(request, storage, "retained", page->cache_candidate);
+    page = codex::scan_usage(request, profile, storage, [] { return false; }, quiet_progress, &error);
+    check(page && page->records.size() == 1 && page->records.front().total_tokens == 17 &&
+        page->incomplete_historical_coverage, "compression keeps accepted usage and marks the unread history");
+}
+
 std::string utf8(const fs::path& path)
 {
     const auto bytes = path.u8string();
@@ -3067,6 +3096,7 @@ int main(int argc, char** argv)
         scanner_sorts_pages_and_preserves_cache_on_retry(fixture.path);
         scanner_reads_archived_rollouts(fixture.path);
         scanner_accepts_new_profiles_and_retains_transient_empty_history(fixture.path);
+        scanner_marks_compressed_only_history(fixture.path);
         current_cache_replay_and_loss(fixture.path);
         selected_cache_preserves_peer_validation(fixture.path);
         current_scan_cancellation_preserves_accepted_history(fixture.path);

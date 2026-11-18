@@ -13,6 +13,10 @@ turn reports cache writes when its cumulative `cache_write_input_tokens`
 observations establish the amount, including zero. Missing evidence leaves
 that dimension unknown. Turns accepted by an earlier scanner keep their
 original cache-write coverage. Newly accepted turns report the native breakdown.
+Codex can compress cold rollouts into `.jsonl.zst` files. A scan that finds
+only the compressed representation of a rollout reports incomplete historical
+coverage and retains its previously accepted turns. When both representations
+exist, the scan reads the plain sibling once, following Codex's precedence.
 Accounting, cache acceptance and progress follow the independently versioned
 [usage-scan contracts](https://github.com/Varinomics/Logonomic/tree/master/sdk/logonomic_cli_addon_sdk/docs).
 
