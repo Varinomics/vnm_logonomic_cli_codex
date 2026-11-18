@@ -1243,6 +1243,23 @@ int main(int argc, char** argv)
             codex::handle_preparation(cancelled);
             require(!cancelled.succeeded && cancelled.output == addon::Json_value("cancelled"),
                 "Cancelled standalone preparation cannot publish a process");
+            request.context.account_context.reset();
+            request.context.launch_environment->effective_environment.set("CODEX_HOME", addon::Json_value("."));
+            standalone.input.payload = addon::encode_structured_prepare_request(request);
+            codex::handle_preparation(standalone);
+            const auto unselected = addon::decode_structured_prepare_result(standalone.output, &failure);
+            require(standalone.succeeded && unselected && !unselected->account_context &&
+                std::any_of(unselected->process.environment.begin(), unselected->process.environment.end(), [&](const auto& entry) {
+                    return entry.first == "CODEX_HOME" && fs::equivalent(addon::path_from_utf8(entry.second),
+                        addon::path_from_utf8(request.context.working_directory));
+                }), "An unselected standalone request resolves the frozen profile relative to its workspace");
+            request.context.account_context = source->context.account_context;
+            request.context.account_context->adapter_account_key = "foreign-key";
+            Context foreign;
+            foreign.input = {"foreign", {"structured-session", 3}, "prepare", addon::encode_structured_prepare_request(request)};
+            codex::handle_preparation(foreign);
+            require(!foreign.succeeded && foreign.output == addon::Json_value("account_context_mismatch"),
+                "An invalid account grant must not fall back to the frozen profile");
         }
         Context reviewed;
         reviewed.input = {"review", {"delegated-session", 3}, "prepare",

@@ -639,11 +639,22 @@ void prepare_session(addon::Invocation_context& context, const addon::Structured
     const addon::Delegated_control* control, const std::optional<addon::Delegated_model_selection>& selection)
 {
     addon::Contract_failure failure;
-    const auto profile = selected_profile(request.context, context);
-    if (!profile) return;
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
     const bool review = request.purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
     if (request.prompt.empty() || !addon::path_from_utf8(request.context.working_directory).is_absolute()) {
         context.fail(addon::Result_status::FAILED, review ? "invalid_review_request" : "invalid_implementation_request");
+        return;
+    }
+    std::string profile_error;
+    const auto profile = control || request.context.account_context
+        ? selected_profile(request.context, context)
+        : profile_from_environment(*request.context.launch_environment, native_home_fallback(),
+              request.context.working_directory, &profile_error);
+    if (!profile) {
+        if (!profile_error.empty()) context.fail(addon::Result_status::UNAVAILABLE, profile_error);
         return;
     }
     const auto literal = request.context.launcher.runner_key == addon::k_runner_direct
