@@ -65,7 +65,12 @@ fs::path windows_profile(const fs::path& path)
     // Codex canonicalizes the supplied directory, strips a drive/UNC namespace
     // prefix, then opens its children. Win32 applies different rules to a final
     // component and the same component followed by a child.
-    const auto input = win32_full_path(fs::path(path).make_preferred());
+    const auto preferred = fs::path(path).make_preferred();
+    const auto& spelling = preferred.native();
+    // GetFullPathNameW trims the final component even in a device path.
+    // Native directory handles open an explicit device spelling verbatim.
+    const auto input = spelling.starts_with(LR"(\\?\)") || spelling.starts_with(LR"(\\.\)")
+        ? preferred : win32_full_path(preferred);
     if (input.empty()) return {};
     std::error_code error;
     const auto canonical = fs::canonical(input, error);
