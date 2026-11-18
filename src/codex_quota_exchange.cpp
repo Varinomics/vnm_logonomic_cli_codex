@@ -79,9 +79,18 @@ addon::Quota_inspect_result quota_response(const addon::Json_value& response)
     const auto& payload = member(response, "result");
     const auto& limits = member(payload, "rateLimits");
     if (response.find("error")) {
-        return addon::make_quota_failure(authentication_required(error)
-            ? addon::Quota_failure::AUTHENTICATION_REQUIRED
-            : addon::Quota_failure::REQUEST_FAILED);
+        // Codex reports this invalid request when its auth manager has no account.
+        // A signed-in API-key account receives a different rate-limit error.
+        if (member(error, "code") == addon::Json_value(-32600) &&
+            member(error, "message") == addon::Json_value("codex account authentication required to read rate limits"))
+        {
+            observation.state = addon::Quota_status::NOT_LOGGED_IN;
+        }
+        else {
+            return addon::make_quota_failure(authentication_required(error)
+                ? addon::Quota_failure::AUTHENTICATION_REQUIRED
+                : addon::Quota_failure::REQUEST_FAILED);
+        }
     }
     else
     if (limits.is_object() && quota_window(member(limits, "primary"), &observation.primary) &&
