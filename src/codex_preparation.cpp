@@ -155,9 +155,8 @@ std::vector<std::pair<std::string, std::string>> launch_environment(
     return environment;
 }
 
-// Detects the positional PROMPT of Codex's interactive session: its help
-// states the usage `codex [OPTIONS] [PROMPT]` when its parser takes one.
-bool takes_initial_prompt(
+// Codex advertises a positional PROMPT in its native interactive help.
+std::optional<std::string> initial_prompt_failure(
     const Verified_launch&                                  launch,
     const std::vector<std::pair<std::string, std::string>>& environment,
     std::string_view                                        working_directory,
@@ -165,8 +164,14 @@ bool takes_initial_prompt(
 {
     std::vector<std::string> argv(launch.argv.begin(), launch.argv.begin() + launch.prefix_size);
     argv.push_back("--help");
-    const auto output = probe_cli_options(argv, environment, working_directory, context);
-    return output && output->output.find("[PROMPT]") != std::string::npos;
+    bool timed_out = false;
+    const auto output = probe_cli_options(argv, environment, working_directory, context, &timed_out);
+    if (timed_out) return "The Codex help check (--help) timed out while checking initial prompt support.";
+    if (!output) return "Logonomic could not run the Codex help check (--help) to verify initial prompt support.";
+    if (output->output.find("[PROMPT]") == std::string::npos) {
+        return "This Codex does not take an initial prompt for an interactive session.";
+    }
+    return std::nullopt;
 }
 
 // Codex submits its positional PROMPT as the first user message of a new
@@ -216,26 +221,33 @@ void prepare_interactive(addon::Invocation_context& context)
         return;
     }
     auto launch = verified_launch(request->launcher, request->launcher_argv,
-        request->launch_environment->effective_environment, request->working_directory, false, context);
+        request->launch_environment->effective_environment, request->working_directory, false, context, &failure);
     if (!launch) {
-        if (prompt && !context.cancel_requested()) {
-            refuse_initial_prompt(context, "Codex cannot be prepared from this launcher.");
-            return;
+        if (context.cancel_requested()) {
+            if (failure.reason_code == addon::reason::k_launcher_version_cancelled) {
+                context.fail(addon::Result_status::CANCELLED, failure.reason_code, failure.detail);
+            }
+            else {
+                context.fail(addon::Result_status::CANCELLED, "cancelled");
+            }
         }
-        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
-            context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
+        else if (prompt) {
+            refuse_initial_prompt(context, failure.detail);
+        }
+        else {
+            context.fail(addon::Result_status::UNAVAILABLE, failure.reason_code, failure.detail);
+        }
         return;
     }
-    if (prompt && !takes_initial_prompt(*launch,
+    if (prompt) {
+        const auto error = initial_prompt_failure(*launch,
             launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),
-            request->working_directory, context))
-    {
-        if (context.cancel_requested()) {
-            context.fail(addon::Result_status::CANCELLED, "cancelled");
+            request->working_directory, context);
+        if (error) {
+            if (context.cancel_requested()) context.fail(addon::Result_status::CANCELLED, "cancelled");
+            else refuse_initial_prompt(context, *error);
             return;
         }
-        refuse_initial_prompt(context, "This Codex does not take an initial prompt for an interactive session.");
-        return;
     }
     auto native_preparation = prepare_native_launch(*launch,
         launch_environment(request->launch_environment->effective_environment, *launch, profile->profile_path),

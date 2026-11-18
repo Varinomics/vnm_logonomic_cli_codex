@@ -974,9 +974,18 @@ int main(int argc, char** argv)
         codex_invocation_launches(npm_pet, npm_pet_prefix, probe_environment, root, false);
         auto cold = through_powershell(npm_pet);
         cold.launch_environment->effective_environment.set("CODEX_FIXTURE_SLOW_CLI_START", addon::Json_value("1"));
+        auto missing = cold;
+        missing.launch_environment->effective_environment.set("PATH", addon::Json_value(utf8(root / "empty-path")));
+        Context missing_call;
+        prepare_launch(missing_call, missing);
+        require(missing_call.output == addon::Json_value("launcher_program_not_found") &&
+            missing_call.failure_detail.find("codex-pet") != std::string::npos,
+            "An absent executable must identify the saved launcher in the failure message");
         Context short_call;
         prepare_launch(short_call, cold, 100);
-        require(!short_call.succeeded, "A short caller deadline must still bound the native version check");
+        require(short_call.output == addon::Json_value("launcher_version_timeout") &&
+            short_call.failure_detail.find("--version") != std::string::npos,
+            "An expired native version check must explain the timeout");
         cold.initial_prompt = addon::Initial_prompt_request{"Read the brief.", utf8(root / "brief.md")};
         Context cold_call;
         prepare_launch(cold_call, cold);
@@ -984,6 +993,11 @@ int main(int argc, char** argv)
         require(cold_call.succeeded && cold_patch &&
             addon::validate_initial_prompt_acknowledgment(cold.initial_prompt, *cold_patch, &failure),
             "Slow native version and help checks must prepare the saved npm launcher within the host budget");
+        Context short_help;
+        prepare_launch(short_help, cold, 100);
+        require(short_help.output == addon::Json_value(addon::reason::k_initial_prompt_unavailable) &&
+            short_help.failure_detail.find("--help) timed out") != std::string::npos,
+            "A timed-out help check after version verification must explain why prompt support is unknown");
         addon::Discover_request npm_discovery;
         npm_discovery.platform_id = environment.platform_id;
         npm_discovery.ambient_environment = npm_pet.launch_environment->effective_environment;

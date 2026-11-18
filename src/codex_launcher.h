@@ -45,7 +45,8 @@ std::optional<logonomic::cli_addon::Probe_output> run_probe(
 
 std::optional<logonomic::cli_addon::Probe_output> probe_cli_options(
     const std::vector<std::string>& argv, const logonomic::cli_addon::Environment& environment,
-    std::string_view working_directory, logonomic::cli_addon::Invocation_context& context);
+    std::string_view working_directory, logonomic::cli_addon::Invocation_context& context,
+    bool* out_timed_out = nullptr);
 
 bool supported_session_arguments(const std::vector<std::string>& argv, bool resume,
     std::string* approval_policy = nullptr);
@@ -76,7 +77,8 @@ std::optional<Verified_launch> verified_launch(
     const logonomic::cli_addon::Json_value&        effective_environment,
     std::string_view                working_directory,
     bool                            delegated,
-    logonomic::cli_addon::Invocation_context&     context);
+    logonomic::cli_addon::Invocation_context&     context,
+    logonomic::cli_addon::Contract_failure*       out_failure = nullptr);
 
 // Each verified launch file's path, size and modification time. Results
 // remembered for an executable chain are invalidated by a change in this

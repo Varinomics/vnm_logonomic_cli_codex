@@ -440,13 +440,15 @@ std::optional<addon::Probe_output> run_probe(
 
 std::optional<addon::Probe_output> probe_cli_options(
     const std::vector<std::string>& argv, const Environment& environment,
-    std::string_view working_directory, addon::Invocation_context& context)
+    std::string_view working_directory, addon::Invocation_context& context, bool* out_timed_out)
 {
     // Even --version and --help start the native binary through the selected
     // launcher. The host cancels the whole preparation at its original deadline.
     const auto timeout_ms = std::min<std::int64_t>(
         context.request().deadline_ms, addon::limits::k_launch_prepare_deadline_ms);
-    return run_probe(argv, environment, working_directory, static_cast<int>(timeout_ms), context);
+    bool timed_out;
+    return addon::probe_with_timeout_status(argv, environment, working_directory,
+        static_cast<int>(timeout_ms), context, out_timed_out ? *out_timed_out : timed_out);
 }
 
 std::optional<std::vector<std::string>> resolve_probe_launcher(
@@ -696,11 +698,18 @@ std::optional<std::pair<std::string, std::string>> native_target(
 std::optional<Verified_launch> verified_launch(
     const addon::Launcher_request& launcher, const std::vector<std::string>& launcher_argv,
     const addon::Json_value& effective_environment, std::string_view working_directory,
-    bool delegated, addon::Invocation_context& context)
+    bool delegated, addon::Invocation_context& context, addon::Contract_failure* out_failure)
 {
+    const auto refuse = [&](const char* reason, std::string message) {
+        if (out_failure) *out_failure = {reason, std::move(message)};
+        return std::nullopt;
+    };
+    const auto unsupported = [&] {
+        return refuse("launcher_command_unsupported", "Logonomic could not verify the saved Codex launcher command.");
+    };
     const auto recognized = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!recognized || !recognized->prefix_arguments.empty() || launcher_argv.empty()) {
-        return std::nullopt;
+        return unsupported();
     }
     std::vector<std::string> literal;
     if (launcher.runner_key == addon::k_runner_direct) {
@@ -715,36 +724,42 @@ std::optional<Verified_launch> verified_launch(
             if (!std::isalnum(character) && std::string_view(" \t-_./\\:=+").find(character) == std::string_view::npos &&
                 !(delegated && character == '"'))
             {
-                return std::nullopt;
+                return unsupported();
             }
         }
         literal = addon::literal_argv(launcher.script_body);
     }
     else {
-        return std::nullopt;
+        return unsupported();
     }
     if (literal.empty() || !is_codex_program(literal.front()) ||
         (delegated && !supported_session_arguments(literal, false)) || !effective_environment.is_object())
     {
-        return std::nullopt;
+        return unsupported();
     }
     Environment environment;
     for (const auto& member : effective_environment.as_object()) {
         if (!member.value.is_string()) {
-            return std::nullopt;
+            return unsupported();
         }
         set_environment(environment, member.name, member.value.as_string());
     }
+    const bool pet = addon::base_name(literal.front(), Launcher_whitespace::ASCII) == "codex-pet";
+    const std::string name = pet ? "codex-pet" : "Codex";
+    const auto installation_unverified = [&] {
+        return refuse("launcher_installation_unverified", "Logonomic found " + name +
+            " but could not verify its installation. Check that the selected launcher and its dependencies are installed.");
+    };
     const auto selected = resolve_program(
         literal.front(), environment, working_directory, Launcher_whitespace::ASCII);
     if (!selected) {
-        return std::nullopt;
+        return refuse("launcher_program_not_found", "Logonomic could not find an executable for " + name +
+            ". Check the saved launcher path and its PATH setting.");
     }
     std::vector<fs::path> files{*selected};
     std::vector<std::string> prefix{path_to_utf8(*selected)};
     Environment updates;
     std::string package_version;
-    const bool pet = addon::base_name(literal.front(), Launcher_whitespace::ASCII) == "codex-pet";
 #ifdef _WIN32
     const bool npm = lower(selected->extension().string()) == ".cmd";
 #else
@@ -761,7 +776,7 @@ std::optional<Verified_launch> verified_launch(
         const auto javascript = regular_file(root / "bin" / "codex.js");
         const auto manifest   = regular_file(root / "package.json");
         if (!javascript || !manifest) {
-            return std::nullopt;
+            return installation_unverified();
         }
 #ifdef _WIN32
         auto node = regular_file(directory / "node.exe");
@@ -791,11 +806,11 @@ std::optional<Verified_launch> verified_launch(
         const auto target = node ? native_target(*node) : std::nullopt;
         const auto package = object_file(*manifest);
         if (!target || !package) {
-            return std::nullopt;
+            return installation_unverified();
         }
 #ifdef _WIN32
         if (lower(node->extension().string()) != ".exe") {
-            return std::nullopt;
+            return installation_unverified();
         }
 #endif
         package_version = member_text(*package, "version");
@@ -806,7 +821,7 @@ std::optional<Verified_launch> verified_launch(
         if (!addon::is_semantic_version(package_version) || member_text(*package, "name") != package_name ||
             addon::path_from_utf8(bin_path).lexically_normal() != fs::path("bin/codex.js"))
         {
-            return std::nullopt;
+            return installation_unverified();
         }
         fs::path native_root = root;
         if (pet) {
@@ -819,7 +834,7 @@ std::optional<Verified_launch> verified_launch(
             const std::string native_version = package_version + "-" + target->first;
             const auto* dependencies = package->find("optionalDependencies");
             if (!dependencies || member_text(*dependencies, platform_name) != "npm:@openai/codex@" + native_version) {
-                return std::nullopt;
+                return installation_unverified();
             }
             std::optional<fs::path> platform_manifest;
             for (auto cursor = javascript->parent_path(); !cursor.empty();) {
@@ -831,7 +846,7 @@ std::optional<Verified_launch> verified_launch(
             }
             const auto platform = platform_manifest ? object_file(*platform_manifest) : std::nullopt;
             if (!platform || member_text(*platform, "name") != "@openai/codex" || member_text(*platform, "version") != native_version) {
-                return std::nullopt;
+                return installation_unverified();
             }
             native_root = platform_manifest->parent_path();
             files.push_back(*platform_manifest);
@@ -843,14 +858,14 @@ std::optional<Verified_launch> verified_launch(
 #endif
         const auto image = regular_file(native_root / "vendor" / target->second / "bin" / image_name);
         if (!image || native_target(*image, target->first) != target) {
-            return std::nullopt;
+            return installation_unverified();
         }
         prefix = {path_to_utf8(*node), path_to_utf8(*javascript)};
         files.insert(files.end(), {*node, *javascript, *manifest, *image});
     }
     else
     if (!native_image(*selected)) {
-        return std::nullopt;
+        return installation_unverified();
     }
     std::vector<std::string> probe_argv = prefix;
     probe_argv.push_back("--version");
@@ -860,7 +875,7 @@ std::optional<Verified_launch> verified_launch(
     }
     const auto evidence = file_evidence(file_names);
     if (!evidence) {
-        return std::nullopt;
+        return installation_unverified();
     }
     addon::Sha256 digest;
     const auto append = [&](std::string_view value) {
@@ -889,16 +904,28 @@ std::optional<Verified_launch> verified_launch(
         }
     }
     if (version.empty()) {
-        const auto output = probe_cli_options(probe_argv, environment, working_directory, context);
+        if (context.cancel_requested()) return refuse("cancelled", {});
+        bool timed_out = false;
+        const auto output = probe_cli_options(probe_argv, environment, working_directory, context, &timed_out);
         if (!output) {
-            return std::nullopt;
+            if (timed_out) {
+                return refuse("launcher_version_timeout", "Logonomic found " + name +
+                    ", but its version check (--version) timed out. Retry the launch.");
+            }
+            if (context.cancel_requested()) {
+                return refuse(addon::reason::k_launcher_version_cancelled,
+                    "Preparation stopped while checking the version of " + name + ".");
+            }
+            return refuse("launcher_version_unavailable", "Logonomic found " + name +
+                ", but could not complete its version check (--version).");
         }
         version = parse_version_output(output->output, output->errors);
         if (version.empty() || (!package_version.empty() && version != package_version)) {
-            return std::nullopt;
+            return refuse("launcher_version_invalid", "Logonomic found " + name +
+                ", but its version output did not identify the expected Codex installation.");
         }
         if (file_evidence(file_names) != evidence) {
-            return std::nullopt;
+            return installation_unverified();
         }
         std::lock_guard lock(cache_mutex);
         if (cache.size() >= 32) {
@@ -906,9 +933,8 @@ std::optional<Verified_launch> verified_launch(
         }
         cache[key] = version;
     }
-    if (context.cancel_requested() || (delegated && !version_is_at_least(version, 0, 150, 1))) {
-        return std::nullopt;
-    }
+    if (context.cancel_requested()) return refuse("cancelled", {});
+    if (delegated && !version_is_at_least(version, 0, 150, 1)) return unsupported();
     const std::size_t prefix_size = prefix.size();
     prefix.insert(prefix.end(), literal.begin() + 1, literal.end());
     return Verified_launch{std::move(prefix), std::move(version), std::move(updates), std::move(file_names), prefix_size};
