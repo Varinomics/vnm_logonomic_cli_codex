@@ -141,7 +141,7 @@ int main(int argc, char** argv)
         if (argc == 7 && std::string_view(argv[1]) == "--native") return native_probe(argv);
         require(argc == 2, "Expected fake native CLI");
         Temporary_directory temporary;
-        const auto root = temporary.path;
+        const auto root = fs::canonical(temporary.path);
         const auto log = root / "native-requests.jsonl";
         addon::Prepare_request request;
         request.launcher = {"codex", addon::k_runner_direct, ""};

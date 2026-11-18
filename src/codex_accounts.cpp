@@ -171,7 +171,12 @@ std::string profile_account_key(std::string_view absolute_path)
 std::optional<Profile_selection> granted_profile(const addon::Account_context& account, std::string_view selected_path)
 {
     if (!account.profile_path || account.adapter_account_key.empty()) return {};
+#ifdef _WIN32
+    // Lexical normalization can discard an extended Windows drive root.
+    const auto original = addon::path_from_utf8(*account.profile_path).make_preferred();
+#else
     const auto original = addon::path_from_utf8(*account.profile_path).lexically_normal();
+#endif
     const auto granted  = normalized_profile(addon::path_from_utf8(*account.profile_path));
     const auto selected = normalized_profile(addon::path_from_utf8(selected_path));
     if (granted.empty() || selected.empty() || !addon::same_native_account_profile(granted, selected)) return {};
