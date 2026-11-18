@@ -255,7 +255,14 @@ addon::Prepare_request through_powershell(addon::Prepare_request request)
     request.launcher.runner_key  = addon::k_runner_powershell;
     request.launcher.script_body = addon::base_name(utf8(program), addon::Launcher_whitespace::ASCII) + " --yolo";
     request.launcher_argv        = {"powershell", "-NoLogo", "-Command", request.launcher.script_body};
-    request.launch_environment->effective_environment.set("PATH", addon::Json_value(utf8(program.parent_path())));
+    auto path = utf8(program.parent_path());
+    auto& environment = request.launch_environment->effective_environment;
+    if (const auto* existing = environment.find("PATH"); existing && !existing->as_string().empty() && existing->as_string() != path) {
+        // A project-local npm shim still needs Node from the launcher's PATH.
+        path += request.launch_environment->platform_id.starts_with("windows-") ? ';' : ':';
+        path += existing->as_string();
+    }
+    environment.set("PATH", addon::Json_value(std::move(path)));
     return request;
 }
 
@@ -587,7 +594,11 @@ void initial_prompt_launches(
     for (const auto* launcher : launchers) {
         Context unprompted;
         prepare_launch(unprompted, *launcher);
-        require(unprompted.succeeded && !unprompted.output.find(addon::k_initial_prompt_member),
+        if (!unprompted.succeeded) {
+            throw std::runtime_error("Unprompted " + launcher->launcher.runner_key + " launcher " +
+                launcher->launcher.script_body + " failed: " + addon::serialize_json(unprompted.output));
+        }
+        require(!unprompted.output.find(addon::k_initial_prompt_member),
             "A launch without an initial prompt must not acknowledge one");
         for (const auto& text : texts) {
             auto request = *launcher;
@@ -876,10 +887,11 @@ int main(int argc, char** argv)
             Context probe;
             require(!codex::run_probe({utf8(root / "absent-cli")}, probe_environment, utf8(root), 1000, probe),
                 "Missing probe executable unexpectedly spawned");
-            const auto result = codex::run_probe({argv[1], "--version"}, probe_environment, utf8(root), 1000, probe);
-            require(result && (result->output == "codex-cli 0.150.1\n" ||
-                result->output == "codex-cli 0.150.1\r\n"),
-                "Probe custody admission leaked after failed spawn or child reaping");
+            const auto result = codex::run_probe({argv[1], "--version"}, probe_environment, utf8(root), 3000, probe);
+            if (!result || (result->output != "codex-cli 0.150.1\n" && result->output != "codex-cli 0.150.1\r\n")) {
+                throw std::runtime_error("Custody version probe " + std::to_string(attempt + 1) +
+                    " of 64 failed: " + (result ? result->output : "no process result"));
+            }
         }
 #ifndef _WIN32
         Context inherited;
@@ -1288,6 +1300,8 @@ int main(int argc, char** argv)
         auto complete_review = review;
 #ifdef _WIN32
         const auto complete_launcher = with_arguments(npm, {"-c", "approval_policy=\"on-request\"", "-anever"});
+        complete_review.context.launch_environment->effective_environment.set(
+            "PATH", *npm.launch_environment->effective_environment.find("PATH"));
 #else
         const auto complete_launcher = with_arguments(prepare, {"-c", "approval_policy=\"on-request\"", "-anever"});
 #endif
@@ -1312,7 +1326,11 @@ int main(int argc, char** argv)
                 addon::encode_delegated_prepare_request(request)};
             codex::handle_preparation(prepared);
             const auto result = addon::decode_delegated_prepare_result(prepared.output, &failure);
-            require(prepared.succeeded && result && result->process.argv.size() <= addon::limits::k_max_argv_entries &&
+            if (!prepared.succeeded || !result) {
+                throw std::runtime_error("Full delegation preparation failed: " +
+                    (prepared.succeeded ? failure.detail : addon::serialize_json(prepared.output)));
+            }
+            require(result->process.argv.size() <= addon::limits::k_max_argv_entries &&
                 addon::validate_structured_process_proposal(result->process, &failure) &&
                 result->model_selection == request.model_selection &&
                 result->acknowledgment.server_ids == std::vector<std::string>{"coordination", "delegation"},
