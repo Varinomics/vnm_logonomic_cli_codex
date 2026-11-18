@@ -446,12 +446,15 @@ std::optional<Conversation_history> read_history(
                 else
                 if (event != "user_message" && event != "agent_message" && event != "token_count" &&
                     event != "task_complete" && event != "turn_complete" && event != "agent_reasoning" &&
-                    event != "agent_reasoning_raw_content")
+                    event != "agent_reasoning_raw_content" &&
+                    !(event == "thread_settings_applied" && json::member(payload, "thread_settings").is_object()) &&
+                    !((event == "item_started" || event == "item_completed") &&
+                        !json::text(json::member(payload, "item"), "type").empty()))
                 {
                     history.content_understood = false;
                 }
-                // User and assistant events mirror response_item bodies. Using both
-                // would duplicate each displayed message and lose canonical tool data.
+                // Native item notifications describe turn progress; response_item
+                // holds the conversation. Event-only history cannot prove emptiness.
             }
             else
             if (paginated && type != "session_meta" && type != "turn_context" &&
@@ -462,7 +465,9 @@ std::optional<Conversation_history> read_history(
                     "This paginated Codex history contains an unsupported record type.");
             }
             else
-            if (type != "session_meta" && type != "turn_context" && type != "token_usage_record") {
+            if (type != "session_meta" && type != "turn_context" && type != "token_usage_record" &&
+                !(type == "world_state" && json::member(payload, "full").is_boolean() &&
+                    json::member(payload, "state").is_object())) {
                 // Export can retain understood messages beside opaque legacy rows.
                 // Such rows cannot establish that no meaningful content exists.
                 history.content_understood = false;

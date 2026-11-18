@@ -234,6 +234,18 @@ void native_history(const fs::path& fixture)
         R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Retained work"}]}})" "\n";
     write(source, metadata() + prompt);
     expect(Availability::AVAILABLE, Content::NONEMPTY);
+    const std::string native_context =
+        R"({"type":"world_state","payload":{"full":true,"state":{}}})" "\n"
+        R"({"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"example"}}})" "\n";
+    const std::string completed =
+        R"({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage"}}})" "\n"
+        R"({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage"}}})" "\n";
+    write(source, metadata() + native_context + prompt + completed);
+    expect(Availability::AVAILABLE, Content::NONEMPTY);
+    write(source, metadata() + native_context + completed);
+    expect(Availability::AVAILABLE, Content::UNKNOWN);
+    write(source, metadata() + prompt + R"({"type":"world_state","payload":{"future_state":[]}})" "\n");
+    expect(Availability::AVAILABLE, Content::UNKNOWN);
     write(source, metadata() +
         R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>native context</environment_context>"}]}})" "\n");
     expect(Availability::AVAILABLE, Content::EMPTY);
