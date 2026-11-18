@@ -924,6 +924,14 @@ bool merge_snapshot_records(const fs::path& output_path, const std::optional<fs:
         Rollout_usage_record* record = accepted_record ? &*accepted_record : nullptr;
         if (record) clear_repository_correction(record->usage);
         if (chosen) {
+            // Earlier scanners committed this dimension as unsupported. The
+            // host retains that coverage on partial cumulative observations,
+            // including when a corrected total grows.
+            if (accepted_record && accepted_record->usage.cache_creation.coverage &&
+                accepted_record->usage.cache_creation.coverage->support == addon::Usage_support::UNSUPPORTED)
+            {
+                chosen->usage.cache_creation = accepted_record->usage.cache_creation;
+            }
             if (!accepted_record || !confirms(*accepted_record, *chosen)) {
                 if (accepted_record) defer_repository_growth(*accepted_record, *chosen);
                 record = &*chosen;

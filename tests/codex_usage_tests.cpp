@@ -477,6 +477,70 @@ void selected_cache_preserves_previous_rollout_order(const fs::path& fixture)
     }
 }
 
+void selected_cache_preserves_accepted_cache_write_coverage(const fs::path& fixture)
+{
+    const auto profile = fixture / "cache-write-profile";
+    const auto storage = fixture / "cache-write-storage";
+    fs::create_directories(profile / "sessions");
+    fs::create_directory(storage);
+    const auto path = profile / "sessions" / "rollout-cache-write.jsonl";
+    const auto history = [](int total) {
+        return metadata() + start("first") + tokens(total, ",\"cache_write_input_tokens\":9") + complete("first");
+    };
+    write(path, history(35));
+    addon::Usage_scan_request request;
+    request.mode = "incremental";
+    request.context.account_context = addon::Account_context{1, "cache-write-account"};
+    const auto scan = [&] {
+        std::string error;
+        const auto page = codex::scan_usage(request, profile, storage,
+            [] { return false; }, quiet_progress, &error);
+        check(page.has_value(), error.c_str());
+        return *page;
+    };
+    select_cache(request, storage, "initial");
+    const auto first = scan();
+    check(first.records.size() == 1 && first.records.front().cache_creation.value == 9,
+        "a native cache-write witness is present");
+
+    const auto historical = storage / "historical";
+    fs::create_directory(historical);
+    for (const auto* name : {"rollouts", "snapshot", "cache-state"}) {
+        fs::copy_file(storage / "initial" / name, historical / name);
+    }
+    std::ifstream records(storage / "initial" / "records", std::ios::binary);
+    std::string line;
+    check(static_cast<bool>(std::getline(records, line)), "read the original record");
+    auto row = addon::parse_json(line, {}, nullptr);
+    auto usage = row ? addon::decode_usage_record(*row->find("usage"), nullptr, 3) : std::nullopt;
+    check(usage.has_value(), "decode the cache-write fixture");
+    usage->cache_creation = {false, std::nullopt, addon::Usage_field_coverage{0, 1, false, addon::Usage_support::UNSUPPORTED}};
+    row->set("usage", addon::encode_usage_record(*usage, 3));
+    row->erase("temporal_observation");
+    write(historical / "records", addon::serialize_json(*row) + '\n');
+    addon::Contract_failure failure;
+    const auto accepted = addon::seal_usage_cache_candidate(addon::path_to_utf8(historical),
+        addon::path_to_utf8(storage), request.context.account_context, first.snapshot_id,
+        "codex-rollout-cache@3", [] { return false; }, &failure);
+    check(accepted.has_value(), "seal the previous scanner's unsupported dimension");
+
+    // The previous turn gains one token and a new turn contributes nine
+    // writes. Both observations must reconcile with the same selected cache.
+    write(path, history(36) + start("second") + tokens(70, ",\"cache_write_input_tokens\":18") + complete("second"));
+    select_cache(request, storage, "updated", accepted);
+    const auto update = scan();
+    check(update.records.size() == 2 && update.records[0].total_tokens == 36 &&
+        !update.records[0].cache_creation.applicable && !update.records[0].cache_creation.value &&
+        update.records[0].cache_creation.coverage->support == addon::Usage_support::UNSUPPORTED &&
+        update.records[1].total_tokens == 34 && update.records[1].cache_creation.value == 9,
+        "a growing historical turn retains its accepted support while new turns report actual writes");
+    fs::remove(path);
+    select_cache(request, storage, "retained", update.cache_candidate);
+    const auto retained = scan();
+    check(retained.records.size() == 2 && !retained.records[0].cache_creation.applicable &&
+        retained.records[1].cache_creation.value == 9, "retain both historical observations after source removal");
+}
+
 void selected_cache_reparses_previous_parser_revision(const fs::path& fixture)
 {
     const auto profile = fixture / "parser-revision-profile";
@@ -2994,6 +3058,7 @@ int main(int argc, char** argv)
         reducer_preserves_fork_turn_precision(fixture.path / "rollout-fixture.jsonl");
         reducer_keeps_categories_across_interrupted_turns(fixture.path / "rollout-fixture.jsonl");
         selected_cache_reparses_previous_parser_revision(fixture.path);
+        selected_cache_preserves_accepted_cache_write_coverage(fixture.path);
         selected_cache_preserves_previous_rollout_order(fixture.path);
         reducer_attributes_resumed_turns(fixture.path);
         scanner_keeps_per_turn_repositories(fixture.path);

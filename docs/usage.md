@@ -8,6 +8,11 @@ unknown cwd remains unattributed.
 Both `sessions` and `archived_sessions` contribute native history, including
 on a fresh scan or reset. Archiving preserves stable native turn identities;
 overlapping copies contribute each turn once and retained history survives moves.
+The native input count includes both cached reads and cache writes. A completed
+turn reports cache writes when its cumulative `cache_write_input_tokens`
+observations establish the amount, including zero. Missing evidence leaves
+that dimension unknown. Turns accepted by an earlier scanner keep their
+original cache-write coverage. Newly accepted turns report the native breakdown.
 Accounting, cache acceptance and progress follow the independently versioned
 [usage-scan contracts](https://github.com/Varinomics/Logonomic/tree/master/sdk/logonomic_cli_addon_sdk/docs).
 
@@ -16,8 +21,8 @@ Accounting, cache acceptance and progress follow the independently versioned
 Host-selected usage caches use `codex-rollout-cache@3`, whose records retain
 usage-scan@3 native counter provenance. A candidate keeps one metadata line per
 rollout in `rollouts` beside the sorted `records`, so it holds the same four
-files however many rollouts a home has. Rollout metadata is ordered by its
-recorded source spelling. Older sealed indexes are reordered from their saved
+files however many rollouts a home has. Rollout metadata is ordered by a hash
+of its recorded source spelling. Older sealed indexes are reordered from their saved
 metadata, including entries whose native files have disappeared. Native turn
 IDs keep copies and account-directory aliases from adding a second debit.
 An incremental scan parses rollouts whose
