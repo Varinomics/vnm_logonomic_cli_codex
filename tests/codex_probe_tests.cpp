@@ -497,6 +497,36 @@ void current_account_identity_reobserves_after_account_notifications()
     }
 }
 
+void quota_recognizes_the_native_signed_out_response()
+{
+    constexpr auto signed_out = "codex account authentication required to read rate limits";
+    const auto inspect = [](int code, const char* message) {
+        addon::Probe_inspect_request request;
+        request.inspection.final = true;
+        request.inspection.exit_code = 0;
+        request.inspection.stdout_bytes = "{\"id\":1,\"result\":{}}\n"
+            "{\"id\":2,\"error\":{\"code\":" + std::to_string(code) + ",\"message\":\"" + message + "\"}}\n";
+        std::string failure;
+        return codex::inspect_quota(request, &failure);
+    };
+    const auto result = inspect(-32600, signed_out);
+    check(result.complete && result.observation && result.observation->state == addon::Quota_status::NOT_LOGGED_IN &&
+        !result.failure_reason, "Codex reports a signed-out profile as a completed quota observation");
+    for (const bool asked : {false, true}) {
+        const auto payload = addon::encode_quota_inspect_result(result, 2, asked);
+        check(!payload.find("quota_failure") && !payload.find("failure_reason") &&
+            addon::decode_quota_inspect_result(payload, true, nullptr, 2).has_value(),
+            "a signed-out quota observation carries no failure diagnostics");
+    }
+    for (const auto& other : {inspect(-32600, "chatgpt authentication required to read rate limits"),
+            inspect(-32603, signed_out), inspect(-32600, "codex account authentication required to read token usage")})
+    {
+        check(other.observation && other.observation->state == addon::Quota_status::FAILED && other.failure_reason &&
+            addon::parse_quota_failure(*other.failure_reason) == addon::Quota_failure::REQUEST_FAILED,
+            "an incompatible account, different method, or other RPC error cannot establish a signed-out profile");
+    }
+}
+
 void quota_errors_remain_redacted()
 {
     addon::Probe_inspect_request request;
@@ -1535,6 +1565,7 @@ int main(int argc, char** argv)
         current_account_identity_reobserves_after_account_notifications();
         current_account_helper_keeps_native_output_private(std::filesystem::absolute(argv[1]), std::filesystem::absolute(argv[2]));
         quota_protocol_and_optional_windows();
+        quota_recognizes_the_native_signed_out_response();
         quota_errors_remain_redacted();
         quota_cause_crosses_only_when_asked();
         quota_requires_a_settled_valid_exchange();
