@@ -195,6 +195,7 @@ logonomic_cli_addon_package_platform(CODEX_PLATFORM)
 set(CODEX_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
 logonomic_cli_addon_add_package(codex_package logonomic.cli.codex CODEX_PACKAGE_DIRECTORY
+    PROJECT_LICENSE LICENSE
     ADAPTER codex_adapter
     HELPERS codex_helper codex_pet_helper codex_launch_bridge codex_quota_helper
     INDEX_ARGUMENTS

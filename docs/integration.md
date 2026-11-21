@@ -82,9 +82,8 @@ native-store and unrelated configuration remain intact.
 Preparation and a ready process do not fabricate a confirmed cwd; the
 conversation's current directory stays unknown until Codex reports it.
 
-The declaration does not complete Codex's wider native selection/ownership work
-tracked in [#16](https://github.com/Varinomics/vnm_logonomic_cli_codex/issues/16)
-or the [host continuity tracker](https://github.com/Varinomics/logonomic/issues/257).
+Wider native selection and ownership work is tracked in the
+[Codex provider issue](https://github.com/Varinomics/vnm_logonomic_cli_codex/issues/16).
 
 Native qualification records the exact CLI and package revisions and verifies
 that a command with no per-command directory override runs in the working

@@ -34,6 +34,7 @@ wake unavailability does not prevent ordinary launching.
 
 The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
 Send provider pull requests to [the codex repository](https://github.com/Varinomics/vnm_logonomic_cli_codex/pulls).
+See the [repository license](LICENSE) for the terms covering Varinomics code.
 
 The provider uses the Windows SDK's winsqlite3 on Windows and SQLite3 development files
 on Linux and macOS. CMake uses installed toml++ headers or fetches them from upstream.
