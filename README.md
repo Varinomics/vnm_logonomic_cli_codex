@@ -39,9 +39,7 @@ The provider uses the Windows SDK's winsqlite3 on Windows and SQLite3 developmen
 on Linux and macOS. CMake uses installed toml++ headers or fetches them from upstream.
 The SDK dependency tracks `vnm_logonomic_cli_addon` on `master`.
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE` can select an explicit local SDK for coordinated
-development. Build `codex_package` in a separate tree. Windows/Linux x86-64 and
-macOS ARM64 have separate package manifests; follow the build queue and
-platform toolchain policy.
+development. Build `codex_package` in a separate tree.
 
 - [Building and qualification](docs/building.md): package outputs, runtime
   export rules and focused CTest registrations.

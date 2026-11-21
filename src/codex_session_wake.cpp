@@ -20,6 +20,11 @@ namespace addon = logonomic::cli_addon;
 using Json = addon::Json_value;
 using Environment = std::vector<std::pair<std::string, std::string>>;
 
+bool supports_queue_watcher(std::string_view version)
+{
+    return version_is_at_least(version, 0, 149, 0);
+}
+
 Json object(std::initializer_list<std::pair<std::string, Json>> members)
 {
     auto result = Json::object();
@@ -249,7 +254,7 @@ std::optional<Bound_queue> bound_queue(const addon::Session_wake_target& target)
     const auto* prefix = binding.find("prefix");
     const auto* evidence = binding.find("files");
     if (!canonical_uuid(target.provider_session_id) || !schema || *schema != Json(1) ||
-        !version_is_at_least(text(binding, "version"), 0, 149, 0) ||
+        !supports_queue_watcher(text(binding, "version")) ||
         text(binding, "cwd") != target.working_directory ||
         !prefix || !prefix->is_array() || prefix->as_array().empty() ||
         !evidence || !evidence->is_array() || evidence->as_array().empty()) return std::nullopt;
@@ -317,7 +322,7 @@ Native_launch_preparation prepare_native_launch(
     };
     // 0.149 introduced both the writer and the external queue watcher. A new
     // executable found later cannot retroactively add the watcher to an old TUI.
-    if (!version_is_at_least(launch.version, 0, 149, 0)) return unavailable("native_queue_watcher_unavailable");
+    if (!supports_queue_watcher(launch.version)) return unavailable("native_queue_watcher_unavailable");
     const auto configuration = configuration_arguments(launch);
     if (!configuration) return unavailable("wake_launcher_unsupported");
     const auto home = normalized_absolute(environment_value(environment, "CODEX_HOME"));

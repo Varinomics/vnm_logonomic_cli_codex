@@ -200,8 +200,8 @@ and its relative order is preserved; an explicit empty list becomes activity
 alone when immediate identity is not negotiated. Without that qualified opt-in,
 an absent or null list keeps Codex's native default. Configuration files
 and unrelated TUI settings are unchanged. This preparation requires the existing
-native configuration probe (Codex 0.149.0 or newer); unsupported named profiles
-or a failed probe retain their original title configuration. Preparation also
+native configuration probe. Unsupported named profiles or a failed probe retain
+their original title configuration. Preparation also
 keeps the original title when the override would exceed the host's launch
 argument contract.
 
@@ -337,9 +337,9 @@ has exited.
 
 Authentication, quota, account discovery and per-turn usage scanning preserve the
 native integration's semantics. Historical account, resume and usage imports
-match the exact `codex` provider attribution. Lifecycle support requires Codex
-0.146.0 or newer. Structured execution requires 0.150.1 or newer. Version checks have no upper bound,
-and accepted protocol records still undergo structural and identity validation.
+match the exact `codex` provider attribution. The [launcher requirements](../README.md#use-with-logonomic)
+apply to lifecycle and structured execution. The provider validates the structure and
+identity of accepted protocol records.
 
 With `current-account@1` negotiated, authentication uses the selected launcher's
 native app-server in the existing authentication observation. The helper reads

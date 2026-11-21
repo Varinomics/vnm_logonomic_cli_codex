@@ -6,19 +6,8 @@
 `codex_package` target produces an indexed package under
 `package/logonomic.cli.codex` in a single-configuration build directory, or
 `package/<config>/logonomic.cli.codex` with a multi-configuration generator.
-Windows and Linux x86-64 and macOS ARM64
-artifacts have separate manifests. Follow the workstation build queue and
-toolchain policy for every configure and build command.
 
-The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
-during configuration. `cmake --install` exports a fresh artifact beneath its install-time
-prefix and preserves executable permissions. An existing per-package destination,
-including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
-nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
-a failure may leave a partial artifact directory. Choose a fresh destination or
-manually remove only that identified disposable export before retrying; never
-remove an installed generation this way. The application's package ingestion
-owns atomic installation and updates.
+Use `cmake --install` to export the indexed package to a fresh directory. See [SDK package export](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/sdk/logonomic_cli_addon_sdk/docs/package_contract.md#exporting-a-package).
 
 Package validation, conformance, preparation, startup-observer, lifecycle,
 implementation-protocol, account/probe and usage contract fixtures are registered

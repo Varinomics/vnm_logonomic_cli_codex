@@ -28,6 +28,11 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 
+bool supports_lifecycle_hooks(std::string_view version)
+{
+    return version_is_at_least(version, 0, 146, 0);
+}
+
 bool environment_name_equal(std::string_view left, std::string_view right)
 {
 #ifdef _WIN32
@@ -251,7 +256,7 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.profile_storage = request->profile_storage;
     patch.account_context = request->account_context;
     patch.session_wake    = std::move(wake);
-    patch.disposition     = addon::Launch_disposition{true, version_is_at_least(launch->version, 0, 146, 0), true};
+    patch.disposition     = addon::Launch_disposition{true, supports_lifecycle_hooks(launch->version), true};
     if (request->codex_invocation) {
         patch.codex_invocation = addon::Codex_invocation{launch->prefix_size};
     }
@@ -362,7 +367,7 @@ void prepare_resume(addon::Invocation_context& context)
     }
     auto launch = verified_launch(request->context.launcher, request->context.launcher_argv,
         request->context.launch_environment->effective_environment, working_directory, false, context);
-    if (!launch || !version_is_at_least(launch->version, 0, 146, 0)) {
+    if (!launch || !supports_lifecycle_hooks(launch->version)) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "resume_launcher_unavailable");
         return;

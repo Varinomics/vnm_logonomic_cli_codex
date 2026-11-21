@@ -170,6 +170,7 @@ else()
 endif()
 
 add_executable(codex_adapter src/adapter.cpp)
+target_compile_definitions(codex_adapter PRIVATE LOGONOMIC_CLI_ADDON_ADAPTER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(codex_adapter PRIVATE codex_provider)
 codex_target(codex_adapter)
 add_executable(codex_helper src/codex_helper.cpp)
