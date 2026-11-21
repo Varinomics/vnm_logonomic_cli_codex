@@ -1,6 +1,6 @@
 # Building and qualification
 
-`CMakeLists.txt` fetches the SDK from the owned Logonomic `master` branch. Set
+`CMakeLists.txt` fetches the SDK from `vnm_logonomic_cli_addon` on `master`. Set
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to an explicit local
 `sdk/logonomic_cli_addon_sdk` directory for coordinated development. The
 `codex_package` target produces an indexed package under
@@ -44,8 +44,7 @@ The repository's CI workflow builds the standalone package and runs its existing
 provider contract tests on Windows/Linux x86-64 and macOS ARM64. The SDK's
 compiler-target proof excludes macOS Intel and FreeBSD package builds.
 
-Run the workflow manually in GitHub Actions. Its shared build workflow lives
-with the Logonomic CLI add-on SDK and consumes SDK source from `master` using
-`VARINOMICS_REPO_READ_TOKEN`. Provider credentials are not required. Retained
+Run the workflow manually in GitHub Actions. The maintainer workflow in Logonomic consumes SDK
+source from `vnm_logonomic_cli_addon` using its configured repository read token. Provider credentials are not required. Retained
 artifacts are development packages and validation evidence; official bundle
 assembly and publication remain separate operations.

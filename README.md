@@ -3,7 +3,7 @@
 [![CI](https://github.com/Varinomics/vnm_logonomic_cli_codex/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_logonomic_cli_codex/actions/workflows/ci.yml)
 
 Standalone C++20 provider package `logonomic.cli.codex` for Logonomic. It uses
-the public CLI add-on SDK without Qt or desktop-private headers. Codex itself
+the CLI add-on SDK without Qt or desktop-private headers. Codex itself
 is installed separately.
 
 The package recognizes Codex launchers and selected `CODEX_HOME` accounts,
@@ -32,7 +32,12 @@ wake unavailability does not prevent ordinary launching.
 
 ## Build and reference
 
-The SDK dependency tracks Logonomic `master`.
+The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
+Send provider pull requests to [the codex repository](https://github.com/Varinomics/vnm_logonomic_cli_codex/pulls).
+
+The provider uses the Windows SDK's winsqlite3 on Windows and SQLite3 development files
+on Linux and macOS. CMake uses installed toml++ headers or fetches them from upstream.
+The SDK dependency tracks `vnm_logonomic_cli_addon` on `master`.
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE` can select an explicit local SDK for coordinated
 development. Build `codex_package` in a separate tree. Windows/Linux x86-64 and
 macOS ARM64 have separate package manifests; follow the build queue and
@@ -44,7 +49,7 @@ platform toolchain policy.
   prompts, account observations and delegated permission posture.
 - [Usage evidence and caches](docs/usage.md): incremental scanning,
   reconciliation, provenance, optional session identity and progress.
-- [Public Logonomic CLI add-on SDK](https://github.com/Varinomics/Logonomic/tree/master/sdk/logonomic_cli_addon_sdk).
+- [Logonomic CLI add-on SDK](https://github.com/Varinomics/vnm_logonomic_cli_addon/tree/master/sdk/logonomic_cli_addon_sdk).
 
 ## Attribution
 

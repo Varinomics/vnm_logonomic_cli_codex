@@ -18,7 +18,7 @@ only the compressed representation of a rollout reports incomplete historical
 coverage and retains its previously accepted turns. When both representations
 exist, the scan reads the plain sibling once, following Codex's precedence.
 Accounting, cache acceptance and progress follow the independently versioned
-[usage-scan contracts](https://github.com/Varinomics/Logonomic/tree/master/sdk/logonomic_cli_addon_sdk/docs).
+[usage-scan contracts](https://github.com/Varinomics/vnm_logonomic_cli_addon/tree/master/sdk/logonomic_cli_addon_sdk/docs).
 
 ## Cache and reconciliation
 
@@ -109,7 +109,7 @@ scan waiting for another scan of this package, report nothing.
 
 ## Native session identity
 
-The optional [usage-session@1](https://github.com/Varinomics/Logonomic/blob/master/sdk/logonomic_cli_addon_sdk/docs/usage_session_1.md)
+The optional [usage-session@1](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/sdk/logonomic_cli_addon_sdk/docs/usage_session_1.md)
 operation associates scanned record identities with the native lifecycle session
 and states that Codex records exclude the current turn still in flight. It does not rewrite
 ordinary scan responses, stable record/session keys or accepted cache bytes.
